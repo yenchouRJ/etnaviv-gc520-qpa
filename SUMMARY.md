@@ -101,9 +101,13 @@ using the CPU raster engine. This is the baseline to beat with GPU acceleration.
 Qt5 app (QPainter API — unchanged)
     │
     ▼
-Custom Qt5 QPA plugin          ← new work
+Custom Qt5 QPA plugin          ← new work (backing store + paint engine)
     │
-    ├── libdrm_etnaviv.so      ← already present; deps: libdrm + libc only
+    ▼
+libetna2d  (thin 2D op builder) ← new work — the "userspace HAL" to write
+    │  fill / blit / blend / stretch  →  VIVS_DE_* register writes
+    │
+    ├── libdrm_etnaviv.so      ← already present; BO + cmd_stream + submit + fence
     │       │
     │       └── ioctl() on /dev/dri/renderD128
     │                 │
@@ -112,10 +116,39 @@ Custom Qt5 QPA plugin          ← new work
     └── libdrm.so              ← KMS page-flip on /dev/dri/card0
 ```
 
-**Mesa, EGL, GBM, `etnaviv_dri.so` are not in this path.**
-`etnaviv_dri.so` (Mesa Gallium) opens `ETNA_PIPE_3D` — it fails on GC520
-and is irrelevant. The custom plugin talks directly to `libdrm_etnaviv`
-with `ETNA_PIPE_2D`.
+### Do I need a userspace HAL? — Yes, but a thin one.
+
+"HAL" spans two levels. `libdrm_etnaviv` **already is the bottom half**
+(BO alloc, `etna_cmd_stream`, relocations, submit ioctl, fence sync — all
+proven by `etnaviv_2d_test.c`). What is missing is the **2D op builder**:
+functions that translate `fill/blit/blend/stretch` into `VIVS_DE_*`
+register sequences + a `DRAW_2D` packet. The `gen_cmd_stream()` in the
+test (a hand-written CLEAR) is a slice of exactly this layer.
+
+Build it as a small module `libetna2d` (a few hundred lines):
+
+| Function | DE path | Registers |
+|---|---|---|
+| `etna2d_fill(dst, rect, color)` | CLEAR | `DEST_CONFIG_COMMAND_CLEAR`, `CLEAR_PIXEL_VALUE32` (done) |
+| `etna2d_blit(src, dst, sr, dr, rop)` | BIT_BLT | `SRC_*`, `DEST_CONFIG_COMMAND_BIT_BLT`, `ROP` |
+| `etna2d_blend(src, dst, ..., mode)` | BIT_BLT + PE | `ALPHA_CONTROL`, `ALPHA_MODES` |
+| `etna2d_stretch(src, dst, ..., f)` | STRETCH_BLT | `STRETCH_FACTOR_LOW/HIGH` |
+
+This is **not** a reimplementation of Mesa or of Vivante's libGAL.
+
+### What is NOT in this path
+
+**Mesa / EGL / GBM / `etnaviv_dri.so`.** Mesa's etnaviv is a Gallium *3D*
+driver: it compiles shaders and drives the 3D pipeline (TS/RA/PE-3D). It
+does nothing for the 2D DE block, and on GC520 (`PIPE_3D=0`) it won't even
+initialize. There is nothing in Mesa to replicate for 2D.
+
+**Vendor `libGAL` / `libdirectfb_gal.so` (in `drivers/ref/GC520L`).**
+Do NOT link against it. It depends on Vivante's own `galcore.ko` and a
+separate DRM ABI (`gc_hal_drm.h`) that is **incompatible with `etnaviv.ko`**.
+Using it would mean discarding the entire etnaviv bring-up. Keep it only as
+a *register-sequence reference* — see `driver/dfb/gc_dfb_raster.c` and the
+2D API PDFs under `doc/2D/` for how each DE op is programmed.
 
 **Qt5 app sources need zero modification.** The plugin is selected at
 runtime: `QT_QPA_PLATFORM=etnaviv2d ./myapp`.
@@ -127,37 +160,59 @@ must run with `QT_QUICK_BACKEND=software` to use the raster path.
 
 ## Roadmap
 
-### Phase 1 — Validate remaining DE operations (before Qt5 work)
+Four layers, built bottom-up. Each phase is independently verifiable so a
+failure is localized instead of tangled inside the Qt plugin.
 
-- [ ] Write `etnaviv_bitblt_test.c`: BIT_BLT from one BO to another, verify pixels.
-      Template: `etnaviv_2d_test.c`. Key registers: `VIVS_DE_SRC_ADDRESS`,
-      `VIVS_DE_SRC_STRIDE`, `VIVS_DE_SRC_CONFIG`, `VIVS_DE_DEST_ADDRESS`,
-      `VIVS_DE_DEST_CONFIG` with `COMMAND_BIT_BLT`, `VIVS_DE_ROP`.
-- [ ] Write `etnaviv_alpha_test.c`: BIT_BLT + alpha blend. Key registers:
+### Phase 1 — Validate remaining DE operations (offscreen, CPU-verified)
+
+Goal: prove each 2D op produces correct pixels in a BO. Template:
+`etnaviv_2d_test.c`; all registers in `state_2d.xml.h`.
+
+- [ ] `etnaviv_bitblt_test.c`: BIT_BLT BO→BO, verify pixels.
+      `VIVS_DE_SRC_ADDRESS`, `SRC_STRIDE`, `SRC_CONFIG`, `DEST_ADDRESS`,
+      `DEST_CONFIG` with `COMMAND_BIT_BLT`, `VIVS_DE_ROP`.
+- [ ] `etnaviv_alpha_test.c`: BIT_BLT + alpha blend.
       `VIVS_DE_ALPHA_CONTROL`, `VIVS_DE_ALPHA_MODES`.
-- [ ] Write `etnaviv_stretch_test.c`: STRETCH_BLT with `VIVS_DE_STRETCH_FACTOR_LOW/HIGH`.
+- [ ] `etnaviv_stretch_test.c`: STRETCH_BLT.
+      `VIVS_DE_STRETCH_FACTOR_LOW/HIGH`.
 
-All register definitions are in `state_2d.xml.h`. Working command stream
-pattern is in `etnaviv_2d_test.c`.
+### Phase 2 — Package the ops into `libetna2d` (the thin userspace HAL)
 
-### Phase 2 — Qt5 QPA plugin (new project)
+- [ ] Fold the validated sequences into `etna2d_{fill,blit,blend,stretch}()`
+      over `etna_cmd_stream`. This is the reusable 2D builder both the
+      benchmark app and the Qt plugin call. Keep it Qt-independent.
 
-- [ ] Create plugin skeleton based on `qlinuxfb` source
-      (`qtbase/src/plugins/platforms/linuxfb/`).
-- [ ] Replace `flush()` memcpy with GC520 DE BIT_BLT (backing store BO → KMS BO).
-      This alone accelerates the final screen blit for all QWidget apps.
-- [ ] Subclass `QRasterPaintEngine` (private API: `<private/qrasterpaintengine_p.h>`):
-  - [ ] Override `drawRects()` → DE CLEAR command
-  - [ ] Override `drawPixmap()` → DE BIT_BLT command
-  - [ ] Override `drawImage()` → DE BIT_BLT command
-  - Fallback to `QRasterPaintEngine::drawXxx()` for unsupported ops.
-- [ ] KMS integration: allocate framebuffer BOs exportable as dma-buf,
-      import into display controller via `drmPrimeFDToHandle` + `drmModeAddFB2`
-      + `drmModePageFlip`.
-- [ ] Register plugin under `QT_QPA_PLATFORM=etnaviv2d`.
-- [ ] Benchmark frame rate vs linuxfb CPU baseline on a representative widget app.
+### Phase 3 — KMS scanout milestone (display half, no Qt)  ← NEW, do before Qt
 
-### Phase 3 — Optional extensions
+- [ ] Prove on-panel output independently of the paint path: allocate a
+      scanout BO, export dma-buf (`drmPrimeHandleToFD`), `drmModeAddFB2`,
+      `drmModeSetCrtc` / `drmModePageFlip` on `/dev/dri/card0`.
+- [ ] Confirm the DE can render *into* a scanout-capable BO (stride/tiling/
+      alignment per `doc/2D/Vivante.GPU.Alignment.Requirements`).
+- [ ] Standalone benchmark app: N sprites/frame, `etna2d_blit`+`blend` vs a
+      CPU `memcpy`/software-blend baseline. This is the clean headline
+      accel-vs-CPU number (no toolkit noise). Also satisfies the
+      "custom weston/DRM app" benchmark goal.
+
+### Phase 4 — Qt5 QPA plugin
+
+- [ ] Plugin skeleton from `qlinuxfb` (`qtbase/src/plugins/platforms/linuxfb/`),
+      backing store into a dma-buf BO, scanout via the Phase 3 KMS path.
+- [ ] **Primary win — subclass `QRasterPaintEngine`**
+      (`<private/qrasterpaintengine_p.h>`) so pixel work moves to the GPU:
+  - [ ] `fillRect()` / `drawRects()` → `etna2d_fill`
+  - [ ] `drawImage()` / `drawPixmap()` → `etna2d_blit` (+ `etna2d_blend`
+        when composition mode ≠ Source)
+  - Fall back to `QRasterPaintEngine::drawXxx()` for unsupported ops.
+- [ ] Accelerate `flush()` (backing store BO → scanout BO) with `etna2d_blit`.
+      NOTE: this alone yields only a few % — by flush time the CPU has
+      already rasterized everything. The paint-engine overrides above are
+      where the FPS win comes from; do them first, not last.
+- [ ] Register under `QT_QPA_PLATFORM=etnaviv2d`.
+- [ ] Benchmark vs `linuxfb` CPU baseline on a representative widget app
+      (real-world number, to complement the Phase 3 headline number).
+
+### Phase 5 — Optional extensions
 
 - [ ] Alpha blend compositing in the paint engine (`VIVS_DE_ALPHA_MODES`).
 - [ ] Stretch blit for scaled `drawPixmap()`.
@@ -171,9 +226,11 @@ pattern is in `etnaviv_2d_test.c`.
 | File | Purpose |
 |---|---|
 | `drivers/gpu/drm/etnaviv/` | Working 6.6 etnaviv tree |
-| `tests/etnaviv/etnaviv_2d_test.c` | Working DE command stream template |
-| `tests/etnaviv/state_2d.xml.h` | Complete DE register map (all 2D operations) |
-| `etnaviv/etnaviv_drmif.h` | Full libdrm_etnaviv userspace API |
+| `tests/libdrm/etnaviv_2d_test.c` | Working DE command stream template (CLEAR) |
+| `tests/libdrm/state_2d.xml.h` | Complete DE register map (all 2D operations) |
+| `etnaviv/etnaviv_drmif.h` | libdrm_etnaviv userspace API (BO/stream/submit/fence) |
+| `drivers/ref/GC520L/.../driver/dfb/gc_dfb_raster.c` | Vendor DE op sequences — **reference only** (galcore ABI, do not link) |
+| `drivers/ref/GC520L/.../doc/2D/` | Vivante 2D API + alignment PDFs — DE programming reference |
 | `qtbase/src/plugins/platforms/linuxfb/` | QPA plugin skeleton to start from |
 | `qtbase/src/plugins/platforms/directfb/` | Reference: non-GL 2D QPA plugin |
 | `qtbase/src/plugins/platforms/direct2d/` | Reference: QRasterPaintEngine subclass pattern |
