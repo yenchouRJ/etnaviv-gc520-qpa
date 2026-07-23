@@ -13,6 +13,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/regulator/consumer.h>
+#include <linux/reset.h>
 #include <linux/thermal.h>
 
 #include "etnaviv_cmdbuf.h"
@@ -649,6 +650,8 @@ static void etnaviv_gpu_enable_mlcg(struct etnaviv_gpu *gpu)
 
 void etnaviv_gpu_start_fe(struct etnaviv_gpu *gpu, u32 address, u16 prefetch)
 {
+	printk("Start FE: 0x%x, debug 0x%x, prefetch length %d\n",
+	       address, gpu_read(gpu, VIVS_FE_DMA_ADDRESS), prefetch);
 	gpu_write(gpu, VIVS_FE_COMMAND_ADDRESS, address);
 	gpu_write(gpu, VIVS_FE_COMMAND_CONTROL,
 		  VIVS_FE_COMMAND_CONTROL_ENABLE |
@@ -676,6 +679,9 @@ static void etnaviv_gpu_start_fe_idleloop(struct etnaviv_gpu *gpu,
 	prefetch = etnaviv_buffer_init(gpu);
 	address = etnaviv_cmdbuf_get_va(&gpu->buffer,
 					&gpu->mmu_context->cmdbuf_mapping);
+
+	printk("iova 0x%x, offset 0x%x\n", address,
+	       gpu->buffer.suballoc_offset);
 
 	etnaviv_gpu_start_fe(gpu, address, prefetch);
 
@@ -778,6 +784,25 @@ int etnaviv_gpu_init(struct etnaviv_gpu *gpu)
 	if (ret < 0) {
 		dev_err(gpu->dev, "Failed to enable GPU power domain\n");
 		goto pm_put;
+	}
+
+	{
+		struct reset_control *rst;
+		struct device *dev = gpu->dev;
+
+		rst = devm_reset_control_get_optional(dev, "gpu");
+		if (IS_ERR(rst)) {
+			dev_err(dev, "failed to get reset: %ld\n", PTR_ERR(rst));
+			ret = PTR_ERR(rst);
+			goto fail;
+		}
+		if (rst) {
+			reset_control_assert(rst);
+			usleep_range(1000, 2000);
+			reset_control_deassert(rst);
+			usleep_range(1000, 2000);
+			dev_info(dev, "Etnaviv reset deasserted\n");
+		}
 	}
 
 	etnaviv_hw_identify(gpu);
@@ -1530,10 +1555,12 @@ static irqreturn_t irq_handler(int irq, void *data)
 
 		pm_runtime_mark_last_busy(gpu->dev);
 
-		dev_dbg(gpu->dev, "intr 0x%08x\n", intr);
+		dev_info(gpu->dev, "intr 0x%08x\n", intr);
 
 		if (intr & VIVS_HI_INTR_ACKNOWLEDGE_AXI_BUS_ERROR) {
 			dev_err(gpu->dev, "AXI bus error\n");
+			u32 axi = gpu_read(gpu, VIVS_HI_AXI_STATUS);
+			printk("axi status 0x%x\n", axi);
 			intr &= ~VIVS_HI_INTR_ACKNOWLEDGE_AXI_BUS_ERROR;
 		}
 

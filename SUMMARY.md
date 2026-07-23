@@ -6,12 +6,15 @@ Buildroot:
 - /home/joeylu/Documents/workspace/ma35d1/ma35d1_br24_qt5
 drivers:
 - {buildroot}/output/build/linux-custom/drivers/gpu/drm
+- /home/joeylu/opencode/graphic/drm-2d-gc520/drivers/gpu/drm
 devicetree:
 - {buildroot}/output/build/linux-custom/arch/arm64/boot/dts/nuvoton/ma35d1.dtsi
 - {buildroot}/output/build/linux-custom/arch/arm64/boot/dts/nuvoton/ma35d1-som-256m.dts
 packages:
 - {buildroot}/output/build/libdrm-2.4.120
 - {buildroot}/output/build/qt5base-
+vivante's vender support with tests:
+- /home/joeylu/opencode/graphic/drm-2d-gc520/drivers/ref/GC520L
 
 ---
 
