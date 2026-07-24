@@ -77,3 +77,59 @@ are confirmed working end-to-end on GC520 rev 0x5341.
 the Phase 2 `libetna2d` module. Each function emits a complete, stateless
 DE command sequence (full state setup + `DRAW_2D` rectangle) into an
 `etna_cmd_stream`. No state leaks between ops.
+
+---
+
+## Phase 2 — `libetna2d` (thin userspace HAL)
+
+**Source:** `tests/libetna2d/`  
+**Artifacts:** `libetna2d.so.1` (SONAME'd shared), `libetna2d.a` (static),
+`etna2d.h` (public API), `etna2d_selftest` (on-target acceptance test).
+
+The validated Phase 1 DE sequences were repackaged behind an opaque,
+Qt-independent, C API. This is the reusable 2D builder that both the Phase 3
+benchmark app and the Phase 4 Qt QPA plugin link against.
+
+### API shape (`etna2d.h`)
+
+| Type | Role |
+|---|---|
+| `etna2d_device`  | DRM render node + 2D-capable core (FEATURES_0 bit 9) + `ETNA_PIPE_2D` |
+| `etna2d_surface` | 32bpp ARGB drawable — created fresh **or** imported from a PRIME dma-buf fd |
+| `etna2d_context` | accumulating `etna_cmd_stream`; ops batch until `flush`/`finish` |
+
+Operations: `etna2d_fill`, `etna2d_blit` (sub-rects, selectable ROP, opaque
+or premult SrcOver), `etna2d_blend_over`, `etna2d_stretch`.
+
+### Design decisions
+
+- **Surfaces bundle `{bo, stride, w, h}`** — callers pass one handle, not
+  four loose params. Maps cleanly onto a Qt pixmap / KMS scanout buffer.
+- **`etna2d_surface_from_dmabuf`** wraps `etna_bo_from_dmabuf`, providing the
+  import half of the Phase 3 KMS flow (dumb buffer on card0 → PRIME export →
+  import into etnaviv MMU v2) up front.
+- **Batching** — a context holds one persistent command stream; N ops
+  accumulate into a single submit. This is the real throughput lever
+  (N sprites = 1 submit + 1 fence, not N). `flush()` is async, `finish()`
+  blocks on the fence for CPU-coherent readback.
+- **Stride auto-aligned** to 64B (`ETNA2D_ALIGN`) per the Vivante alignment
+  doc; width rounded up to 16px equivalent.
+- **`ETNA_BO_WC`** mappings + a `__sync_synchronize()` drain in
+  `etna2d_surface_cpu_fini()` before the GPU reads CPU-written pixels.
+- **Pluggable logger** (`etna2d_set_logger`) instead of hardwired stderr —
+  silent by default, so the library is embeddable in Qt.
+
+### Acceptance test (`etna2d_selftest`)
+
+Exercises the full API — device/surface/context lifecycle, all four ops,
+and specifically the **batching path** (3 ops in one submit) that Phase 1
+did not cover. CPU-verifies:
+- batched fill + fill + premult blend (result `0xff80007f` over blue bg,
+  `0xff807f00` over a green box) within ±2/channel;
+- opaque sub-rect blit (copied region, background intact, outside untouched);
+- 2× stretch (four quadrant colours land in the right destination cells).
+
+Cross-compiles cleanly for aarch64 (no warnings). `libetna2d.so.1` exports
+only the `etna2d_*` API; its sole external dependency is `libdrm_etnaviv`.
+
+**Status:** built and staged. On-hardware run of `etna2d_selftest` pending.
