@@ -184,20 +184,48 @@ Goal: prove each 2D op produces correct pixels in a BO. Template:
 
 ### Phase 3 — KMS scanout milestone (display half, no Qt)  ← NEW, do before Qt
 
-- [ ] Prove on-panel output independently of the paint path: allocate a
-      scanout BO, export dma-buf (`drmPrimeHandleToFD`), `drmModeAddFB2`,
-      `drmModeSetCrtc` / `drmModePageFlip` on `/dev/dri/card0`.
-- [ ] Confirm the DE can render *into* a scanout-capable BO (stride/tiling/
-      alignment per `doc/2D/Vivante.GPU.Alignment.Requirements`).
+Display backend = **DRM/KMS on `/dev/dri/card0` (ma35), NOT linuxfb/fbdev.**
+The ma35 driver advertises `DRIVER_GEM|DRIVER_MODESET|DRIVER_ATOMIC` with
+GEM-DMA (CMA, contiguous) dumb buffers + PRIME (`ma35_drm.c:61`), so KMS
+gives zero-copy present via page flip. linuxfb would force a CPU memcpy at
+present time — re-adding the CPU cost we are trying to remove. Keep linuxfb
+only as a bring-up fallback.
+
+Buffer-sharing direction (dictated by the HW): the display is contiguous
+with no display-side IOMMU; etnaviv has its own MMU v2. Therefore allocate
+the scanout BO on the **display** side and import it into **etnaviv** — not
+the reverse:
+
+```
+1. drmModeCreateDumbBuffer on card0 (ma35)  → contiguous scanout BO
+2. PRIME export → dma-buf fd  (DRM_IOCTL_PRIME_HANDLE_TO_FD)
+3. etna_bo_from_dmabuf(dev, fd)             → etnaviv maps it via its MMU
+4. 2D engine (renderD128) renders fill/blit/blend INTO that BO
+5. drmModeAddFB2 + atomic page flip on card0 → on panel, zero copy
+```
+
+- [ ] Prove on-panel output independently of the paint path: dumb buffer →
+      PRIME export → `drmModeAddFB2` → `drmModeSetCrtc`/`drmModePageFlip`.
+- [ ] Prove the import path: `etna_bo_from_dmabuf` on the exported fd, then
+      DE renders into it (stride/tiling/alignment per
+      `doc/2D/Vivante.GPU.Alignment.Requirements`).
+- [ ] Double-buffer: two scanout BOs, ping-pong on flip, wait flip event.
 - [ ] Standalone benchmark app: N sprites/frame, `etna2d_blit`+`blend` vs a
       CPU `memcpy`/software-blend baseline. This is the clean headline
       accel-vs-CPU number (no toolkit noise). Also satisfies the
       "custom weston/DRM app" benchmark goal.
 
-### Phase 4 — Qt5 QPA plugin
+### Phase 4 — Qt5 QPA plugin (KMS-backed, non-GL)
 
-- [ ] Plugin skeleton from `qlinuxfb` (`qtbase/src/plugins/platforms/linuxfb/`),
-      backing store into a dma-buf BO, scanout via the Phase 3 KMS path.
+Compose the plugin from two existing pieces, not from scratch:
+- raster structure (`QFbScreen`/backing-store pattern) from **`linuxfb`**
+  (`qtbase/src/plugins/platforms/linuxfb/`)
+- KMS modeset + page flip from **`kmsconvenience`**
+  (`qtbase/src/platformsupport/kmsconvenience/`: `QKmsDevice`, `QKmsOutput`)
+  — the same plumbing `eglfs_kms` uses, but without GL/GBM/EGL.
+
+- [ ] Backing store = dma-buf scanout BO (Phase 3 flow); present via KMS
+      page flip. Do NOT use fbdev.
 - [ ] **Primary win — subclass `QRasterPaintEngine`**
       (`<private/qrasterpaintengine_p.h>`) so pixel work moves to the GPU:
   - [ ] `fillRect()` / `drawRects()` → `etna2d_fill`
