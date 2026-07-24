@@ -133,3 +133,60 @@ Cross-compiles cleanly for aarch64 (no warnings). `libetna2d.so.1` exports
 only the `etna2d_*` API; its sole external dependency is `libdrm_etnaviv`.
 
 **Status:** built and staged. On-hardware run of `etna2d_selftest` pending.
+
+---
+
+## Phase 3 — KMS scanout milestone (display half, no Qt)
+
+**Source:** `tests/kms/`  
+**Display:** DRM/KMS on `/dev/dri/card0` (ma35 driver), legacy modeset path.
+**Render:** GC520 via libetna2d on `/dev/dri/renderD128`.
+
+Proves the zero-copy present pipeline separately from any toolkit: the
+display allocates a contiguous dumb buffer, exports it via PRIME, etnaviv
+imports it into its MMU v2, the DE renders into it, and KMS page-flips it
+onto the panel — no CPU copy at present time.
+
+### Display helper (`kms_display.[ch]`)
+
+Encapsulates the display side so the milestone programs stay small:
+`kms_open` (pick first connected connector + usable crtc + preferred mode),
+`kms_fb_create` (dumb buffer → `drmModeAddFB2`, `DRM_FORMAT_XRGB8888`),
+`kms_fb_export_dmabuf` (`drmPrimeHandleToFD`), `kms_set_crtc`,
+`kms_page_flip` + `kms_wait_flip` (vblank event via `drmHandleEvent`).
+Saves/restores the original CRTC on close. Legacy modeset (not atomic) —
+sufficient for fullscreen scanout and simpler.
+
+ma35 capabilities confirmed from the driver source: `DRIVER_GEM|MODESET|
+ATOMIC`, GEM-DMA dumb buffers with VMAP, PRIME, and `ARGB8888`/`XRGB8888`
+primary-plane formats (`ma35_plane.c`).
+
+### Milestones
+
+| Program | Proves |
+|---|---|
+| `kms_test` | Milestone A — on-panel output: dumb buffer → `AddFB2` → CPU test pattern (colour bars + diagonal) → `SetCrtc`. Display path stands alone (no GPU, does not even link libetna2d). |
+| `kms_gpu_test` | Milestone B — the import path: scanout → PRIME export → `etna2d_surface_from_dmabuf` → DE fills + premult blend render **into** the scanout BO → present. Every on-screen pixel is GPU-produced through etnaviv's MMU. |
+| `bench2d` | Milestone C+D — double-buffered (two scanout FBs, ping-pong on vblank) animated benchmark; `--gpu` (libetna2d fill + SrcOver) vs `--cpu` (software premult SrcOver) over the identical scene. Reports FPS and ms/frame. |
+
+### `bench2d` methodology
+
+Identical workload both modes: background fill + N × 96×96 premultiplied
+source-over sprite composites per frame, double-buffered, animated. Only the
+pixel-touching engine differs (GC520 DE vs a scalar CPU compositor). Knobs:
+`-n` sprites, `-f` frames, `--no-vsync` (measure uncapped render throughput
+vs vsync-capped present rate), `--card`, `--render`. The `--no-vsync`
+render-time figure is the clean fill-rate comparison; the vsync FPS is the
+real present rate.
+
+Cross-compiles cleanly for aarch64 (no warnings); `bench2d`/`kms_gpu_test`
+link `libetna2d.a` + `libdrm`, `kms_test` links only `libdrm`.
+
+**Status:** built and staged. On-hardware runs pending. Run from a text VT
+with no compositor/Qt holding the display:
+```
+./kms_test /dev/dri/card0 5
+./kms_gpu_test /dev/dri/card0 /dev/dri/renderD128 5
+./bench2d --gpu -n 64 -f 300   ;   ./bench2d --cpu -n 64 -f 300
+./bench2d --gpu -n 64 -f 300 --no-vsync   # uncapped fill-rate
+```
