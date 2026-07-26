@@ -188,5 +188,88 @@ with no compositor/Qt holding the display:
 ./kms_test /dev/dri/card0 5
 ./kms_gpu_test /dev/dri/card0 /dev/dri/renderD128 5
 ./bench2d --gpu -n 64 -f 300   ;   ./bench2d --cpu -n 64 -f 300
-./bench2d --gpu -n 64 -f 300 --no-vsync   # uncapped fill-rate
+./bench2d --gpu -n 64 -f 300 --no-vsync   # render-rate only (no present)
 ```
+
+### First on-hardware results (1024x600@60, 96×96 sprites)
+
+| Run | render ms/frame | rate |
+|---|---|---|
+| CPU, 60 sprites | 121.6 | 7.5 FPS (vsync-capped) |
+| GPU, 60 sprites | 11.0 | 56.9 FPS (vsync-capped) |
+
+GC520 DE composites the same scene ~11× faster than the scalar CPU loop.
+
+### Bug fixes and hardening from that first run
+
+**MMU fault / GPU hang under animation** (`MMU 0 fault (page not present)`).
+The GPU hung intermittently once sprites were bouncing around the screen.
+
+*Root cause — an application bug, confirmed from the crash dump.* A
+devcoredump was captured on hang and parsed:
+
+```
+scanout BO iova  : 0x2e3000
+scanout BO size  : 0x258000   (2,457,600 = 600 rows × 4096 B stride)
+scanout BO end   : 0x2e3000 + 0x258000 = 0x53b000
+fault address    : 0x53b5c0   →  0x5c0 past the end  (row 600 of a 600-row buffer)
+```
+
+Every fault address (`0x53b5c0`, `0x53b700`, `0x53c2c0`) sat 1–2 rows past
+the buffer end. The benchmark's `sprites_step` only **reversed velocity** at
+the edge without **clamping** position, so a fast sprite could overshoot to
+`y = 505.x` → `dy = 505`, `dy + SPRITE_H = 601 > 600`. A `SRC_OVER` blend
+**reads** the destination pixels it composites onto, so the DE read
+destination row 600 — past the BO's last mapped page — and MMU-faulted.
+(A plain fill only *writes*, and the write is bounded by the DE clip window,
+which is why fills never faulted; only the blend's destination *read* runs
+unchecked.)
+
+This is not a hardware or command-stream problem: the DE has **no implicit
+bounds checking**, and the MA35D1 has no IOMMU between engines — an
+out-of-bounds op simply walks unmapped GPU-VA and faults.
+
+*Two fixes:*
+- **App (`bench2d.c`):** `sprites_step` now clamps position to
+  `[0, dim − SPRITE]` in addition to reflecting velocity, so every op stays
+  in-bounds.
+- **Library robustness (`libetna2d.c`, the important one):** `etna2d_blit`
+  now clips the transfer rect to **both** the source and destination extents
+  (and drops fully-off-surface ops); `etna2d_fill` clips to the destination.
+  A 2D library must never let a caller's bad rectangle hang the GPU. Since
+  `etna2d_blend_over` delegates to `blit`, blends are covered.
+
+**Atomic ops across libdrm auto-flush (`op_begin`).** Separate from the fault
+above, `etna_cmd_stream_reserve()` in libdrm does **not** grow the command
+buffer — when it fills it *auto-flushes* (submits) the partial stream. With a
+batched context such a flush could land **inside** an op, splitting its BO
+relocation from the `DRAW_2D` that consumes it. `op_begin()` reserves a full
+worst-case op (`ETNA2D_OP_WORDS = 128`) up front so any auto-flush occurs at
+a clean op boundary and every op stays atomic; it also resets `pending` if a
+flush fired so `flush`/`finish` don't double-submit. `etna2d_context_create`
+sizing was matched (64 → 128 words/op). This keeps batching safe at any op
+count.
+
+**Fair CPU baseline colour.** The GPU blended one premultiplied 50%-red
+texture while the CPU path blended random multi-colour sprites — visually
+misleading even though pixel counts matched. `sprites_init` now uses the
+identical `0x80800000` premultiplied red, so both paths composite the same
+scene and only the compositing engine differs.
+
+**`--no-vsync` measurement corrected.** Queuing a page flip without waiting
+the prior vblank is rejected with `EBUSY`, so most frames were dropped and
+the "uncapped FPS" reflected a flip-spamming loop, not throughput. `--no-vsync`
+now skips modeset and presentation entirely (display untouched) and reports a
+**render rate** derived from render time — GPU-fenced by `etna2d_finish` (real
+DE fill-rate) or the scalar CPU loop. The vsync path additionally reports the
+real vsync-capped **present rate**. Output separates the two.
+
+**Takeaway / correct flow on this arch.** Scanout buffers are contiguous
+(CMA) dumb BOs on `card0`, PRIME-exported and imported into etnaviv; the GPU
+renders into them (clipped), is **explicitly fenced** (`etna2d_finish`) before
+the flip, then `card0` page-flips and waits vblank. Display and GPU share only
+bytes (no IOMMU coupling, no cross-engine fences) — so bounds and GPU→display
+ordering are the caller's responsibility, both now enforced.
+
+**Status:** all fixes built clean (aarch64, no warnings) and verified on
+hardware — no MMU faults at high sprite counts, GPU ~11× faster than CPU.

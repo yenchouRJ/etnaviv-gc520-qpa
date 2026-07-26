@@ -166,6 +166,31 @@ static void op_tail(struct etna_cmd_stream *s)
 	ss(s, VIVS_GL_FLUSH_CACHE, VIVS_GL_FLUSH_CACHE_PE2D);
 }
 
+/* Worst-case command words for a single op (blit-with-blend is the largest:
+ * ~40 state writes @2w + draw_2d @4w + tail @8w). Round up generously. */
+#define ETNA2D_OP_WORDS 128u
+
+/* Reserve a whole op's worth of space up front.
+ *
+ * etna_cmd_stream_reserve() does NOT grow the buffer — when space runs out
+ * it *auto-flushes* (submits) the stream. If that happened partway through
+ * an op, the op's BO relocation (address patch) would land in one submit
+ * while the DRAW_2D that consumes it landed in the next, leaving the DE to
+ * draw from a stale/garbage GPU address -> "MMU page not present" fault and
+ * a GPU hang. Reserving the whole op here forces any flush to occur at a
+ * clean op boundary, keeping every op atomic. */
+static void op_begin(struct etna2d_context *ctx)
+{
+	uint32_t before = etna_cmd_stream_offset(ctx->stream);
+	etna_cmd_stream_reserve(ctx->stream, ETNA2D_OP_WORDS);
+	/* If reserve triggered an auto-flush the stream reset to offset 0 and
+	 * the previously-accumulated ops were already submitted; drop them
+	 * from our pending count so flush()/finish() don't double-submit. */
+	if (etna_cmd_stream_offset(ctx->stream) < before)
+		ctx->pending = 0;
+}
+
+
 static void set_source(struct etna_cmd_stream *s,
 		       struct etna_bo *src, uint32_t src_stride,
 		       int src_w, int src_h, int src_x, int src_y)
@@ -385,8 +410,10 @@ int etna2d_context_create(struct etna2d_device *dev, unsigned hint_ops,
 	if (!dev || !out)
 		return ETNA2D_EINVAL;
 
-	/* ~64 command words per op; clamp to a sane range. */
-	words = (hint_ops ? hint_ops : 16) * 64u;
+	/* Size the buffer to hold hint_ops full ops without splitting.
+	 * ETNA2D_OP_WORDS is the worst-case op size; op_begin() keeps every
+	 * op atomic even if this estimate is exceeded. */
+	words = (hint_ops ? hint_ops : 16) * ETNA2D_OP_WORDS;
 	if (words < 0x400) words = 0x400;
 
 	ctx = calloc(1, sizeof(*ctx));
@@ -443,9 +470,20 @@ int etna2d_fill(struct etna2d_context *ctx, struct etna2d_surface *dst,
 
 	if (!ctx || !dst || w <= 0 || h <= 0)
 		return ETNA2D_EINVAL;
+	/* Clip to the destination; the DE clip window bounds the write but a
+	 * rect starting off-surface would still program a bad base offset. */
+	if (x < 0) { w += x; x = 0; }
+	if (y < 0) { h += y; y = 0; }
+	if (x >= dst->w || y >= dst->h)
+		return ETNA2D_OK;
+	if (x + w > dst->w) w = dst->w - x;
+	if (y + h > dst->h) h = dst->h - y;
+	if (w <= 0 || h <= 0)
+		return ETNA2D_OK;
 	s = ctx->stream;
 
 	LOG_DBG("fill (%d,%d %dx%d) argb=0x%08x", x, y, w, h, argb);
+	op_begin(ctx);
 
 	ss(s, VIVS_DE_SRC_STRIDE, 0);
 	ss(s, VIVS_DE_SRC_ROTATION_CONFIG, 0);
@@ -500,6 +538,26 @@ int etna2d_blit(struct etna2d_context *ctx,
 
 	if (!ctx || !src || !dst || w <= 0 || h <= 0)
 		return ETNA2D_EINVAL;
+
+	/* Clip the transfer rect to BOTH the source and destination extents.
+	 *
+	 * A 1:1 blit reads src[sx..sx+w, sy..sy+h] and writes/reads
+	 * dst[dx..dx+w, dy..dy+h]. The DE has no implicit bounds check: if any
+	 * edge exceeds a surface it walks past the BO's mapped pages and takes
+	 * an "MMU page not present" fault (hanging the GPU). The DE_CLIP window
+	 * bounds the *write* but NOT the source read nor the destination read
+	 * done for SRC_OVER blending, so we must shrink w/h here. Also drop the
+	 * op entirely if it starts outside either surface. */
+	if (dx < 0 || dy < 0 || sx < 0 || sy < 0 ||
+	    dx >= dst->w || dy >= dst->h || sx >= src->w || sy >= src->h)
+		return ETNA2D_OK;   /* fully clipped: nothing to draw */
+	if (dx + w > dst->w) w = dst->w - dx;
+	if (dy + h > dst->h) h = dst->h - dy;
+	if (sx + w > src->w) w = src->w - sx;
+	if (sy + h > src->h) h = src->h - sy;
+	if (w <= 0 || h <= 0)
+		return ETNA2D_OK;
+
 	if (!rop)
 		rop = ETNA2D_ROP_COPY;
 	s = ctx->stream;
@@ -507,6 +565,7 @@ int etna2d_blit(struct etna2d_context *ctx,
 	LOG_DBG("blit src(%d,%d) -> dst(%d,%d) %dx%d blend=%d rop=0x%02x",
 		sx, sy, dx, dy, w, h, blend, rop);
 
+	op_begin(ctx);
 	set_source(s, src->bo, src->stride, src->w, src->h, sx, sy);
 	ss(s, VIVS_DE_STRETCH_FACTOR_LOW, 0);
 	ss(s, VIVS_DE_STRETCH_FACTOR_HIGH, 0);
@@ -572,19 +631,36 @@ int etna2d_stretch(struct etna2d_context *ctx,
 {
 	struct etna_cmd_stream *s;
 	uint32_t fx, fy;
+	int cx0, cy0, cx1, cy1;
 
 	if (!ctx || !src || !dst || dw <= 0 || dh <= 0)
 		return ETNA2D_EINVAL;
 	s = ctx->stream;
 
 	/* Vivante .16 fixed-point stretch factor, point sampled:
-	 *   factor = ((srcSize - 1) << 16) / (dstSize - 1) */
+	 *   factor = ((srcSize - 1) << 16) / (dstSize - 1)
+	 * Computed from the FULL requested dw/dh so the scaling geometry is
+	 * preserved even when the destination rect is partially off-surface. */
 	fx = (dw > 1) ? (uint32_t)(((uint64_t)(src->w - 1) << 16) / (dw - 1)) : 0;
 	fy = (dh > 1) ? (uint32_t)(((uint64_t)(src->h - 1) << 16) / (dh - 1)) : 0;
+
+	/* Clip the DESTINATION write rect to the surface. The source read is
+	 * inherently in-bounds: at dest column i the source index is
+	 * (i * fx) >> 16, whose maximum over i in [0, dw-1] is exactly
+	 * src->w - 1 by construction, so only the write needs bounding. The
+	 * factors above are left unchanged, so clipping just drops the tail
+	 * that would fall outside the surface rather than rescaling. */
+	cx0 = dx < 0 ? 0 : dx;
+	cy0 = dy < 0 ? 0 : dy;
+	cx1 = dx + dw; if (cx1 > dst->w) cx1 = dst->w;
+	cy1 = dy + dh; if (cy1 > dst->h) cy1 = dst->h;
+	if (cx0 >= cx1 || cy0 >= cy1)
+		return ETNA2D_OK;   /* fully clipped: nothing to draw */
 
 	LOG_DBG("stretch src %dx%d -> dst(%d,%d) %dx%d factor x=0x%05x y=0x%05x",
 		src->w, src->h, dx, dy, dw, dh, fx, fy);
 
+	op_begin(ctx);
 	set_source(s, src->bo, src->stride, src->w, src->h, 0, 0);
 	ss(s, VIVS_DE_STRETCH_FACTOR_LOW,  VIVS_DE_STRETCH_FACTOR_LOW_X(fx));
 	ss(s, VIVS_DE_STRETCH_FACTOR_HIGH, VIVS_DE_STRETCH_FACTOR_HIGH_Y(fy));
@@ -601,9 +677,9 @@ int etna2d_stretch(struct etna2d_context *ctx,
 	   VIVS_DE_ROP_ROP_FG(0xcc) | VIVS_DE_ROP_ROP_BG(0xcc) |
 	   VIVS_DE_ROP_TYPE_ROP4);
 	ss(s, VIVS_DE_CLIP_TOP_LEFT,
-	   VIVS_DE_CLIP_TOP_LEFT_X(dx) | VIVS_DE_CLIP_TOP_LEFT_Y(dy));
+	   VIVS_DE_CLIP_TOP_LEFT_X(cx0) | VIVS_DE_CLIP_TOP_LEFT_Y(cy0));
 	ss(s, VIVS_DE_CLIP_BOTTOM_RIGHT,
-	   VIVS_DE_CLIP_BOTTOM_RIGHT_X(dx + dw) | VIVS_DE_CLIP_BOTTOM_RIGHT_Y(dy + dh));
+	   VIVS_DE_CLIP_BOTTOM_RIGHT_X(cx1) | VIVS_DE_CLIP_BOTTOM_RIGHT_Y(cy1));
 	ss(s, VIVS_DE_CONFIG, 0);
 	ss(s, VIVS_DE_SRC_ORIGIN_FRACTION, 0);
 	ss(s, VIVS_DE_ALPHA_CONTROL, 0);
@@ -613,7 +689,7 @@ int etna2d_stretch(struct etna2d_context *ctx,
 	ss(s, VIVS_DE_ROT_ANGLE, 0);
 
 	pe_reset(s);
-	draw_2d_rect(s, dx, dy, dx + dw, dy + dh);
+	draw_2d_rect(s, cx0, cy0, cx1, cy1);
 	op_tail(s);
 	ctx->pending++;
 	return ETNA2D_OK;

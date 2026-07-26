@@ -139,6 +139,55 @@ int main(int argc, char **argv)
 		etna2d_surface_destroy(small);
 	}
 
+	/* --- Batch 4: out-of-bounds clipping (robustness) -----------------
+	 * Ops whose destination rect runs past the surface must be clipped by
+	 * the library, never handed to the DE (which has no bounds check and
+	 * would MMU-fault / hang the GPU on an out-of-range read/write). We
+	 * push fill, blend and stretch off the edges, then verify the GPU
+	 * still runs, in-bounds pixels are correct, and untouched regions stay
+	 * untouched. Ops are placed to avoid overlap so each check is exact. */
+	{
+		etna2d_fill(ctx, dst, 0, 0, W, H, 0xff111111u);   /* known bg */
+
+		/* fill straddling the top-left (negative origin): the in-bounds
+		 * part [0..16] x [0..16] gets 0xffff0000. */
+		etna2d_fill(ctx, dst, -32, -32, 48, 48, 0xffff0000u);
+
+		/* fill straddling the bottom-right corner: only [W-16..W] x
+		 * [H-16..H] should be written green. */
+		etna2d_fill(ctx, dst, W - 16, H - 16, 64, 64, 0xff00ff00u);
+
+		/* opaque blit whose source overhangs the RIGHT edge: dest
+		 * [W-16..W] x [0..16], reads src[0..16, 0..16] (clipped w). */
+		etna2d_blit(ctx, src, 0, 0, dst, W - 16, 0, 64, 16,
+			    ETNA2D_BLEND_NONE, ETNA2D_ROP_COPY);
+
+		/* stretch overhanging the bottom edge only, in a clear column
+		 * band [8..40] x [H-40..H+88] -> clipped to [..H]. Must not
+		 * fault; the last row in that band must be written. */
+		etna2d_stretch(ctx, src, dst, 8, H - 40, 32, 128);
+
+		/* fully off-surface: pure no-ops, must be dropped cleanly. */
+		etna2d_fill(ctx, dst, W + 10, H + 10, 32, 32, 0xffabcdefu);
+		etna2d_blend_over(ctx, src, dst, W + 100, 0, 32, 32);
+		etna2d_stretch(ctx, src, dst, -300, -300, 64, 64);
+
+		rc = etna2d_finish(ctx);
+		ok("clipped ops finish (no GPU hang)", rc == ETNA2D_OK);
+
+		dp = etna2d_surface_map(dst);
+		ok("clip: top-left fill in-bounds",
+		   dp[4*W + 4] == 0xffff0000u);
+		ok("clip: bottom-right fill in-bounds",
+		   dp[(H - 8)*W + (W - 8)] == 0xff00ff00u);
+		ok("clip: right-overhang blit in-bounds",
+		   dp[4*W + (W - 8)] == 0x80800000u);
+		ok("clip: bottom-overhang stretch reached last row",
+		   dp[(H - 1)*W + 20] != 0xff111111u);
+		ok("clip: interior bg untouched",
+		   dp[(H/2)*W + (W/2)] == 0xff111111u);
+	}
+
 out:
 	etna2d_context_destroy(ctx);
 	etna2d_surface_destroy(big);
