@@ -162,6 +162,23 @@ int etna2d_stretch(struct etna2d_context *ctx,
 		   struct etna2d_surface *dst,
 		   int dx, int dy, int dw, int dh);
 
+/* Destination rectangle for the batched stretch API. */
+struct etna2d_rect { int x, y, w, h; };
+
+/* Batched point-sampled stretch: scale the whole src into each of the `n`
+ * destination rectangles in `rects`. The heavy per-op DE state (source,
+ * dest, ROP, format, pe_reset) is emitted ONCE for the whole batch; each
+ * rect then costs only its stretch factor, clip window and DRAW_2D. This
+ * cuts the fixed per-tile cost several-fold versus calling etna2d_stretch()
+ * in a loop, which matters when a frame is hundreds/thousands of small
+ * tiles (heavy downscale). Rects are clipped individually; fully-off rects
+ * are skipped. The batch auto-flushes internally to respect the kernel's
+ * per-submit size cap, re-emitting shared state as needed. */
+int etna2d_stretch_batch(struct etna2d_context *ctx,
+			 struct etna2d_surface *src,
+			 struct etna2d_surface *dst,
+			 const struct etna2d_rect *rects, int n);
+
 #ifdef __cplusplus
 }
 #endif

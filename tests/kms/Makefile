@@ -4,6 +4,7 @@
 #   kms_test      Milestone A — on-panel test pattern (CPU-drawn, no GPU)
 #   kms_gpu_test  Milestone B — GPU renders into PRIME-imported scanout
 #   bench2d       Milestone C+D — double-buffered GPU-vs-CPU FPS benchmark
+#   bench_stretch StretchBlt (scaler) GPU-vs-CPU throughput benchmark
 #
 # Depends on libetna2d (../libetna2d): build that first, or run `make` here
 # which recurses into it.
@@ -18,6 +19,8 @@
 #   ./kms_gpu_test /dev/dri/card0 /dev/dri/renderD128 5
 #   ./bench2d --gpu -n 64 -f 300
 #   ./bench2d --cpu -n 64 -f 300
+#   ./bench_stretch --gpu --sweep
+#   ./bench_stretch --cpu --sweep
 
 # ---- Buildroot locations -------------------------------------------------
 BR      ?= /home/joeylu/Documents/workspace/ma35d1/ma35d1_br24_qt5
@@ -49,7 +52,7 @@ LDFLAGS ?=
 LDFLAGS += --sysroot=$(SYSROOT)
 LDLIBS  := -ldrm_etnaviv -ldrm
 
-PROGS := kms_test kms_gpu_test bench2d
+PROGS := kms_test kms_gpu_test bench2d bench_stretch
 
 .PHONY: all clean libetna2d check-env
 all: $(PROGS)
@@ -72,6 +75,9 @@ kms_gpu_test: kms_gpu_test.c kms_display.o $(ETNA2D_A)
 
 bench2d: bench2d.c kms_display.o $(ETNA2D_A)
 	$(CC) $(CFLAGS) $(LDFLAGS) bench2d.c kms_display.o $(ETNA2D_A) $(LDLIBS) -o $@
+
+bench_stretch: bench_stretch.c kms_display.o $(ETNA2D_A)
+	$(CC) $(CFLAGS) $(LDFLAGS) bench_stretch.c kms_display.o $(ETNA2D_A) $(LDLIBS) -o $@
 
 check-env:
 	@echo "CC      = $(CC)"

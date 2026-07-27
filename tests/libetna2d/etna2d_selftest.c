@@ -136,6 +136,57 @@ int main(int argc, char **argv)
 		ok("stretch TR green", dp[64*W + 192]  == 0xff00ff00u);
 		ok("stretch BL blue",  dp[192*W + 64]  == 0xff0000ffu);
 		ok("stretch BR white", dp[192*W + 192] == 0xffffffffu);
+		/* Same source stretched into an OFFSET rect. The DE addresses the
+		 * source relative to the draw rect's top-left, so a placed rect
+		 * needs no origin correction. Stretch a 64x64 copy into a 64x64
+		 * dest at (128,128) and verify all four quadrants land at their
+		 * expected sub-positions (regression for placed StretchBlt). */
+		etna2d_fill(ctx, dst, 0, 0, W, H, 0xff000000u);
+		etna2d_stretch(ctx, small, dst, 128, 128, 64, 64);
+		etna2d_finish(ctx);
+		dp = etna2d_surface_map(dst);
+		ok("stretch@offset TL red",   dp[(128+16)*W + (128+16)] == 0xffff0000u);
+		ok("stretch@offset TR green", dp[(128+16)*W + (128+48)] == 0xff00ff00u);
+		ok("stretch@offset BL blue",  dp[(128+48)*W + (128+16)] == 0xff0000ffu);
+		ok("stretch@offset BR white", dp[(128+48)*W + (128+48)] == 0xffffffffu);
+		ok("stretch@offset bg above", dp[100*W + (128+16)] == 0xff000000u);
+
+		/* Batched stretch: same source tiled into a 3x3 grid of 40x40
+		 * dest rects via the ONE-submit batch API. Verifies the batched
+		 * path (shared state emitted once, only clip+draw per tile) does
+		 * not hang and produces the same quadrant pattern as the per-op
+		 * path — including a tile that overhangs the surface edge. */
+		etna2d_fill(ctx, dst, 0, 0, W, H, 0xff000000u);
+		{
+			struct etna2d_rect grid[9];
+			int gi = 0;
+			for (int gy = 0; gy < 3; gy++)
+				for (int gx = 0; gx < 3; gx++) {
+					grid[gi].x = 10 + gx * 44;
+					grid[gi].y = 10 + gy * 44;
+					grid[gi].w = 40;
+					grid[gi].h = 40;
+					gi++;
+				}
+			/* push the last tile partly off the right/bottom edge */
+			grid[8].x = W - 20;
+			grid[8].y = H - 20;
+			ok("stretch_batch returns ok",
+			   etna2d_stretch_batch(ctx, small, dst, grid, 9) == ETNA2D_OK);
+		}
+		etna2d_finish(ctx);
+		dp = etna2d_surface_map(dst);
+		/* tile 0 at (10,10) size 40: quadrant centres at +10 / +30 */
+		ok("batch tile0 TL red",   dp[(10+10)*W + (10+10)] == 0xffff0000u);
+		ok("batch tile0 BR white", dp[(10+30)*W + (10+30)] == 0xffffffffu);
+		/* centre tile at (54,54) */
+		ok("batch tile4 TL red",   dp[(54+10)*W + (54+10)] == 0xffff0000u);
+		ok("batch tile4 BR white", dp[(54+30)*W + (54+30)] == 0xffffffffu);
+		/* overhanging tile: its in-bounds top-left must be red, and the
+		 * pixel just outside the surface must not have been touched (no
+		 * hang / no OOB write is implied by finish succeeding). */
+		ok("batch overhang TL red", dp[(H-20+10)*W + (W-20+10)] == 0xffff0000u);
+
 		etna2d_surface_destroy(small);
 	}
 

@@ -163,6 +163,20 @@ static void op_tail(struct etna_cmd_stream *s)
 	ss(s, 1, 0);
 	ss(s, 1, 0);
 	ss(s, 1, 0);
+	/* NOTE: the PE 2D cache is NOT flushed here. Flushing after every op
+	 * forces a full pipeline stall between back-to-back tiles, which
+	 * dominates frame time when a frame is hundreds of small ops (e.g. a
+	 * heavily-tiled downscale). The flush is only needed once, before the
+	 * destination is consumed by another engine (scanout) or read back on
+	 * the CPU; etna2d_flush()/etna2d_finish() emit it exactly once per
+	 * submit. Overlapping writes to the same dest within a submit are not
+	 * a concern for the 2D pipe (rects are processed in order). */
+}
+
+/* Emit a single PE 2D cache flush. Called once per submit by flush/finish. */
+static void emit_pe_flush(struct etna_cmd_stream *s)
+{
+	etna_cmd_stream_reserve(s, 2);
 	ss(s, VIVS_GL_FLUSH_CACHE, VIVS_GL_FLUSH_CACHE_PE2D);
 }
 
@@ -445,6 +459,7 @@ int etna2d_flush(struct etna2d_context *ctx)
 	if (!ctx)
 		return ETNA2D_EINVAL;
 	if (ctx->pending) {
+		emit_pe_flush(ctx->stream);         /* one flush per submit */
 		etna_cmd_stream_flush(ctx->stream); /* resets the stream */
 		ctx->pending = 0;
 	}
@@ -455,6 +470,8 @@ int etna2d_finish(struct etna2d_context *ctx)
 {
 	if (!ctx)
 		return ETNA2D_EINVAL;
+	if (ctx->pending)
+		emit_pe_flush(ctx->stream);         /* one flush per submit */
 	etna_cmd_stream_finish(ctx->stream);    /* submits + waits + resets */
 	ctx->pending = 0;
 	return ETNA2D_OK;
@@ -644,18 +661,25 @@ int etna2d_stretch(struct etna2d_context *ctx,
 	fx = (dw > 1) ? (uint32_t)(((uint64_t)(src->w - 1) << 16) / (dw - 1)) : 0;
 	fy = (dh > 1) ? (uint32_t)(((uint64_t)(src->h - 1) << 16) / (dh - 1)) : 0;
 
-	/* Clip the DESTINATION write rect to the surface. The source read is
-	 * inherently in-bounds: at dest column i the source index is
-	 * (i * fx) >> 16, whose maximum over i in [0, dw-1] is exactly
-	 * src->w - 1 by construction, so only the write needs bounding. The
-	 * factors above are left unchanged, so clipping just drops the tail
-	 * that would fall outside the surface rather than rescaling. */
+	/* The DE derives the stretch geometry from the DRAW_2D rect size
+	 * (source spans SRC_SIZE across the full draw rect), while the DE_CLIP
+	 * window bounds the actual writes. So the DRAW rect must stay the FULL
+	 * requested dw x dh — clipping it would rescale the tile into the
+	 * smaller rect (the "compressed" partially-off tiles). We instead clip
+	 * only the CLIP window to the surface and keep the draw rect intact.
+	 * The draw rect may legitimately extend past the surface; the DE walks
+	 * source pixels but only WRITES inside the clip window, so no unmapped
+	 * dest page is touched. */
 	cx0 = dx < 0 ? 0 : dx;
 	cy0 = dy < 0 ? 0 : dy;
 	cx1 = dx + dw; if (cx1 > dst->w) cx1 = dst->w;
 	cy1 = dy + dh; if (cy1 > dst->h) cy1 = dst->h;
 	if (cx0 >= cx1 || cy0 >= cy1)
 		return ETNA2D_OK;   /* fully clipped: nothing to draw */
+
+	/* SRC_ORIGIN / SRC_SIZE define the source sampling window; the DE
+	 * addresses the source RELATIVE to the draw rect's top-left, so a
+	 * placed dest rect samples from source (0,0) with no correction. */
 
 	LOG_DBG("stretch src %dx%d -> dst(%d,%d) %dx%d factor x=0x%05x y=0x%05x",
 		src->w, src->h, dx, dy, dw, dh, fx, fy);
@@ -689,8 +713,127 @@ int etna2d_stretch(struct etna2d_context *ctx,
 	ss(s, VIVS_DE_ROT_ANGLE, 0);
 
 	pe_reset(s);
-	draw_2d_rect(s, cx0, cy0, cx1, cy1);
+	/* FULL draw rect: preserves the stretch geometry. Writes are bounded
+	 * by the DE_CLIP window (cx0,cy0)-(cx1,cy1) set above. */
+	draw_2d_rect(s, dx, dy, dx + dw, dy + dh);
 	op_tail(s);
 	ctx->pending++;
+	return ETNA2D_OK;
+}
+
+/* Emit the DE state shared by every rect of a stretch batch: source setup,
+ * dest surface/format, ROP and pe_reset. Factor, clip and the DRAW_2D are
+ * emitted per rect by the batch loop. Costs ~30 words; done once per submit
+ * instead of once per tile. */
+static void stretch_batch_state(struct etna_cmd_stream *s,
+				struct etna2d_surface *src,
+				struct etna2d_surface *dst)
+{
+	set_source(s, src->bo, src->stride, src->w, src->h, 0, 0);
+	ss_reloc(s, VIVS_DE_DEST_ADDRESS, dst->bo, ETNA_RELOC_WRITE);
+	ss(s, VIVS_DE_DEST_STRIDE, dst->stride);
+	ss(s, VIVS_DE_DEST_ROTATION_CONFIG, 0);
+	ss(s, VIVS_DE_DEST_CONFIG,
+	   VIVS_DE_DEST_CONFIG_FORMAT(DE_FORMAT_A8R8G8B8) |
+	   VIVS_DE_DEST_CONFIG_COMMAND_STRETCH_BLT |
+	   VIVS_DE_DEST_CONFIG_SWIZZLE(DE_SWIZZLE_ARGB) |
+	   VIVS_DE_DEST_CONFIG_TILED_DISABLE |
+	   VIVS_DE_DEST_CONFIG_MINOR_TILED_DISABLE);
+	ss(s, VIVS_DE_ROP,
+	   VIVS_DE_ROP_ROP_FG(0xcc) | VIVS_DE_ROP_ROP_BG(0xcc) |
+	   VIVS_DE_ROP_TYPE_ROP4);
+	ss(s, VIVS_DE_CONFIG, 0);
+	ss(s, VIVS_DE_SRC_ORIGIN_FRACTION, 0);
+	ss(s, VIVS_DE_ALPHA_CONTROL, 0);
+	ss(s, VIVS_DE_ALPHA_MODES, 0);
+	ss(s, VIVS_DE_DEST_ROTATION_HEIGHT, 0);
+	ss(s, VIVS_DE_SRC_ROTATION_HEIGHT, 0);
+	ss(s, VIVS_DE_ROT_ANGLE, 0);
+	pe_reset(s);
+}
+
+int etna2d_stretch_batch(struct etna2d_context *ctx,
+			 struct etna2d_surface *src,
+			 struct etna2d_surface *dst,
+			 const struct etna2d_rect *rects, int n)
+{
+	struct etna_cmd_stream *s;
+	int state_dirty = 1;
+
+	if (!ctx || !src || !dst || (n > 0 && !rects))
+		return ETNA2D_EINVAL;
+	if (n <= 0)
+		return ETNA2D_OK;
+	s = ctx->stream;
+
+	/* Per-rect footprint in words: factor (2×2) + src origin (2) +
+	 * clip (2×2) + draw_2d (4) ≈ 16; STATE_WORDS covers the shared block
+	 * (set_source + dest cfg + ROP + pe_reset ≈ 30×2). Keep each submit
+	 * well under the kernel's 128 KB (32 K-word) cap with margin for
+	 * relocs: flush after ~800 rects (~13 K words). */
+	const uint32_t PER_RECT_WORDS = 32;
+	const uint32_t STATE_WORDS    = 96;
+	const int RECTS_PER_SUBMIT = 800;
+	int since_flush = 0;
+
+	for (int i = 0; i < n; i++) {
+		int dx = rects[i].x, dy = rects[i].y;
+		int dw = rects[i].w, dh = rects[i].h;
+		int cx0, cy0, cx1, cy1;
+		uint32_t fx, fy;
+
+		if (dw <= 0 || dh <= 0)
+			continue;
+
+		cx0 = dx < 0 ? 0 : dx;
+		cy0 = dy < 0 ? 0 : dy;
+		cx1 = dx + dw; if (cx1 > dst->w) cx1 = dst->w;
+		cy1 = dy + dh; if (cy1 > dst->h) cy1 = dst->h;
+		if (cx0 >= cx1 || cy0 >= cy1)
+			continue;   /* fully clipped */
+
+		/* Periodic flush to bound the submit under the kernel cap. */
+		if (since_flush >= RECTS_PER_SUBMIT) {
+			emit_pe_flush(s);
+			etna_cmd_stream_flush(s);   /* resets stream */
+			ctx->pending = 0;
+			state_dirty = 1;
+			since_flush = 0;
+		}
+
+		/* Reserve enough for this rect, plus the shared state block when
+		 * it must be (re-)emitted. etna_cmd_stream_reserve() does not
+		 * grow the buffer: if the reservation does not fit it auto-
+		 * flushes (submitting and resetting the stream), which drops the
+		 * ops accumulated so far and requires re-emitting shared state.
+		 * Detect that via the offset going backwards. */
+		uint32_t need = PER_RECT_WORDS + (state_dirty ? STATE_WORDS : 0);
+		uint32_t before = etna_cmd_stream_offset(s);
+		etna_cmd_stream_reserve(s, need);
+		if (etna_cmd_stream_offset(s) < before) {
+			ctx->pending = 0;
+			state_dirty = 1;
+		}
+		if (state_dirty) {
+			stretch_batch_state(s, src, dst);
+			state_dirty = 0;
+		}
+
+		fx = (dw > 1) ? (uint32_t)(((uint64_t)(src->w - 1) << 16) / (dw - 1)) : 0;
+		fy = (dh > 1) ? (uint32_t)(((uint64_t)(src->h - 1) << 16) / (dh - 1)) : 0;
+
+		ss(s, VIVS_DE_STRETCH_FACTOR_LOW,  VIVS_DE_STRETCH_FACTOR_LOW_X(fx));
+		ss(s, VIVS_DE_STRETCH_FACTOR_HIGH, VIVS_DE_STRETCH_FACTOR_HIGH_Y(fy));
+		ss(s, VIVS_DE_SRC_ORIGIN, 0);
+		ss(s, VIVS_DE_CLIP_TOP_LEFT,
+		   VIVS_DE_CLIP_TOP_LEFT_X(cx0) | VIVS_DE_CLIP_TOP_LEFT_Y(cy0));
+		ss(s, VIVS_DE_CLIP_BOTTOM_RIGHT,
+		   VIVS_DE_CLIP_BOTTOM_RIGHT_X(cx1) | VIVS_DE_CLIP_BOTTOM_RIGHT_Y(cy1));
+		draw_2d_rect(s, dx, dy, dx + dw, dy + dh);
+		/* No per-rect cache flush: the DE processes DRAW_2D in order and
+		 * the batch is flushed once at submit time. */
+		ctx->pending++;
+		since_flush++;
+	}
 	return ETNA2D_OK;
 }
