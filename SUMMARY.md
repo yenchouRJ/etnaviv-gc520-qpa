@@ -101,10 +101,13 @@ using the CPU raster engine. This is the baseline to beat with GPU acceleration.
 Qt5 app (QPainter API — unchanged)
     │
     ▼
-Custom Qt5 QPA plugin          ← new work (backing store + paint engine)
+QBlitterPaintEngine (Qt-provided)  ← dispatches ops; CPU-raster fallback
     │
     ▼
-libetna2d  (thin 2D op builder) ← new work — the "userspace HAL" to write
+Custom Qt5 QPA plugin          ← new work: EtnaBlittable + backing store
+    │  (subclass QBlittable / QBlittablePlatformPixmap — the directfb pattern)
+    ▼
+libetna2d  (thin 2D op builder) ← done — the "userspace HAL"
     │  fill / blit / blend / stretch  →  VIVS_DE_* register writes
     │
     ├── libdrm_etnaviv.so      ← already present; BO + cmd_stream + submit + fence
@@ -217,28 +220,73 @@ the reverse:
 
 ### Phase 4 — Qt5 QPA plugin (KMS-backed, non-GL)
 
-Compose the plugin from two existing pieces, not from scratch:
-- raster structure (`QFbScreen`/backing-store pattern) from **`linuxfb`**
-  (`qtbase/src/plugins/platforms/linuxfb/`)
-- KMS modeset + page flip from **`kmsconvenience`**
-  (`qtbase/src/platformsupport/kmsconvenience/`: `QKmsDevice`, `QKmsOutput`)
-  — the same plumbing `eglfs_kms` uses, but without GL/GBM/EGL.
+**Do NOT subclass `QRasterPaintEngine` directly.** Qt 5.15 already ships the
+exact machinery for a hardware 2D engine — the **`QBlittable` architecture**
+that the `directfb` plugin uses. We provide one HW-hook class; Qt provides the
+paint engine, the QPainter dispatch, and the automatic CPU-raster fallback.
+This is the template to copy, not invent:
+`src/plugins/platforms/directfb/qdirectfbblitter.{h,cpp}`.
 
-- [ ] Backing store = dma-buf scanout BO (Phase 3 flow); present via KMS
-      page flip. Do NOT use fbdev.
-- [ ] **Primary win — subclass `QRasterPaintEngine`**
-      (`<private/qrasterpaintengine_p.h>`) so pixel work moves to the GPU:
-  - [ ] `fillRect()` / `drawRects()` → `etna2d_fill`
-  - [ ] `drawImage()` / `drawPixmap()` → `etna2d_blit` (+ `etna2d_blend`
-        when composition mode ≠ Source)
-  - Fall back to `QRasterPaintEngine::drawXxx()` for unsupported ops.
-- [ ] Accelerate `flush()` (backing store BO → scanout BO) with `etna2d_blit`.
-      NOTE: this alone yields only a few % — by flush time the CPU has
-      already rasterized everything. The paint-engine overrides above are
-      where the FPS win comes from; do them first, not last.
+How the pieces fit (all the `Q*` classes below already exist in qt5base):
+
+```
+QPainter op ─► QBlitterPaintEngine (Qt, subclasses QRasterPaintEngine)
+                 │ accelerated?  → QBlittable virtuals → libetna2d
+                 │ not accel?    → QRasterPaintEngine renders into the
+                 │                 lock()-ed BO memory (CPU fallback, free)
+QPixmap/backingstore ─► QBlittablePlatformPixmap (Qt base)
+                 │ createBlittable() → OUR EtnaBlittable
+```
+
+Headers: `private/qblittable_p.h`, `private/qpixmap_blitter_p.h`,
+`private/qpaintengine_blitter_p.h`.
+
+- [ ] **`EtnaBlittable : QBlittable`** (~150 lines) — the whole HW hook. Advertise
+      `Capabilities` for what libetna2d supports and map the virtuals 1:1:
+
+      | QBlittable virtual                | libetna2d call                      | Capability flag |
+      |-----------------------------------|-------------------------------------|-----------------|
+      | `fillRect` *(pure)*               | `etna2d_fill`                       | `SolidRectCapability` |
+      | `alphaFillRect`                   | `etna2d_fill` (premult color)       | `AlphaFillRectCapability` |
+      | `drawPixmap` *(pure)*             | `etna2d_blit` / `etna2d_stretch`    | `SourcePixmapCapability`, `SourceOverScaledPixmapCapability` |
+      | `drawPixmapOpacity`               | `etna2d_blend_over` / stretch       | `SourceOverPixmapCapability`, `OpacityPixmapCapability` |
+      | `doLock` *(pure)*                 | `etna2d_surface_map` → wrap `QImage`| — |
+      | `doUnlock` *(pure)*              | `etna2d_surface_cpu_fini`, `etna2d_finish` | — |
+
+      `doLock()` MUST wrap the mapped BO in a `QImage` using the real BO stride
+      (`etna2d_surface_stride`, NOT `w*4`) and format
+      **`Format_ARGB32_Premultiplied`** — this matches the GC520 premultiplied
+      blend model we verified, so HW blend and the CPU fallback agree.
+- [ ] **`EtnaBlittablePlatformPixmap : QBlittablePlatformPixmap`** (~20 lines) —
+      single method `createBlittable(size, alpha)` → `new EtnaBlittable(...)`.
+      Qt's base supplies `paintEngine()`, `buffer()`, `fromImage()`, class id.
+- [ ] **Integration** — subclass `QPlatformIntegration`; override
+      `createPlatformPixmap()` → `EtnaBlittablePlatformPixmap` (Bitmap type
+      still `QRasterPlatformPixmap`) and `createPlatformBackingStore()`. Copy
+      `qdirectfbintegration.cpp:132`.
+- [ ] **Screen/window scaffolding** — reuse `fbconvenience`
+      (`QFbScreen`/`QFbWindow`/`QFbCursor`) from `linuxfb`. Confirmed
+      GL/GBM/EGL-free.
+- [ ] **Backing store** — model on `qdirectfbbackingstore`. `paintDevice()`
+      returns a `QPixmap` over the blittable; **only `flush()` is ours**.
+      v1 uses buffering option **(B), decided:** paint into an offscreen
+      libetna2d BO, then on flush `etna2d_blit` backing→scanout and page-flip.
+      (Upgrade to zero-copy scanout-BO double-buffer later.)
+- [ ] **KMS flip** — **decided: reuse our Phase 3 standalone card0 code**
+      (dumb buffer → PRIME → `drmModeAddFB2` → page-flip) inside `flush()`. Do
+      NOT adapt eglfs-oriented `QKmsDevice` — it exists (`kmsconvenience`, pure
+      DRM/KMS, no GL) but is geared to GBM buffers; our Phase 3 code is less
+      friction.
 - [ ] Register under `QT_QPA_PLATFORM=etnaviv2d`.
-- [ ] Benchmark vs `linuxfb` CPU baseline on a representative widget app
-      (real-world number, to complement the Phase 3 headline number).
+- [ ] Benchmark vs `linuxfb` CPU baseline on a representative widget app.
+
+**Risk to watch — per-op cost on widget frames.** The DE reloads full pipeline
+state per op (~2.5–3 µs, proven in Phase 3). Widget UIs issue many tiny
+fills/blits and `QBlittable` gives no batching hook. Mitigation: accumulate ops
+in the `etna2d_context` and only `etna2d_flush` at `doUnlock`/`flush` time
+(cache flush is already per-submit). Text is the dominant widget workload;
+`drawCachedGlyphs` is optional and deferred to Phase 5, so early real-widget
+wins may be modest until glyph blitting lands.
 
 ### Phase 5 — Optional extensions
 
@@ -254,11 +302,14 @@ Compose the plugin from two existing pieces, not from scratch:
 | File | Purpose |
 |---|---|
 | `drivers/gpu/drm/etnaviv/` | Working 6.6 etnaviv tree |
-| `tests/libdrm/etnaviv_2d_test.c` | Working DE command stream template (CLEAR) |
-| `tests/libdrm/state_2d.xml.h` | Complete DE register map (all 2D operations) |
+| `hal/libdrm/etnaviv_2d_test.c` | Working DE command stream template (CLEAR) |
+| `hal/libdrm/state_2d.xml.h` | Complete DE register map (all 2D operations) |
 | `etnaviv/etnaviv_drmif.h` | libdrm_etnaviv userspace API (BO/stream/submit/fence) |
 | `drivers/ref/GC520L/.../driver/dfb/gc_dfb_raster.c` | Vendor DE op sequences — **reference only** (galcore ABI, do not link) |
 | `drivers/ref/GC520L/.../doc/2D/` | Vivante 2D API + alignment PDFs — DE programming reference |
-| `qtbase/src/plugins/platforms/linuxfb/` | QPA plugin skeleton to start from |
-| `qtbase/src/plugins/platforms/directfb/` | Reference: non-GL 2D QPA plugin |
-| `qtbase/src/plugins/platforms/direct2d/` | Reference: QRasterPaintEngine subclass pattern |
+| `qtbase/src/plugins/platforms/directfb/qdirectfbblitter.{h,cpp}` | **Primary template** — QBlittable subclass over a HW 2D API |
+| `qtbase/src/plugins/platforms/directfb/qdirectfb{backingstore,integration}.cpp` | Backing-store + integration wiring to copy |
+| `qtbase/src/gui/painting/qblittable_p.h` | `QBlittable` abstract class + `Capability` flags |
+| `qtbase/src/gui/image/qpixmap_blitter_p.h` | `QBlittablePlatformPixmap` base |
+| `qtbase/src/platformsupport/fbconvenience/` | `QFbScreen`/`QFbWindow`/`QFbCursor` scaffolding (from linuxfb) |
+| `qtbase/src/plugins/platforms/linuxfb/` | Screen/window integration reference |
