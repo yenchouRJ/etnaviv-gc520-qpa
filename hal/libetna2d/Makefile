@@ -3,14 +3,15 @@
 # Builds the reusable, Qt-independent 2D HAL as both a shared and a static
 # library, plus an on-target acceptance test. Cross-compiled for MA35D1.
 #
-# Build (same two modes as the Phase 1 tests):
+# Build:
 #   A) source the Buildroot SDK env, then: make
 #   B) make BR=/home/joeylu/Documents/workspace/ma35d1/ma35d1_br24_qt5
 #
-# Artifacts:
-#   libetna2d.so.1   libetna2d.so   libetna2d.a   etna2d_selftest
+# Artifacts (all under build/):
+#   build/libetna2d.so.1   build/libetna2d.so   build/libetna2d.a
+#   build/etna2d_selftest
 #
-# Deploy libetna2d.so.1 + etna2d_selftest to the target and run:
+# Deploy build/libetna2d.so.1 + build/etna2d_selftest to the target and run:
 #   ETNA2D_VERBOSE=1 ./etna2d_selftest /dev/dri/renderD128
 
 # ---- Buildroot locations -------------------------------------------------
@@ -28,6 +29,10 @@ AR      ?= $(CROSS)ar
 LIBDRM  ?= $(BR)/output/build/libdrm-2.4.120
 ETNA_H  := $(LIBDRM)/tests/etnaviv
 
+# ---- Output directory ----------------------------------------------------
+BUILDDIR := build
+$(shell mkdir -p $(BUILDDIR))
+
 # ---- Flags ---------------------------------------------------------------
 CFLAGS  ?= -O2 -g
 CFLAGS  += -Wall -Wextra -std=gnu11 -fPIC
@@ -41,29 +46,30 @@ LDFLAGS ?=
 LDFLAGS += --sysroot=$(SYSROOT)
 LDLIBS  := -ldrm_etnaviv -ldrm
 
-SONAME  := libetna2d.so.1
-SHARED  := libetna2d.so
-STATIC  := libetna2d.a
+SONAME  := $(BUILDDIR)/libetna2d.so.1
+SHARED  := $(BUILDDIR)/libetna2d.so
+STATIC  := $(BUILDDIR)/libetna2d.a
+OBJ     := $(BUILDDIR)/libetna2d.o
 
 .PHONY: all clean check-env
-all: $(SONAME) $(SHARED) $(STATIC) etna2d_selftest
+all: $(SONAME) $(SHARED) $(STATIC) $(BUILDDIR)/etna2d_selftest
 
-libetna2d.o: libetna2d.c etna2d.h
+$(OBJ): libetna2d.c etna2d.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Shared library with a proper SONAME; link libdrm_etnaviv in.
-$(SONAME): libetna2d.o
-	$(CC) $(CFLAGS) $(LDFLAGS) -shared -Wl,-soname,$(SONAME) \
+# Shared library with a proper SONAME.
+$(SONAME): $(OBJ)
+	$(CC) $(CFLAGS) $(LDFLAGS) -shared -Wl,-soname,libetna2d.so.1 \
 		$< $(LDLIBS) -o $@
 
 $(SHARED): $(SONAME)
-	ln -sf $(SONAME) $@
+	ln -sf libetna2d.so.1 $(SHARED)
 
-$(STATIC): libetna2d.o
+$(STATIC): $(OBJ)
 	$(AR) rcs $@ $<
 
 # Self-test links the static lib for a self-contained on-target binary.
-etna2d_selftest: etna2d_selftest.c $(STATIC)
+$(BUILDDIR)/etna2d_selftest: etna2d_selftest.c $(STATIC)
 	$(CC) $(CFLAGS) $(LDFLAGS) $< $(STATIC) $(LDLIBS) -o $@
 
 check-env:
@@ -76,4 +82,4 @@ check-env:
 	@echo "environment OK"
 
 clean:
-	rm -f *.o $(SONAME) $(SHARED) $(STATIC) etna2d_selftest
+	rm -rf $(BUILDDIR)

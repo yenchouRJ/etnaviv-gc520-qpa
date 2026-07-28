@@ -7,11 +7,11 @@
 **Hardware:** Nuvoton MA35D1, Vivante GC520 rev 0x5341  
 **GPU FEATURES_0:** `0xe02c7eca`  
 **Test node:** `/dev/dri/renderD128`  
-**Source:** `tests/vivante2d/`
+**Source:** `hal/vivante2d/`
 
 ### Tests
 
-All three tests pass. Source: `tests/vivante2d/`.
+All three tests pass. Source: `hal/vivante2d/`.
 
 #### BIT_BLT (`etnaviv_bitblt_test`)
 
@@ -82,7 +82,7 @@ DE command sequence (full state setup + `DRAW_2D` rectangle) into an
 
 ## Phase 2 — `libetna2d` (thin userspace HAL)
 
-**Source:** `tests/libetna2d/`  
+**Source:** `hal/libetna2d/`  
 **Artifacts:** `libetna2d.so.1` (SONAME'd shared), `libetna2d.a` (static),
 `etna2d.h` (public API), `etna2d_selftest` (on-target acceptance test).
 
@@ -140,7 +140,7 @@ and the Batch 4 out-of-bounds robustness cases).
 
 ## Phase 3 — KMS scanout + benchmarks (display half, no Qt)
 
-**Source:** `tests/kms/`
+**Source:** `hal/kms/`
 **Display:** DRM/KMS on `/dev/dri/card0` (ma35 driver), legacy modeset path.
 **Render:** GC520 via `libetna2d` on `/dev/dri/renderD128`.
 
