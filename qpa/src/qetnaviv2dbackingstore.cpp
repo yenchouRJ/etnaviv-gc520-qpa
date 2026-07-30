@@ -108,24 +108,29 @@ void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
     /* 1. Unlock: drain CPU writes + GPU fence for any raster-fallback ops. */
     blitter->unlock();
 
-    /* 2. GPU blit dirty region from backing BO into scanout back-buffer.
-     *    Compute union of dirty rects and blit each. */
-    QRect dirtyBound = region.boundingRect();
-    if (dirtyBound.isEmpty())
-        dirtyBound = QRect(0, 0,
-                           etna2d_surface_width(backingSurf),
-                           etna2d_surface_height(backingSurf));
+    /* 2. GPU blit the full backing surface into the scanout back-buffer.
+     *
+     *    We do NOT use the dirty region here.  With double-buffering the back
+     *    buffer contains stale content from two frames ago; blitting only the
+     *    dirty rect leaves the remainder of the back buffer with that stale
+     *    image, causing "ghosting" when widgets move (e.g. moveblocks).
+     *
+     *    A full-surface blit costs one DE submit (~3µs fixed cost + pixel fill
+     *    time) which is identical to the dirty-region path for full-screen
+     *    repaints and only marginally more expensive for small dirty regions.
+     *    The optimisation can be re-introduced later using a "shadow back"
+     *    copy-on-flip scheme.
+     */
+    int surfW = etna2d_surface_width(backingSurf);
+    int surfH = etna2d_surface_height(backingSurf);
+    BS_DBG << "flush: full blit" << surfW << "x" << surfH
+           << "(dirty=" << region.boundingRect() << "ignored for correctness)";
 
-    BS_DBG << "flush: dirty=" << dirtyBound;
-
-    for (const QRect &r : region) {
-        if (r.isEmpty()) continue;
-        etna2d_blit(ctx,
-                    backingSurf, r.x(), r.y(),
-                    scanoutBack, r.x(), r.y(),
-                    r.width(), r.height(),
-                    ETNA2D_BLEND_NONE, ETNA2D_ROP_COPY);
-    }
+    etna2d_blit(ctx,
+                backingSurf, 0, 0,
+                scanoutBack, 0, 0,
+                surfW, surfH,
+                ETNA2D_BLEND_NONE, ETNA2D_ROP_COPY);
 
     /* 3. Wait for GPU blit to complete before handing the buffer to display. */
     if (etna2d_finish(ctx) != ETNA2D_OK) {

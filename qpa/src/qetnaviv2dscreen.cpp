@@ -280,7 +280,13 @@ int QEtnaviv2dScreen::pageFlip()
         FD_SET(m_kfd, &fds);
         int r = select(m_kfd + 1, &fds, nullptr, nullptr, nullptr);
         if (r < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) {
+                /* Signal received (e.g. SIGINT → QCoreApplication::quit()).
+                 * Stop waiting — the flip may never complete if the app is
+                 * shutting down, and blocking here would prevent cleanup. */
+                m_flipPending = 0;
+                return -1;
+            }
             SCR_WARN << "select:" << strerror(errno);
             return -1;
         }

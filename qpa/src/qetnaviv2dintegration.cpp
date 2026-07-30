@@ -45,6 +45,8 @@
 #endif
 
 #include <QDebug>
+#include <QCoreApplication>
+#include <csignal>
 
 QT_BEGIN_NAMESPACE
 
@@ -127,6 +129,15 @@ bool QEtnaviv2dIntegration::initializeHardware()
 
     if (!qEnvironmentVariableIntValue("QT_QPA_ETNAVIV2D_DISABLE_INPUT"))
         createInputHandlers();
+
+    /* 6. Wire SIGINT/SIGTERM to a clean Qt shutdown so Ctrl-C works even
+     *    when the VT handler has the terminal in raw mode. */
+    struct sigaction sa{};
+    sa.sa_handler = [](int) { QCoreApplication::quit(); };
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; /* do NOT use SA_RESTART — we want select() to return EINTR */
+    sigaction(SIGINT,  &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
 
     return true;
 }
