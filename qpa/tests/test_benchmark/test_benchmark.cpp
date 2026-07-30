@@ -37,6 +37,10 @@
 #include <QDebug>
 #include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/fb.h>
 
 /* -----------------------------------------------------------------------
  * Benchmark widget
@@ -49,8 +53,17 @@ public:
         , m_totalFrames(nframes)
         , m_nsprites(nsprites)
         , m_opaque(opaque)
+        , m_fbFd(-1)
     {
         setWindowTitle(QStringLiteral("etnaviv2d benchmark"));
+
+        /* Open /dev/fb0 for FBIO_WAITFORVSYNC when running under linuxfb.
+         * etnaviv2d already syncs to vblank via drmModePageFlip — no fd needed. */
+        if (QGuiApplication::platformName() == QLatin1String("linuxfb")) {
+            m_fbFd = ::open("/dev/fb0", O_RDWR | O_CLOEXEC);
+            if (m_fbFd < 0)
+                perror("open /dev/fb0 (vsync unavailable)");
+        }
 
         /* Build sprite pixmap.
          * Always use Format_ARGB32_Premultiplied so both etnaviv2d and linuxfb
@@ -73,6 +86,12 @@ public:
         m_positions.reserve(nsprites);
         for (int i = 0; i < nsprites; ++i)
             m_positions.append(QPoint((i * 37) % 900, (i * 53) % 550));
+    }
+
+    ~BenchWidget()
+    {
+        if (m_fbFd >= 0)
+            ::close(m_fbFd);
     }
 
     void startBenchmark()
@@ -109,6 +128,15 @@ protected:
         p.setPen(Qt::white);
         p.drawText(10, 20, QStringLiteral("Frame %1 / %2")
                             .arg(m_frame).arg(m_totalFrames));
+        p.end(); /* flush QPainter before vsync wait */
+
+        /* linuxfb vsync: block until the next vertical blanking interval so
+         * the just-rendered frame lands tear-free, matching etnaviv2d's
+         * drmModePageFlip vblank synchronisation. */
+        if (m_fbFd >= 0) {
+            unsigned int dummy = 0;
+            ::ioctl(m_fbFd, FBIO_WAITFORVSYNC, &dummy);
+        }
     }
 
 private slots:
@@ -127,6 +155,7 @@ private:
     int             m_nsprites;
     bool            m_opaque;
     int             m_frame = 0;
+    int             m_fbFd;          /* /dev/fb0 fd for FBIO_WAITFORVSYNC, or -1 */
     QPixmap         m_sprite;
     QVector<QPoint> m_positions;
     QElapsedTimer   m_elapsed;
