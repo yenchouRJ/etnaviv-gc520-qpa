@@ -305,6 +305,7 @@ Text-heavy scenes may be similar (text is raster fallback on both paths).
 | `QT_QPA_PLATFORM="etnaviv2d:ctx=1024"` | Override context op-buffer size (default 512) |
 | `QT_QPA_ETNAVIV2D_DISABLE_INPUT=1` | Skip evdev input handler creation |
 | `QT_QPA_ETNAVIV2D_NO_LIBINPUT=1` | Force evdev even if libinput is available |
+| `QT_ETNAVIV2D_NO_BATCH=1` | Disable source-pixmap batch unlock. By default (0) the plugin defers `etna2d_finish()` to frame boundary — source pixmaps are released with a WC-drain only (`cpu_fini`), keeping all per-frame GPU ops in one command-stream submission. Set to 1 to revert to a conservative full `finish()` on every `drawPixmap` source surface; useful for debugging GPU ordering issues or measuring the baseline cost of per-op serialisation. |
 
 ---
 

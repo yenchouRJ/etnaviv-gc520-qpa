@@ -41,6 +41,13 @@ public:
     etna2d_surface *surface() const { return m_surf; }
     etna2d_context *context() const { return m_ctx; }
 
+    /* Lightweight CPU→GPU barrier for read-only source surfaces.
+     * Drains WC write buffer (cpu_fini) but does NOT submit or wait for a
+     * GPU fence.  Use this when the surface will only be READ by the GPU
+     * (e.g. as a blit source) so we avoid an etna2d_finish() stall per op.
+     * If the surface is not CPU-locked this is a no-op. */
+    void unlockForGpuRead();
+
     /* --- QBlittable pure virtuals --- */
     void fillRect(const QRectF &rect, const QColor &color) override;
     void drawPixmap(const QRectF &rect, const QPixmap &pixmap,
@@ -70,6 +77,7 @@ private:
     etna2d_context *m_ctx;   /* borrowed — owned by integration */
     etna2d_surface *m_surf;  /* owned by this blittable */
     QImage          m_lockImage; /* scratch; valid only between doLock/doUnlock */
+    bool            m_skipFinishOnUnlock = false; /* set by unlockForGpuRead() */
 };
 
 /* -----------------------------------------------------------------------

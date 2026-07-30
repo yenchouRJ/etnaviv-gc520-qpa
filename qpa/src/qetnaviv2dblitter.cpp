@@ -32,6 +32,16 @@ static bool debugEnabled()
     return v > 0;
 }
 
+/* When set to 1, source-pixmap unlock reverts to the conservative path:
+ * etna2d_finish() is called on every drawPixmap source surface before the
+ * blit op is queued.  This serialises all GPU ops and eliminates batching.
+ * Default 0 (batch mode on): finish is deferred to frame boundary. */
+static bool noBatch()
+{
+    static int v = qEnvironmentVariableIntValue("QT_ETNAVIV2D_NO_BATCH");
+    return v > 0;
+}
+
 #define ETNA_DBG if (debugEnabled()) qDebug() << "[etnaviv2d|blitter]"
 #define ETNA_WARN qWarning() << "[etnaviv2d|blitter]"
 
@@ -100,6 +110,25 @@ EtnaBlittable::~EtnaBlittable()
 }
 
 /* -----------------------------------------------------------------------
+ * unlockForGpuRead — CPU→GPU barrier without a GPU fence stall.
+ *
+ * When a pixmap is used as a blit SOURCE the GPU only reads it; we don't
+ * need to wait for any GPU fence.  We only need to flush the WC write
+ * buffer (cpu_fini) so the GPU sees any CPU writes.
+ *
+ * We set m_skipFinishOnUnlock so that the doUnlock() called by the base
+ * QBlittable::unlock() skips etna2d_finish().  This avoids one ~2.5–3µs
+ * GPU pipeline-drain stall per source sprite per frame.
+ * ----------------------------------------------------------------------- */
+void EtnaBlittable::unlockForGpuRead()
+{
+    if (!isLocked())
+        return;
+    m_skipFinishOnUnlock = true;
+    unlock(); /* → doUnlock() which checks m_skipFinishOnUnlock */
+}
+
+/* -----------------------------------------------------------------------
  * Helpers
  * ----------------------------------------------------------------------- */
 
@@ -113,8 +142,18 @@ etna2d_surface *EtnaBlittable::surfaceFromPixmap(const QPixmap &pixmap)
     if (!blitter)
         return nullptr;
     /* Ensure the source blitter is not CPU-locked; its GPU ops must be
-     * visible before we feed it into etna2d_blit/stretch. */
-    blitter->unlock();
+     * visible before we feed it into etna2d_blit/stretch.
+     * Use unlockForGpuRead() — cpu_fini only, no etna2d_finish stall.
+     * The GPU will see the barrier naturally through command ordering:
+     * the source surface's last GPU write is already fenced inside the
+     * same context's command stream, so no cross-context sync is needed.
+     *
+     * QT_ETNAVIV2D_NO_BATCH=1 falls back to the conservative full unlock
+     * (cpu_fini + etna2d_finish) for debugging or single-context comparison. */
+    if (noBatch())
+        blitter->unlock();
+    else
+        blitter->unlockForGpuRead();
     return blitter->m_surf;
 }
 
@@ -303,11 +342,17 @@ QImage *EtnaBlittable::doLock()
  * ----------------------------------------------------------------------- */
 void EtnaBlittable::doUnlock()
 {
-    ETNA_DBG << "doUnlock — cpu_fini + finish";
+    ETNA_DBG << "doUnlock —"
+             << (m_skipFinishOnUnlock ? "cpu_fini only (read-only src)"
+                                      : "cpu_fini + finish");
     /* WC drain barrier: ensures CPU writes are visible before GPU reads. */
     etna2d_surface_cpu_fini(m_surf);
-    /* Flush all queued GPU ops and wait for the fence. */
-    etna2d_finish(m_ctx);
+    if (!m_skipFinishOnUnlock) {
+        /* Full flush: wait for all queued GPU ops (used for dst surfaces
+         * and at frame boundary). */
+        etna2d_finish(m_ctx);
+    }
+    m_skipFinishOnUnlock = false; /* reset for next lock cycle */
     m_lockImage = QImage(); /* release the dangling pointer */
 }
 
