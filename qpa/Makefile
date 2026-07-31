@@ -41,10 +41,12 @@ BUILD_T_BLIT  = build/test_blitter
 BUILD_T_SCR   = build/test_screen
 BUILD_T_INTG  = build/test_integration
 BUILD_T_BENCH = build/test_benchmark
-BUILD_T_SLIDE = build/test_slideshow
+BUILD_T_SLIDE  = build/test_slideshow
+BUILD_T_GLYPH = build/test_glyph
 
 .PHONY: all plugin tests clean \
-        test_blitter test_screen test_integration test_benchmark test_slideshow \
+        test_blitter test_screen test_integration test_benchmark \
+        test_slideshow test_glyph \
         plugin_intree_sync
 
 all: plugin tests
@@ -72,7 +74,7 @@ $(PLUGIN_INTREE_DIR)/Makefile: plugin_intree_sync
 # -----------------------------------------------------------------------
 # Tests: built with in-tree qmake (resolves private Qt headers correctly)
 # -----------------------------------------------------------------------
-tests: test_blitter test_screen test_integration test_benchmark test_slideshow
+tests: test_blitter test_screen test_integration test_benchmark test_slideshow test_glyph
 
 test_blitter: $(BUILD_T_BLIT)/Makefile
 	$(MAKE) -C $(BUILD_T_BLIT)
@@ -88,6 +90,9 @@ test_benchmark: $(BUILD_T_BENCH)/Makefile
 
 test_slideshow: $(BUILD_T_SLIDE)/Makefile
 	$(MAKE) -C $(BUILD_T_SLIDE)
+
+test_glyph: $(BUILD_T_GLYPH)/Makefile
+	$(MAKE) -C $(BUILD_T_GLYPH)
 
 $(BUILD_T_BLIT)/Makefile: tests/test_blitter/test_blitter.pro | $(BUILD_T_BLIT)
 	cd $(BUILD_T_BLIT) && $(QMAKE) $(CURDIR)/tests/test_blitter/test_blitter.pro \
@@ -106,10 +111,14 @@ $(BUILD_T_BENCH)/Makefile: tests/test_benchmark/test_benchmark.pro | $(BUILD_T_B
 $(BUILD_T_SLIDE)/Makefile: tests/test_slideshow/test_slideshow.pro | $(BUILD_T_SLIDE)
 	cd $(BUILD_T_SLIDE) && $(QMAKE) $(CURDIR)/tests/test_slideshow/test_slideshow.pro
 
+$(BUILD_T_GLYPH)/Makefile: tests/test_glyph/test_glyph.pro | $(BUILD_T_GLYPH)
+	cd $(BUILD_T_GLYPH) && $(QMAKE) $(CURDIR)/tests/test_glyph/test_glyph.pro
+
 # -----------------------------------------------------------------------
 # Directory creation
 # -----------------------------------------------------------------------
-$(BUILD_T_BLIT) $(BUILD_T_SCR) $(BUILD_T_INTG) $(BUILD_T_BENCH) $(BUILD_T_SLIDE):
+$(BUILD_T_BLIT) $(BUILD_T_SCR) $(BUILD_T_INTG) $(BUILD_T_BENCH) \
+$(BUILD_T_SLIDE) $(BUILD_T_GLYPH):
 	mkdir -p $@
 
 # -----------------------------------------------------------------------

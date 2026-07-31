@@ -155,3 +155,86 @@ Defaults: `../../images`, `800`, `2` (0 = infinite).
 - `Format_ARGB32_Premultiplied` is consistent between the raster engine, the
   GPU surface, and the scanout blit — no format mismatch artefacts.
 - **Risk #2 closed.**
+
+---
+
+## test_glyph
+
+**Risk #3 — text rendering (glyph) performance measurement**
+
+### What it tests
+
+When Qt's raster engine draws text (or any composited op) onto an EtnaBlittable
+surface it must **read** the destination pixels before blending each glyph row
+(SRC_OVER read-modify-write).  On our plugin the destination is a WC-mapped
+(write-combining) buffer: CPU writes are fast (coalesced) but CPU **reads** are
+uncached — every read goes straight to DRAM.
+
+On linuxfb the backing buffer is normal cacheable CPU memory; reads are fast.
+The fps difference between the two platforms directly quantifies the WC read
+penalty for text-heavy UIs.
+
+Three workload modes isolate different paths:
+
+| Mode | What runs | Purpose |
+|---|---|---|
+| `text` | N `drawText` calls | WC read hot path — raster SRC_OVER RMW on dest |
+| `fill` | N `fillRect` calls | Control group — GPU fast path, no WC reads |
+| `mixed` | N/2 fill + N/2 text | Realistic widget frame |
+
+### Run
+
+```sh
+# text mode — glyph raster hot path
+QT_QPA_PLATFORM=etnaviv2d ./test_glyph --frames=200 --count=20  --mode=text
+QT_QPA_PLATFORM=linuxfb   ./test_glyph --frames=200 --count=20  --mode=text
+
+# fill mode — control group
+QT_QPA_PLATFORM=etnaviv2d ./test_glyph --frames=200 --count=20  --mode=fill
+QT_QPA_PLATFORM=linuxfb   ./test_glyph --frames=200 --count=20  --mode=fill
+
+# mixed — realistic widget frame
+QT_QPA_PLATFORM=etnaviv2d ./test_glyph --frames=200 --count=20  --mode=mixed
+QT_QPA_PLATFORM=linuxfb   ./test_glyph --frames=200 --count=20  --mode=mixed
+```
+
+### Results (MA35D1, 1024×600, count increasing)
+
+```
+count=20   text  : etnaviv2d 113.3  linuxfb  80.2   etnaviv2d wins
+count=20   fill  : etnaviv2d 114.6  linuxfb  88.0   etnaviv2d wins (GPU batch)
+count=20   mixed : etnaviv2d 113.6  linuxfb  84.4   etnaviv2d wins
+
+count=100  text  : etnaviv2d  57.9  linuxfb  58.5   tied (crossover region)
+count=100  fill  : etnaviv2d 114.5  linuxfb  78.1   etnaviv2d wins
+count=100  mixed : etnaviv2d  58.5  linuxfb  64.1   linuxfb slightly ahead
+
+count=200  text  : etnaviv2d  38.8  linuxfb  42.7   linuxfb wins (WC reads dominate)
+count=200  fill  : etnaviv2d 114.5  linuxfb  70.8   etnaviv2d wins
+count=200  mixed : etnaviv2d  57.9  linuxfb  55.1   tied
+```
+
+### Interpretation
+
+**fill mode** (control): etnaviv2d is flat at 114–115 fps across all counts —
+`fillRect` maps to a single batched DE command regardless of N.  linuxfb
+degrades linearly (CPU memset scales with count).  GPU fast path confirmed
+working.
+
+**text mode** (WC read path): etnaviv2d wins at low count because the
+background `fillRect` (GPU fast path) dominates the frame time.  As count
+rises the WC read cost of glyph blending accumulates, and the two platforms
+cross over between count=100 (tied) and count=200 (linuxfb ahead by ~10%).
+
+**Crossover point: ~100 `drawText` calls per frame.**  Below this threshold
+the GPU fill advantage masks the WC read cost; above it WC reads dominate.
+Typical widget UIs (labels, buttons, a few input fields) stay well under 100
+text ops per frame and will not see a regression.
+
+### What it proves
+
+- The WC read penalty exists but the threshold is high (~100 glyph ops/frame).
+- Typical widget UIs are not affected; a shadow buffer (cacheable backing copy)
+  is not needed for v1.
+- **Risk #3 conditionally closed** — acceptable for typical widget UIs; the
+  100-op threshold is the known limit for text-heavy applications.
