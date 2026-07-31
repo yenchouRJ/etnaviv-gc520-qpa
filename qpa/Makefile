@@ -41,9 +41,10 @@ BUILD_T_BLIT  = build/test_blitter
 BUILD_T_SCR   = build/test_screen
 BUILD_T_INTG  = build/test_integration
 BUILD_T_BENCH = build/test_benchmark
+BUILD_T_SLIDE = build/test_slideshow
 
 .PHONY: all plugin tests clean \
-        test_blitter test_screen test_integration test_benchmark \
+        test_blitter test_screen test_integration test_benchmark test_slideshow \
         plugin_intree_sync
 
 all: plugin tests
@@ -71,7 +72,7 @@ $(PLUGIN_INTREE_DIR)/Makefile: plugin_intree_sync
 # -----------------------------------------------------------------------
 # Tests: built with in-tree qmake (resolves private Qt headers correctly)
 # -----------------------------------------------------------------------
-tests: test_blitter test_screen test_integration test_benchmark
+tests: test_blitter test_screen test_integration test_benchmark test_slideshow
 
 test_blitter: $(BUILD_T_BLIT)/Makefile
 	$(MAKE) -C $(BUILD_T_BLIT)
@@ -84,6 +85,9 @@ test_integration: $(BUILD_T_INTG)/Makefile
 
 test_benchmark: $(BUILD_T_BENCH)/Makefile
 	$(MAKE) -C $(BUILD_T_BENCH)
+
+test_slideshow: $(BUILD_T_SLIDE)/Makefile
+	$(MAKE) -C $(BUILD_T_SLIDE)
 
 $(BUILD_T_BLIT)/Makefile: tests/test_blitter/test_blitter.pro | $(BUILD_T_BLIT)
 	cd $(BUILD_T_BLIT) && $(QMAKE) $(CURDIR)/tests/test_blitter/test_blitter.pro \
@@ -99,10 +103,13 @@ $(BUILD_T_INTG)/Makefile: tests/test_integration/test_integration.pro | $(BUILD_
 $(BUILD_T_BENCH)/Makefile: tests/test_benchmark/test_benchmark.pro | $(BUILD_T_BENCH)
 	cd $(BUILD_T_BENCH) && $(QMAKE) $(CURDIR)/tests/test_benchmark/test_benchmark.pro
 
+$(BUILD_T_SLIDE)/Makefile: tests/test_slideshow/test_slideshow.pro | $(BUILD_T_SLIDE)
+	cd $(BUILD_T_SLIDE) && $(QMAKE) $(CURDIR)/tests/test_slideshow/test_slideshow.pro
+
 # -----------------------------------------------------------------------
 # Directory creation
 # -----------------------------------------------------------------------
-$(BUILD_T_BLIT) $(BUILD_T_SCR) $(BUILD_T_INTG) $(BUILD_T_BENCH):
+$(BUILD_T_BLIT) $(BUILD_T_SCR) $(BUILD_T_INTG) $(BUILD_T_BENCH) $(BUILD_T_SLIDE):
 	mkdir -p $@
 
 # -----------------------------------------------------------------------
