@@ -141,6 +141,14 @@ etna2d_surface_cpu_fini(surf);  /* WC drain before GPU reads CPU-written pixels 
   ROP, format, PE reset) once, then only stretch-factor + clip + DRAW_2D (~16
   words, zero relocs) per rect. Auto-flushes internally every ~800 rects to
   stay under the kernel's per-submit `SZ_128K` cap.
+- **`ETNA2D_STREAM_WORDS_MAX = 32,768` words (128 KB) per submit** —
+  `etna2d_context_create()` clamps the stream buffer to exactly the kernel's
+  hard limit (`stream_size > SZ_128K` → `EINVAL` in `etnaviv_gem_submit.c`).
+  Allocating more would prevent `etna_cmd_stream_reserve()` from auto-flushing
+  before the submit, causing the kernel to reject it with
+  *"submit arguments out of size limits"*.  With this cap, callers passing any
+  `hint_ops` value get transparent mid-frame auto-flushes instead of a hard
+  error; the kernel word limit is the authoritative ceiling.
 - **Surface bounds checking** — every op clips to its surface extents. An
   out-of-bounds op on the GC520 DE walks unmapped GPU-VA and hangs the GPU;
   the library prevents this unconditionally.
@@ -337,7 +345,7 @@ must respect them.
 | **No DE bounds checking** | Out-of-bounds op → unmapped GPU-VA → `MMU page not present` → GPU hang. `libetna2d` clips every op unconditionally |
 | **SrcOver destination read is not clip-bounded** | A blend op reads destination pixels beyond the write clip; `libetna2d` clips to the destination surface extent before submission |
 | **`libdrm reserve()` auto-flushes** | Can split a command mid-op; use `op_begin()` to reserve the full op up front |
-| **Per-submit kernel caps** | Stream ≤ 128 KB, relocs/BOs ≤ 128 K, PMRs ≤ 128; `stretch_batch` auto-flushes internally |
+| **Per-submit kernel caps** | Stream ≤ 128 KB (32,768 words = `ETNA2D_STREAM_WORDS_MAX`), relocs/BOs ≤ 128 K, PMRs ≤ 128 |
 | **DE pipeline state per op ~2.5–3 µs** | Batch N ops into one submit; do not flush per op |
 | **StretchBlt addressing relative to DRAW_2D rect top-left** | Never clip the draw rect; clip only `DE_CLIP` |
 | **Premultiplied alpha model** | Source pixels must be premultiplied; blend factors `ONE` (src) + `INVERSED` (dst) |

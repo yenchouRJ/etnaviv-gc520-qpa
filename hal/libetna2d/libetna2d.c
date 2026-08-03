@@ -180,9 +180,22 @@ static void emit_pe_flush(struct etna_cmd_stream *s)
 	ss(s, VIVS_GL_FLUSH_CACHE, VIVS_GL_FLUSH_CACHE_PE2D);
 }
 
-/* Worst-case command words for a single op (blit-with-blend is the largest:
- * ~40 state writes @2w + draw_2d @4w + tail @8w). Round up generously. */
-#define ETNA2D_OP_WORDS 128u
+ /* Worst-case command words for a single op (blit-with-blend is the largest:
+  * ~40 state writes @2w + draw_2d @4w + tail @8w). Round up generously. */
+ #define ETNA2D_OP_WORDS 128u
+
+ /* Hard cap on stream buffer size.
+  *
+  * The etnaviv kernel driver rejects any gem_submit with stream_size > SZ_128K
+  * (131,072 bytes = 32,768 words):
+  *   if (args->stream_size > SZ_128K || ...)
+  *       return -EINVAL;  // "submit arguments out of size limits"
+  *
+  * Allocating a buffer larger than this means etna_cmd_stream_reserve() never
+  * sees it as "full", so no auto-flush fires — the oversized submit reaches the
+  * kernel and fails.  Cap the allocation here so the buffer fills and
+  * auto-flushes before that limit is reached. */
+ #define ETNA2D_STREAM_WORDS_MAX (131072u / sizeof(uint32_t))  /* SZ_128K / 4 = 32 768 words */
 
 /* Reserve a whole op's worth of space up front.
  *
@@ -426,9 +439,13 @@ int etna2d_context_create(struct etna2d_device *dev, unsigned hint_ops,
 
 	/* Size the buffer to hold hint_ops full ops without splitting.
 	 * ETNA2D_OP_WORDS is the worst-case op size; op_begin() keeps every
-	 * op atomic even if this estimate is exceeded. */
+	 * op atomic even if this estimate is exceeded.
+	 * Clamp to ETNA2D_STREAM_WORDS_MAX so the buffer never exceeds the
+	 * kernel's SZ_128K per-submit stream size hard limit. */
 	words = (hint_ops ? hint_ops : 16) * ETNA2D_OP_WORDS;
 	if (words < 0x400) words = 0x400;
+	if (words > ETNA2D_STREAM_WORDS_MAX)
+		words = ETNA2D_STREAM_WORDS_MAX;
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx)
