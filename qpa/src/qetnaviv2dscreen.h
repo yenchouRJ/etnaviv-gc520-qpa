@@ -12,13 +12,17 @@
  * independent offscreen surface then etna2d_blit()s into the back scanout
  * BO before flipping (option B, decided in plan.md).
  *
- * Thread safety: all KMS calls must remain on the Qt GUI thread.  The
- * flip-pending flag is volatile; wait_flip() blocks via select().
+ * Thread safety: all KMS calls are serialised by m_flipMutex.  pageFlip()
+ * may be called from a render thread (QT_THREADED_PAINTING=1); the mutex
+ * ensures only one flip is in-flight at a time.  m_shuttingDown is set by
+ * cleanup() so that a late flush() arriving during teardown is silently
+ * dropped instead of racing with a partially-freed KMS state.
  */
 #ifndef QETNAVIV2DSCREEN_H
 #define QETNAVIV2DSCREEN_H
 
 #include <QtFbSupport/private/qfbscreen_p.h>
+#include <QMutex>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
@@ -72,7 +76,8 @@ public:
     etna2d_surface *backSurface() const { return m_scanoutSurf[m_backIdx]; }
 
     /* Flip back buffer to display; waits for vblank.
-     * Returns 0 on success, -1 on error. */
+     * Returns 0 on success, -1 on error or if shutting down.
+     * Thread-safe: serialised by m_flipMutex. */
     int pageFlip();
 
     /* Raw DRM fd (for drmHandleEvent poll if needed outside the screen). */
@@ -98,6 +103,9 @@ private:
     int             m_frontIdx   = 0;
     int             m_backIdx    = 1;
     volatile int    m_flipPending = 0;
+
+    QMutex          m_flipMutex;                /* serialises pageFlip() callers */
+    volatile bool   m_shuttingDown = false;     /* set in cleanup(); drops late flushes */
 
     /* Saved mode info for geometry. */
     drmModeModeInfo m_modeInfo   = {};

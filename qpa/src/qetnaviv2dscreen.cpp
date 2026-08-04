@@ -2,8 +2,9 @@
  * qetnaviv2dscreen.cpp — KMS display screen implementation.
  *
  * Uses the Phase-3 kms_display helper directly (tested and hardware-verified)
- * rather than Qt's eglfs-oriented QKmsDevice.  All KMS operations happen on
- * the GUI thread.
+ * rather than Qt's eglfs-oriented QKmsDevice.  KMS operations are serialised
+ * by m_flipMutex so pageFlip() is safe to call from a render thread
+ * (QT_THREADED_PAINTING=1) as well as the GUI thread.
  *
  * Initialization sequence:
  *  1. Open /dev/dri/card0, pick connector + CRTC, query preferred mode.
@@ -30,6 +31,8 @@
 #include <sys/select.h>
 #include <unistd.h>
 #include <cstring>
+
+#include <QMutexLocker>
 
 #include <drm_fourcc.h>
 
@@ -257,9 +260,18 @@ bool QEtnaviv2dScreen::initialize()
 
 /* -----------------------------------------------------------------------
  * pageFlip() — flip back buffer to display, block for vblank.
+ *
+ * Serialised by m_flipMutex so render-thread and GUI-thread flushes cannot
+ * race.  Returns immediately with -1 if teardown is already in progress
+ * (m_shuttingDown), avoiding an EBUSY from a late Ctrl-C flush.
  * ----------------------------------------------------------------------- */
 int QEtnaviv2dScreen::pageFlip()
 {
+    QMutexLocker lock(&m_flipMutex);
+
+    if (m_shuttingDown)
+        return -1;
+
     m_flipPending = 1;
     if (drmModePageFlip(m_kfd, m_crtcId, m_fb[m_backIdx].fb_id,
                         DRM_MODE_PAGE_FLIP_EVENT,
@@ -294,8 +306,12 @@ int QEtnaviv2dScreen::pageFlip()
             drmHandleEvent(m_kfd, &ev);
     }
 
-    /* Swap front/back. */
-    std::swap(m_frontIdx, m_backIdx);
+    /* Swap front/back — but only if we are not shutting down.
+     * If cleanup() set m_shuttingDown while we were waiting for vblank the
+     * flip has already been presented; skip the swap so cleanup() finds
+     * m_frontIdx/m_backIdx in a consistent state for drmModeSetCrtc. */
+    if (!m_shuttingDown)
+        std::swap(m_frontIdx, m_backIdx);
     SCR_DBG << "pageFlip done — front=" << m_frontIdx
             << "back=" << m_backIdx;
     return 0;
@@ -306,6 +322,13 @@ int QEtnaviv2dScreen::pageFlip()
  * ----------------------------------------------------------------------- */
 void QEtnaviv2dScreen::cleanup()
 {
+    {
+        /* Signal any concurrent pageFlip() to abort, then wait for it to
+         * release the mutex before we tear down KMS state under it. */
+        QMutexLocker lock(&m_flipMutex);
+        m_shuttingDown = true;
+    }
+
     /* Restore saved CRTC. */
     if (m_savedCrtc && m_kfd >= 0) {
         drmModeSetCrtc(m_kfd, m_savedCrtc->crtc_id,
