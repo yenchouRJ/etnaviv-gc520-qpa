@@ -131,8 +131,8 @@ etna2d_blit(src_BO → backing_BO)  doLock() → CPU reads QImage
 ### Run
 
 ```sh
-QT_QPA_PLATFORM=etnaviv2d ./test_slideshow ../../images 800 3
-QT_QPA_PLATFORM=linuxfb   ./test_slideshow ../../images 800 3
+QT_QPA_PLATFORM=etnaviv2d ./test_slideshow ./images 800 3
+QT_QPA_PLATFORM=linuxfb   ./test_slideshow ./images 800 3
 ```
 
 Arguments: `[image_dir [interval_ms [loops]]]`  
@@ -238,3 +238,110 @@ text ops per frame and will not see a regression.
   is not needed for v1.
 - **Risk #3 conditionally closed** — acceptable for typical widget UIs; the
   100-op threshold is the known limit for text-heavy applications.
+
+---
+
+## test_kms_thread
+
+**Risk #5 — KMS page-flip thread safety**
+
+### What it tests
+
+`QEtnaviv2dScreen::pageFlip()` touches `m_kfd`, `m_flipPending`, and
+`m_backIdx` without any lock.  When Qt's render thread
+(`QT_THREADED_PAINTING=1`) calls `flush()` concurrently with the GUI thread,
+two callers can reach `drmModePageFlip` simultaneously — one while a flip is
+already pending — producing `EBUSY`, torn frames, or a crash during teardown.
+
+The test makes the race **visible** and **quantitative** by running two
+concurrent threads against the same screen object, with no artificial
+synchronisation:
+
+```
+┌─────────────────────────┬─────────────────────────┐
+│      Thread A           │      Thread B           │
+│      (Left half)        │      (Right half)       │
+│                         │                         │
+│  earth.mp4 playback     │  Bouncing alpha circles │
+│  pre-extracted PNGs     │  unthrottled — maximum  │
+│  throttled to --fps     │  flush() contention     │
+│                         │                         │
+│  High-contrast edges    │  Real-time FPS counter  │
+│  (coastlines, clouds)   │  + frame counter        │
+│  make tearing obvious   │                         │
+└─────────────────────────┴─────────────────────────┘
+```
+
+`--circles=0` runs Thread A only (single-thread baseline).  The right half
+stays dark; all output is from the video thread alone — used to confirm the
+plugin works correctly before adding contention.
+
+### Frame extraction (one-time setup)
+
+```sh
+ffmpeg -i qpa/images/earth.mp4 -vf scale=512:300 \
+       qpa/images/earth_frames/frame_%04d.png
+# produces 901 frames (30 fps source, 30 s)
+```
+
+### Memory model
+
+Frames are loaded as `QImage` (CPU RAM) using a sliding ring-buffer of
+`--cache` frames.  `QPainter::drawImage()` composites directly onto the
+backing surface — no `QPixmap::fromImage()`, no per-frame `etna_bo`
+allocation.  Peak GPU BO pressure is unchanged from any other test.
+
+`--cache=2` is the recommended value on the MA35D1: the smaller window
+forces disk reads more frequently but avoids any decoded-frame backlog
+that can cause jitter.
+
+### Run
+
+```sh
+# Step 1 — baseline: single thread, no race
+QT_QPA_PLATFORM=etnaviv2d ./test_kms_thread \
+    --frames=100 --fps=30 --circles=0 \
+    --frames-dir=./earth_frames/ --cache=2
+
+# Step 2 — race exposed: QT_THREADED_PAINTING forces flush() from render thread
+QT_QPA_PLATFORM=etnaviv2d QT_THREADED_PAINTING=1 ./test_kms_thread \
+    --frames=100 --fps=30 --circles=10 \
+    --frames-dir=./earth_frames/ --cache=2
+
+# Step 3 — after mutex fix: same command, expect no tearing
+QT_QPA_PLATFORM=etnaviv2d QT_THREADED_PAINTING=1 ./test_kms_thread \
+    --frames=100 --fps=30 --circles=10 \
+    --frames-dir=./earth_frames/ --cache=2
+```
+
+### Pass criteria
+
+| Step | Expected result |
+|---|---|
+| Step 1 (baseline) | Smooth video left half, dark right half, clean exit |
+| Step 2 (race) | Visible horizontal tearing on left half; possible `EBUSY` in dmesg |
+| Step 3 (fixed) | No tearing on either half; smooth FPS counter; clean exit |
+
+### What it proves
+
+`m_flipMutex` makes each `pageFlip()` call atomic from the DRM kernel's point
+of view:
+
+```
+Thread A  pageFlip(): lock ──────────── drmModePageFlip ── vblank ── swap ── unlock
+Thread B  pageFlip():         lock(blocks) ────────────────────────────────── drmModePageFlip ── ...
+                              ↑ held off until Thread A's vblank completes
+```
+
+Without the mutex both threads reach `drmModePageFlip` while a flip is already
+in flight.  The kernel rejects the second call with `EBUSY` (only one flip may
+be pending per CRTC at a time); the display scanout continues from the
+previously committed buffer — producing a torn frame where the top scanlines
+show one buffer and the bottom show another.
+
+With the mutex only one caller holds it at a time, so `drmModePageFlip` is
+never called while `m_flipPending` is set.  The DRM kernel never sees a second
+request while the first vblank is outstanding — `EBUSY` is structurally
+impossible.
+
+- **Risk #5 closed.**

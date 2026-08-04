@@ -43,10 +43,12 @@ BUILD_T_INTG  = build/test_integration
 BUILD_T_BENCH = build/test_benchmark
 BUILD_T_SLIDE  = build/test_slideshow
 BUILD_T_GLYPH = build/test_glyph
+BUILD_T_KMSTH = build/test_kms_thread
 
 .PHONY: all plugin tests clean \
         test_blitter test_screen test_integration test_benchmark \
         test_slideshow test_glyph \
+        test_kms_thread \
         plugin_intree_sync
 
 all: plugin tests
@@ -74,7 +76,7 @@ $(PLUGIN_INTREE_DIR)/Makefile: plugin_intree_sync
 # -----------------------------------------------------------------------
 # Tests: built with in-tree qmake (resolves private Qt headers correctly)
 # -----------------------------------------------------------------------
-tests: test_blitter test_screen test_integration test_benchmark test_slideshow test_glyph
+tests: test_blitter test_screen test_integration test_benchmark test_slideshow test_glyph test_kms_thread
 
 test_blitter: $(BUILD_T_BLIT)/Makefile
 	$(MAKE) -C $(BUILD_T_BLIT)
@@ -93,6 +95,9 @@ test_slideshow: $(BUILD_T_SLIDE)/Makefile
 
 test_glyph: $(BUILD_T_GLYPH)/Makefile
 	$(MAKE) -C $(BUILD_T_GLYPH)
+
+test_kms_thread: $(BUILD_T_KMSTH)/Makefile
+	$(MAKE) -C $(BUILD_T_KMSTH)
 
 $(BUILD_T_BLIT)/Makefile: tests/test_blitter/test_blitter.pro | $(BUILD_T_BLIT)
 	cd $(BUILD_T_BLIT) && $(QMAKE) $(CURDIR)/tests/test_blitter/test_blitter.pro \
@@ -114,11 +119,14 @@ $(BUILD_T_SLIDE)/Makefile: tests/test_slideshow/test_slideshow.pro | $(BUILD_T_S
 $(BUILD_T_GLYPH)/Makefile: tests/test_glyph/test_glyph.pro | $(BUILD_T_GLYPH)
 	cd $(BUILD_T_GLYPH) && $(QMAKE) $(CURDIR)/tests/test_glyph/test_glyph.pro
 
+$(BUILD_T_KMSTH)/Makefile: tests/test_kms_thread/test_kms_thread.pro | $(BUILD_T_KMSTH)
+	cd $(BUILD_T_KMSTH) && $(QMAKE) $(CURDIR)/tests/test_kms_thread/test_kms_thread.pro
+
 # -----------------------------------------------------------------------
 # Directory creation
 # -----------------------------------------------------------------------
 $(BUILD_T_BLIT) $(BUILD_T_SCR) $(BUILD_T_INTG) $(BUILD_T_BENCH) \
-$(BUILD_T_SLIDE) $(BUILD_T_GLYPH):
+$(BUILD_T_SLIDE) $(BUILD_T_GLYPH) $(BUILD_T_KMSTH):
 	mkdir -p $@
 
 # -----------------------------------------------------------------------
