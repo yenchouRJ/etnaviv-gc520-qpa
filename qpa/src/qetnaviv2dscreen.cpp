@@ -62,6 +62,33 @@ static void flipHandler(int /*fd*/, unsigned int /*seq*/,
 }
 
 /* -----------------------------------------------------------------------
+ * propId() — resolve a property ID by name on a DRM object.
+ *
+ * DRM core assigns property IDs per object, so the same named property has
+ * different IDs on different planes.  Never hardcode; always resolve by name.
+ * Returns 0 if the object does not expose the property (caller must check).
+ * ----------------------------------------------------------------------- */
+uint32_t QEtnaviv2dScreen::propId(int fd, uint32_t objId, uint32_t objType,
+                                  const char *name)
+{
+    uint32_t id = 0;
+    drmModeObjectProperties *props =
+        drmModeObjectGetProperties(fd, objId, objType);
+    if (!props)
+        return 0;
+    for (uint32_t i = 0; i < props->count_props && id == 0; ++i) {
+        drmModePropertyRes *p = drmModeGetProperty(fd, props->props[i]);
+        if (!p)
+            continue;
+        if (strcmp(p->name, name) == 0)
+            id = p->prop_id;
+        drmModeFreeProperty(p);
+    }
+    drmModeFreeObjectProperties(props);
+    return id;
+}
+
+/* -----------------------------------------------------------------------
  * QEtnaviv2dScreen — construction / destruction
  * ----------------------------------------------------------------------- */
 QEtnaviv2dScreen::QEtnaviv2dScreen(const QString &cardPath,
@@ -95,6 +122,13 @@ bool QEtnaviv2dScreen::initialize()
         return false;
     }
     drmSetClientCap(m_kfd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+#ifndef ETNAVIV2D_LEGACY_KMS
+    if (drmSetClientCap(m_kfd, DRM_CLIENT_CAP_ATOMIC, 1)) {
+        SCR_WARN << "DRM_CLIENT_CAP_ATOMIC:" << strerror(errno);
+        cleanup();
+        return false;
+    }
+#endif
 
     /* --- 2. Enumerate resources, pick connector and CRTC --- */
     drmModeRes *res = drmModeGetResources(m_kfd);
@@ -134,7 +168,8 @@ bool QEtnaviv2dScreen::initialize()
         if (!enc) continue;
         for (int c = 0; c < res->count_crtcs; ++c) {
             if (enc->possible_crtcs & (1u << c)) {
-                m_crtcId = res->crtcs[c];
+                m_crtcId    = res->crtcs[c];
+                m_crtcIndex = c;
                 break;
             }
         }
@@ -159,6 +194,95 @@ bool QEtnaviv2dScreen::initialize()
 
     int w = m_modeInfo.hdisplay;
     int h = m_modeInfo.vdisplay;
+
+#ifndef ETNAVIV2D_LEGACY_KMS
+    /* --- 2b. Atomic: pick a PRIMARY plane for our CRTC, resolve props --- */
+    if (m_crtcIndex < 0) {
+        SCR_WARN << "no CRTC index captured";
+        cleanup();
+        return false;
+    }
+    {
+        drmModePlaneRes *pres = drmModeGetPlaneResources(m_kfd);
+        if (!pres) {
+            SCR_WARN << "drmModeGetPlaneResources failed";
+            cleanup();
+            return false;
+        }
+        for (uint32_t i = 0; i < pres->count_planes && m_planeId == 0; ++i) {
+            drmModePlane *pl = drmModeGetPlane(m_kfd, pres->planes[i]);
+            if (!pl)
+                continue;
+            if (pl->possible_crtcs & (1u << m_crtcIndex)) {
+                uint32_t tid = propId(m_kfd, pl->plane_id,
+                                      DRM_MODE_OBJECT_PLANE, "type");
+                if (tid) {
+                    drmModeObjectProperties *pp = drmModeObjectGetProperties(
+                        m_kfd, pl->plane_id, DRM_MODE_OBJECT_PLANE);
+                    if (pp) {
+                        for (uint32_t k = 0; k < pp->count_props; ++k) {
+                            if (pp->props[k] == tid &&
+                                pp->prop_values[k] == DRM_PLANE_TYPE_PRIMARY) {
+                                m_planeId = pl->plane_id;
+                                break;
+                            }
+                        }
+                        drmModeFreeObjectProperties(pp);
+                    }
+                }
+            }
+            drmModeFreePlane(pl);
+        }
+        drmModeFreePlaneResources(pres);
+    }
+    if (m_planeId == 0) {
+        SCR_WARN << "no PRIMARY plane for CRTC index" << m_crtcIndex;
+        cleanup();
+        return false;
+    }
+
+    /* Resolve property IDs by name (per object; 0 == not exposed). */
+    m_planeProps.fb_id   = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "FB_ID");
+    m_planeProps.crtc_id = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "CRTC_ID");
+    m_planeProps.src_x   = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "SRC_X");
+    m_planeProps.src_y   = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "SRC_Y");
+    m_planeProps.src_w   = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "SRC_W");
+    m_planeProps.src_h   = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "SRC_H");
+    m_planeProps.crtc_x  = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "CRTC_X");
+    m_planeProps.crtc_y  = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "CRTC_Y");
+    m_planeProps.crtc_w  = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "CRTC_W");
+    m_planeProps.crtc_h  = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "CRTC_H");
+    m_planeProps.zpos    = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "zpos");
+    /* overlay-only custom props — expected 0 on the primary plane */
+    m_planeProps.blend_mode        = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "porter-duff-blend-mode");
+    m_planeProps.source_alpha_mode = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "source-alpha-mode");
+
+    m_crtcProps.active  = propId(m_kfd, m_crtcId, DRM_MODE_OBJECT_CRTC, "ACTIVE");
+    m_crtcProps.mode_id = propId(m_kfd, m_crtcId, DRM_MODE_OBJECT_CRTC, "MODE_ID");
+    m_connProps.crtc_id = propId(m_kfd, m_connId, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID");
+
+    if (!m_planeProps.fb_id || !m_planeProps.crtc_id ||
+        !m_crtcProps.active || !m_crtcProps.mode_id || !m_connProps.crtc_id) {
+        SCR_WARN << "required atomic properties missing"
+                 << "(plane.fb_id" << m_planeProps.fb_id
+                 << "plane.crtc_id" << m_planeProps.crtc_id
+                 << "crtc.active" << m_crtcProps.active
+                 << "crtc.mode_id" << m_crtcProps.mode_id
+                 << "conn.crtc_id" << m_connProps.crtc_id << ")";
+        cleanup();
+        return false;
+    }
+
+    if (drmModeCreatePropertyBlob(m_kfd, &m_modeInfo, sizeof(m_modeInfo),
+                                  &m_modeBlobId)) {
+        SCR_WARN << "drmModeCreatePropertyBlob:" << strerror(errno);
+        cleanup();
+        return false;
+    }
+
+    SCR_INFO << "Atomic: plane=" << m_planeId
+             << "(primary) props resolved; mode blob=" << m_modeBlobId;
+#endif // !ETNAVIV2D_LEGACY_KMS
 
     /* --- 3. Allocate dumb BOs and DRM FBs --- */
     for (int i = 0; i < KMS_NUM_BUFS; ++i) {
@@ -215,12 +339,44 @@ bool QEtnaviv2dScreen::initialize()
     etna2d_fill(m_etnaCtx, m_scanoutSurf[m_frontIdx], 0, 0, w, h, 0xff000000u);
     etna2d_finish(m_etnaCtx);
 
+#ifdef ETNAVIV2D_LEGACY_KMS
     if (drmModeSetCrtc(m_kfd, m_crtcId, m_fb[m_frontIdx].fb_id, 0, 0,
                        &m_connId, 1, &m_modeInfo)) {
         SCR_WARN << "drmModeSetCrtc:" << strerror(errno);
         cleanup();
         return false;
     }
+#else
+    {
+        drmModeAtomicReq *req = drmModeAtomicAlloc();
+        if (!req) {
+            SCR_WARN << "drmModeAtomicAlloc (modeset) failed";
+            cleanup();
+            return false;
+        }
+        drmModeAtomicAddProperty(req, m_crtcId, m_crtcProps.mode_id, m_modeBlobId);
+        drmModeAtomicAddProperty(req, m_crtcId, m_crtcProps.active,  1);
+        drmModeAtomicAddProperty(req, m_connId, m_connProps.crtc_id, m_crtcId);
+        drmModeAtomicAddProperty(req, m_planeId, m_planeProps.fb_id,   m_fb[m_frontIdx].fb_id);
+        drmModeAtomicAddProperty(req, m_planeId, m_planeProps.crtc_id, m_crtcId);
+        drmModeAtomicAddProperty(req, m_planeId, m_planeProps.src_x,  0);
+        drmModeAtomicAddProperty(req, m_planeId, m_planeProps.src_y,  0);
+        drmModeAtomicAddProperty(req, m_planeId, m_planeProps.src_w,  (uint64_t)w << 16);
+        drmModeAtomicAddProperty(req, m_planeId, m_planeProps.src_h,  (uint64_t)h << 16);
+        drmModeAtomicAddProperty(req, m_planeId, m_planeProps.crtc_x, 0);
+        drmModeAtomicAddProperty(req, m_planeId, m_planeProps.crtc_y, 0);
+        drmModeAtomicAddProperty(req, m_planeId, m_planeProps.crtc_w, w);
+        drmModeAtomicAddProperty(req, m_planeId, m_planeProps.crtc_h, h);
+        int rc = drmModeAtomicCommit(m_kfd, req,
+                                     DRM_MODE_ATOMIC_ALLOW_MODESET, nullptr);
+        drmModeAtomicFree(req);
+        if (rc) {
+            SCR_WARN << "atomic modeset commit:" << strerror(errno);
+            cleanup();
+            return false;
+        }
+    }
+#endif
     SCR_INFO << "Initial modeset OK — screen" << w << "x" << h;
 
     /* --- 6. Fill QFbScreen fields --- */
@@ -273,6 +429,7 @@ int QEtnaviv2dScreen::pageFlip()
         return -1;
 
     m_flipPending = 1;
+#ifdef ETNAVIV2D_LEGACY_KMS
     if (drmModePageFlip(m_kfd, m_crtcId, m_fb[m_backIdx].fb_id,
                         DRM_MODE_PAGE_FLIP_EVENT,
                         static_cast<void *>(const_cast<int *>(&m_flipPending)))) {
@@ -280,6 +437,30 @@ int QEtnaviv2dScreen::pageFlip()
         m_flipPending = 0;
         return -1;
     }
+#else
+    {
+        /* Geometry is fixed after the initial modeset; only FB_ID changes
+         * per flip.  Non-blocking, event-driven — the drain loop below waits
+         * on the same DRM_MODE_PAGE_FLIP_EVENT the legacy path used. */
+        drmModeAtomicReq *req = drmModeAtomicAlloc();
+        if (!req) {
+            SCR_WARN << "drmModeAtomicAlloc (flip) failed";
+            m_flipPending = 0;
+            return -1;
+        }
+        drmModeAtomicAddProperty(req, m_planeId, m_planeProps.fb_id,
+                                 m_fb[m_backIdx].fb_id);
+        int rc = drmModeAtomicCommit(m_kfd, req,
+                     DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT,
+                     static_cast<void *>(const_cast<int *>(&m_flipPending)));
+        drmModeAtomicFree(req);
+        if (rc) {
+            SCR_WARN << "atomic flip commit:" << strerror(errno);
+            m_flipPending = 0;
+            return -1;
+        }
+    }
+#endif
 
     /* Wait for the flip event via select + drmHandleEvent. */
     drmEventContext ev = {};
@@ -329,7 +510,8 @@ void QEtnaviv2dScreen::cleanup()
         m_shuttingDown = true;
     }
 
-    /* Restore saved CRTC. */
+#ifdef ETNAVIV2D_LEGACY_KMS
+    /* Restore saved CRTC (legacy). */
     if (m_savedCrtc && m_kfd >= 0) {
         drmModeSetCrtc(m_kfd, m_savedCrtc->crtc_id,
                        m_savedCrtc->buffer_id,
@@ -338,6 +520,34 @@ void QEtnaviv2dScreen::cleanup()
         drmModeFreeCrtc(m_savedCrtc);
         m_savedCrtc = nullptr;
     }
+#else
+    /* Atomic teardown: disable the plane + CRTC.  Once DRM_CLIENT_CAP_ATOMIC
+     * is set, a legacy drmModeSetCrtc on this CRTC returns EINVAL, so we must
+     * disable via an atomic ALLOW_MODESET commit.  Runs after the flip drain
+     * above, so no commit is in flight. */
+    if (m_kfd >= 0 && m_planeId && m_crtcProps.active) {
+        drmModeAtomicReq *req = drmModeAtomicAlloc();
+        if (req) {
+            drmModeAtomicAddProperty(req, m_planeId, m_planeProps.fb_id,   0);
+            drmModeAtomicAddProperty(req, m_planeId, m_planeProps.crtc_id, 0);
+            drmModeAtomicAddProperty(req, m_connId,  m_connProps.crtc_id,  0);
+            drmModeAtomicAddProperty(req, m_crtcId,  m_crtcProps.active,   0);
+            drmModeAtomicAddProperty(req, m_crtcId,  m_crtcProps.mode_id,  0);
+            if (drmModeAtomicCommit(m_kfd, req,
+                                    DRM_MODE_ATOMIC_ALLOW_MODESET, nullptr))
+                SCR_WARN << "atomic disable commit:" << strerror(errno);
+            drmModeAtomicFree(req);
+        }
+    }
+    if (m_modeBlobId && m_kfd >= 0) {
+        drmModeDestroyPropertyBlob(m_kfd, m_modeBlobId);
+        m_modeBlobId = 0;
+    }
+    if (m_savedCrtc) {              /* saved but unused in atomic mode */
+        drmModeFreeCrtc(m_savedCrtc);
+        m_savedCrtc = nullptr;
+    }
+#endif
 
     for (int i = 0; i < KMS_NUM_BUFS; ++i) {
         if (m_scanoutSurf[i]) {

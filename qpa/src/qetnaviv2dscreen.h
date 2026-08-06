@@ -44,6 +44,25 @@ struct EtnaKmsFb {
     uint32_t height = 0;
 };
 
+/*
+ * Atomic-KMS property-ID caches.  All IDs are resolved once in initialize()
+ * *by name* (drm core assigns IDs per object, so they differ per plane); the
+ * app is responsible for checking presence before use.  A 0 ID means "the
+ * object does not expose that property" — legal for e.g. the blend props on
+ * the primary plane.
+ */
+struct EtnaPlaneProps {
+    uint32_t fb_id  = 0, crtc_id = 0;
+    uint32_t src_x  = 0, src_y = 0, src_w = 0, src_h = 0;
+    uint32_t crtc_x = 0, crtc_y = 0, crtc_w = 0, crtc_h = 0;
+    uint32_t zpos   = 0;
+    /* overlay-only custom props (0 on the primary plane) */
+    uint32_t blend_mode        = 0;
+    uint32_t source_alpha_mode = 0;
+};
+struct EtnaCrtcProps { uint32_t active = 0, mode_id = 0; };
+struct EtnaConnProps { uint32_t crtc_id = 0; };
+
 class QEtnaviv2dScreen : public QFbScreen
 {
     Q_OBJECT
@@ -86,6 +105,11 @@ public:
 private:
     void cleanup();
 
+    /* Resolve a property ID by name on a given DRM object.  Returns 0 if the
+     * object does not expose that property (callers must check before use). */
+    static uint32_t propId(int fd, uint32_t objId, uint32_t objType,
+                           const char *name);
+
     QString         m_cardPath;
     etna2d_context *m_etnaCtx;
     etna2d_device  *m_etnadev;
@@ -94,7 +118,15 @@ private:
     int             m_kfd         = -1;
     uint32_t        m_connId      = 0;
     uint32_t        m_crtcId      = 0;
+    int             m_crtcIndex   = -1;   /* index of m_crtcId in res->crtcs */
+    uint32_t        m_planeId     = 0;    /* the plane we scan out on */
     drmModeCrtc    *m_savedCrtc   = nullptr;
+
+    /* Atomic property-ID caches (resolved by name in initialize()). */
+    EtnaPlaneProps  m_planeProps;
+    EtnaCrtcProps   m_crtcProps;
+    EtnaConnProps   m_connProps;
+    uint32_t        m_modeBlobId  = 0;    /* MODE_ID blob for atomic modeset */
 
     /* Double-buffer scanout resources. */
     struct EtnaKmsFb m_fb[KMS_NUM_BUFS];

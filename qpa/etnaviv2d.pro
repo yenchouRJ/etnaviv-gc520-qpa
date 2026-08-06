@@ -18,6 +18,11 @@ TARGET = qetnaviv2d
 
 DEFINES += QT_NO_FOREACH
 
+# A/B regression oracle: build the frozen legacy-KMS path (drmModeSetCrtc /
+# drmModePageFlip, primary-only) instead of the default atomic path.
+#   qmake etnaviv2d.pro LEGACY_KMS=1
+!isEmpty(LEGACY_KMS):!equals(LEGACY_KMS, 0): DEFINES += ETNAVIV2D_LEGACY_KMS
+
 QT += \
     core-private          \
     gui-private           \

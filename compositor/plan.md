@@ -263,36 +263,33 @@ Verified against `compositor/build/modetest.log` (`modetest -M ma35-drm -p`):
   there is no `-M ma35-drm` driver-name coupling; `card=` just needs to resolve
   to the ma35-drm node (single GPU node).
 
-### Step 1 — Legacy → atomic KMS (build-time oracle kept)
+### Step 1 — Legacy → atomic KMS (build-time oracle kept) — **DONE**
 
-Current path is legacy (`drmModeSetCrtc`/`drmModePageFlip`,
-qetnaviv2dscreen.cpp:218,276) — implicitly primary-only. Plane targeting needs
-atomic.
+All 7 QPA tests (`test_blitter/screen/integration/benchmark/slideshow/glyph/kms_thread`)
+passed on hardware in both atomic (default) and legacy (`LEGACY_KMS=1`) builds.
+No regressions. R3 closed.
 
-- [ ] Add `drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1)`.
-- [ ] Enumerate planes (`drmModeGetPlaneResources` + `drmModeGetPlane`),
+- [x] Add `drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1)`.
+- [x] Enumerate planes (`drmModeGetPlaneResources` + `drmModeGetPlane`),
       classify by `type`, check `possible_crtcs`.
-- [ ] Cache object-property IDs **by name, per object** (IDs are
+- [x] Cache object-property IDs **by name, per object** (IDs are
       hardware-assigned and differ per plane — see Step 0 contract): plane
       (`FB_ID`, `CRTC_ID`, `SRC_*`, `CRTC_*`, `zpos`), CRTC (`ACTIVE`,
       `MODE_ID`), connector (`CRTC_ID`). Cache the blend props
       (`porter-duff-blend-mode`, `source-alpha-mode`) on the **overlay object
       only**; assert they are absent on the primary.
-- [ ] Replace `pageFlip()`'s flip with `drmModeAtomicCommit(...,
+- [x] Replace `pageFlip()`'s flip with `drmModeAtomicCommit(...,
       PAGE_FLIP_EVENT | ATOMIC_NONBLOCK, ...)`. Keep the vblank-event drain
       loop and the `m_flipMutex` / `m_shuttingDown` guards **unchanged**.
-- [ ] Replace `cleanup()`'s `drmModeSetCrtc` restore (qetnaviv2dscreen.cpp:334)
+- [x] Replace `cleanup()`'s `drmModeSetCrtc` restore (qetnaviv2dscreen.cpp:334)
       with a `drmModeAtomicCommit(ALLOW_MODESET)` that sets `ACTIVE=0` (or
       restores the saved mode blob). **Required:** once `DRM_CLIENT_CAP_ATOMIC`
       is set, mixing legacy `drmModeSetCrtc` calls on the same CRTC returns
       `EINVAL`.
-- [ ] Keep legacy code behind a **build-time `#ifdef`** as a frozen A/B
+- [x] Keep legacy code behind a **build-time `#ifdef`** as a frozen A/B
       regression oracle (`plane=primary` only). Atomic is the default and the
       only plane-capable path. (Display driver is owned in-house; atomic is
       always available — no runtime fallback, D7.)
-
-**Verify:** `plane=primary` on atomic reproduces current behaviour — full QPA
-suite passes, no tearing, clean Ctrl-C. Re-run the whole suite (R3).
 
 ### Step 2 — Plumb the `plane` argument
 
@@ -366,6 +363,40 @@ no dark/bright halo. This catches a *wiring* regression (FB left at XRGB8888,
       surfaces to hardware planes — the same NV12 buffer lands on the same
       plane, unchanged. The etnaviv2d QPA is **adapted** to emit `wl_surface`
       commits; `EtnaBlittable`/`libetna2d` remain the GPU-op layer (D11).
+
+### Step 6 — *(Optional)* SW-render mode for GPU vs CPU benchmark
+
+**Purpose:** isolate the GC520 DE contribution by holding the display path
+constant.  The comparison `our SW mode` vs `our GPU mode` answers the question
+*"is the GC520 DE faster than the CPU for 2D ops?"* cleanly.  Comparing against
+linuxfb conflates two variables (rendering engine **and** display path); this
+step removes the display-path variable entirely.
+
+**What changes (small, self-contained):**
+
+| Component | Change |
+|-----------|--------|
+| `QEtnaviv2dScreen` | `mmap` the dumb BOs at allocation (`DRM_IOCTL_MODE_MAP_DUMB`); expose the CPU pointer alongside `m_fb[]`. |
+| `QEtnaviv2dBackingStore` | In SW mode: hold a plain `QImage` as the paint target. In `flush()`: `memcpy` dirty rect into the scanout BO mmap; skip `etna2d_blit` / `etna2d_finish`. |
+| `QEtnaviv2dIntegration` | If SW mode: skip `etna2d_device_open` + `setGlobalContext`; construct screen in a no-GPU state. |
+
+**Trigger:** `QT_ETNAVIV2D_SW=1` env var (or equivalently `render=none` QPA
+arg).  No new files.  `libetna2d`, the blitter, and the atomic KMS path are
+untouched.
+
+**What the comparison measures:**
+
+```
+our SW mode   =  CPU paint  +  memcpy  +  vblank wait
+our GPU mode  =  GPU paint  +  etna2d_blit  +  etna2d_finish  +  vblank wait
+linuxfb       =  CPU paint  (direct fb0 mmap write, no copy, no vblank)
+```
+
+The `memcpy` (width × height × 4 bytes) is the one overhead SW mode adds over
+linuxfb; it can be timed independently to isolate the display-step cost.
+
+**Not a regression risk:** SW mode is an opt-in path; the default GPU path and
+all existing tests are unaffected.
 
 ---
 

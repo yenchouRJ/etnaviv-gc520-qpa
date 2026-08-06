@@ -36,6 +36,11 @@ QMAKE_VARS = \
     "ETNA2D_INCDIR=$(ETNA2D_INCDIR)" \
     "KMS_INCDIR=$(KMS_INCDIR)"
 
+# A/B oracle: `make plugin LEGACY_KMS=1` builds the frozen legacy-KMS path.
+ifdef LEGACY_KMS
+QMAKE_VARS += "LEGACY_KMS=$(LEGACY_KMS)"
+endif
+
 # Build directories for tests (standalone, out-of-tree)
 BUILD_T_BLIT  = build/test_blitter
 BUILD_T_SCR   = build/test_screen
