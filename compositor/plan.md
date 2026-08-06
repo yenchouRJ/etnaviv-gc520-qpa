@@ -1,280 +1,446 @@
 # Plane-aware scanout for the etnaviv2d QPA — Implementation Plan
 
-**Goal:** Let the Qt application target a *specific DRM plane* (primary,
-overlay, or auto) via a QPA argument, so that a second producer (GStreamer /
-FFmpeg) can drive video onto a different plane on the same CRTC without a
-compositor. Design the plane-selection layer so a Wayland compositor
-(Weston) can later take over plane assignment with **no change** to
-`libetna2d` or the QPA blitter.
+**Goal:** Let a single Qt process drive both its **GUI** (on the overlay plane,
+blended) and its **video stream** (on the primary plane) through the etnaviv2d
+QPA, using one atomic KMS commit. Design the plane layer so a Wayland
+compositor (Weston) can later own multi-process plane assignment with **no
+change** to `libetna2d` or the QPA blitter.
+
+> **Status:** Design locked via `/grilling` session. See "Decisions log" at
+> the end for the reasoning behind each choice. Implementation has **not**
+> started — this document is the artifact of shared understanding.
 
 ---
 
-## Target hardware recap
-
-The MA35D1 DRM driver (`drivers/gpu/drm/nuvoton`) exposes a single CRTC with
-three hardware layers as DRM planes (`ma35_plane.c`):
-
-| DRM plane type   | HW layer | Formats                         | Alpha / blend | Position |
-|------------------|----------|---------------------------------|---------------|----------|
-| `PRIMARY`        | Framebuffer | RGB + YUV (NV12, YUYV, P010…) | no (opaque, colorkey vs background) | fixed full-screen |
-| `OVERLAY`        | Overlay  | RGB + YUV                       | yes — Porter-Duff `SRC_OVER`, global/coverage alpha, colorkey | positionable (`crtc_x/y/w/h`) |
-| `CURSOR`         | Cursor   | XRGB8888, 32×32 (`MA35_CURSOR_SIZE`) | no        | positionable |
-
-Key facts driving the design:
-
-- **zpos is immutable** (`drm_plane_create_zpos_immutable_property`,
-  ma35_plane.c:865): stacking order is fixed by the `layer-id` in the device
-  tree — overlay/primary/cursor order cannot be reprogrammed at runtime.
-- **Primary is not positionable** (`can_position = type != PRIMARY`,
-  ma35_plane.c:284) and does **not** blend — it is the opaque background.
-- **Overlay blends** with `SRC_OVER` and supports positioning + colorkey — it
-  is the natural target for a translucent Qt UI floating over video.
-- **The overlay plane can carry YUV**, so *either* split (UI-on-overlay /
-  video-on-primary, **or** video-on-overlay / UI-on-primary) is electrically
-  possible. We standardise on **UI → overlay, video → primary** because the
-  overlay is the only plane that blends, and a UI needs per-pixel alpha over
-  the video.
-
----
-
-## Architecture
+## The two-state model (this is the whole design)
 
 ```
-── No compositor (Phases 1–2) ──────────────────────────────────
+── One process (Phases 1–2, this plan) ─────────────────────────
 
-Qt app (etnaviv2d QPA)            GStreamer / FFmpeg
-   │  drmModeAtomicCommit            │  drmModeAtomicCommit
-   │  (OVERLAY plane, ARGB, blend)   │  (PRIMARY plane, NV12/YUYV)
-   └────────────────── /dev/dri/card0 ──────────────────────────
-                        one DRM master (see lease note below)
+  Qt app (etnaviv2d QPA) — owns GUI *and* video
+     │  GStreamer appsink → memcpy NV12 → primary BO ring
+     │  Qt render        → ARGB overlay BO
+     │
+     └── ONE drmModeAtomicCommit (overlay FB + primary FB) ──────
+                         │
+                    /dev/dri/card0   (Qt is sole DRM master)
 
-── With Wayland compositor (Phase 3) ───────────────────────────
+── Multiple processes (Phase 3, future) ────────────────────────
 
-Qt app (wayland QPA)     GStreamer (waylandsink / dmabuf-import)
-   │  wl_surface               │  wl_surface + linux-dmabuf-v1
-   └───────────┐               └──────────────┐
-               ▼                              ▼
-         Weston compositor (DRM master)
-            │  drmModeAtomicCommit
-            │  (assigns planes from its pool)
-            └──────── /dev/dri/card0
+  Qt app (wayland QPA)     GStreamer (waylandsink / dmabuf-import)
+     │  wl_surface               │  wl_surface + linux-dmabuf-v1
+     └───────────┐               └──────────────┐
+                 ▼                              ▼
+           Weston compositor (sole DRM master)
+              │  drmModeAtomicCommit (assigns planes from its pool)
+              └──────── /dev/dri/card0
 ```
 
-### The one-master problem
+**There is deliberately no in-between.** Two raw-KMS processes never co-own
+`card0`. Single process → the QPA owns everything in one atomic commit.
+Multi-process → a Wayland compositor owns plane *arbitration*; the etnaviv2d
+QPA is **adapted** (not replaced) to present via `wl_surface` instead of direct
+KMS, keeping all GC520 GPU knowledge (D11). The DRM-lease multi-process path is
+a **non-goal** (cut during design; see Decisions log D4).
 
-DRM allows exactly **one master** per `/dev/dri/card0`. Two independent
-processes (Qt + GStreamer) cannot both do `drmModeAtomicCommit` on the same
-card without coordination. Three ways to resolve this, in increasing
-robustness:
+**The GPU-op layer is invariant across all phases.** `libetna2d` and
+`EtnaBlittable` only ever render into an `etna2d_surface` — they never learn
+about planes, KMS, or Wayland. Only the *transport* layer of
+`QEtnaviv2dScreen` changes:
 
-1. **Single-owner (simplest, Phase 2 default).** One process is DRM master and
-   commits *both* planes. The test program is that owner: it runs the Qt event
-   loop and pulls decoded video frames from GStreamer via `appsink`
-   (dmabuf-import), committing UI-on-overlay and video-on-primary in one
-   atomic commit. GStreamer never touches KMS.
+| Phase | Render (invariant) | Transport / scanout |
+|-------|--------------------|---------------------|
+| No compositor | `EtnaBlittable` → `etna2d_surface` | dmabuf → `drmModeAtomicCommit` (direct KMS) |
+| Weston | `EtnaBlittable` → `etna2d_surface` | dmabuf → `wl_surface` + `linux-dmabuf-v1` → `wl_surface_commit`; Weston picks the plane |
 
-2. **DRM lease (Phase 2 stretch).** The Qt process is master, creates a
-   `drmModeCreateLease` for the primary plane + its CRTC resources, and hands
-   the lease fd to GStreamer (`kmssink`). Each side commits its own plane on
-   its own fd. This is the honest multi-process model and the closest analogue
-   to what a compositor does.
-
-3. **Wayland compositor (Phase 3).** Weston is the sole master; Qt and
-   GStreamer are Wayland clients. Plane assignment becomes Weston's job.
-
-We implement (1) first because it needs no new IPC and exercises the full
-plane path. The QPA plane-selection code is identical under all three — only
-*who holds the master fd* changes.
-
-### Wayland-forward invariants
-
-To guarantee the QPA work survives the move to Weston, the plane-selection
-logic must obey:
-
-- **libetna2d and the blitter never learn about planes.** They only ever
-  render into an `etna2d_surface`. Which plane that surface is scanned out on
-  is decided entirely inside `QEtnaviv2dScreen`. Under Wayland the same
-  surface becomes a `wl_buffer`; the blitter is unchanged.
-- **Plane choice is resolved once at screen init**, from the QPA argument,
-  and cached. No per-frame plane logic.
-- **A "handoff" mode exists from day one**: when the QPA argument is `wayland`
-  (or the env says a Wayland display is present), `QEtnaviv2dScreen` does *not*
-  become DRM master and does *not* modeset — it is a no-op stub. This is the
-  seam where the real Wayland QPA takes over later.
+The etnaviv2d QPA remains the **sole holder of GC520 DE knowledge** in both
+worlds. Weston owns *arbitration* (which plane, multi-client), not *rendering*.
 
 ---
 
-## QPA argument design
+## Target hardware (confirmed against sources)
 
-Qt platform plugins receive arguments via
-`-platform etnaviv2d:key=value:key2=value2` (parsed in
-`QEtnaviv2dIntegration`). Add one argument:
+MA35D1 DRM driver (`drivers/gpu/drm/nuvoton`), single CRTC, three planes:
+
+| Plane   | zpos | layer-id (DT) | Formats                    | Blend | Position |
+|---------|------|---------------|----------------------------|-------|----------|
+| PRIMARY | 0 (bottom) | 0 | RGB + YUV (NV12, YUYV, P010…) | no — opaque | fixed full-screen |
+| OVERLAY | 1 (middle) | 1 | RGB + YUV                  | **yes** — Porter-Duff `SRC_OVER` | positionable |
+| CURSOR  | 2 (top)    | 2 | XRGB8888, 32×32            | no    | positionable |
+
+Confirmed facts driving the design:
+
+- **zpos order (R2 — closed).** DT `ma35d1.dtsi:1774–1789` sets
+  `layer-id`: primary=0, overlay=1, cursor=2. `ma35_layer_create` maps
+  `zpos = index` (ma35_plane.c:865), immutable. **Overlay (zpos 1) is above
+  primary (zpos 0)** → UI-on-overlay / video-on-primary is correct. Not a
+  risk.
+- **Overlay blends premultiplied `SRC_OVER` (R1 — closed by spec).** The
+  MA35D1 display spec documents `SRC_OVER` on **premultiplied** alpha with the
+  standard formula `out = src + dst·(1−src.a)`. This matches Qt's
+  `Format_ARGB32_Premultiplied` output exactly — **zero conversion** in the
+  overlay path. `source-alpha-mode = None` makes the driver honour the FB's
+  per-pixel alpha (ma35_plane.c:101–105, 423–428).
+- **Primary is opaque and not positionable** (`can_position = type != PRIMARY`,
+  ma35_plane.c:284) — the correct video background.
+- **NV12 on planes (R4 — sufficient for v1).** `MA35_FORMAT_NV12` is in the
+  shared plane format list (ma35_plane.c:43, validated :164) for both primary
+  and overlay. The plane *accepts* NV12; zero-copy dmabuf import is a **v2**
+  concern gated on the VPU/KMS driver.
+
+### Split-plane assignment (locked)
+
+**UI → overlay (blends), video → primary (opaque NV12).** The overlay is the
+only plane that blends, and a UI needs per-pixel alpha over the video. The DT
+zpos order supports this natively.
+
+---
+
+## Wayland-forward invariants (must hold through all phases)
+
+- **libetna2d and the blitter never learn about planes.** They only render
+  into an `etna2d_surface`. Which plane it scans out on is decided entirely in
+  `QEtnaviv2dScreen`. Under Wayland the same surface becomes a `wl_buffer`;
+  the blitter is unchanged.
+- **Plane choice is resolved once at screen init** from the QPA argument, then
+  cached. No per-frame plane logic.
+- **A `wayland` handoff stub exists from day one:** when the QPA argument is
+  `wayland` (or `$WAYLAND_DISPLAY` is set), `QEtnaviv2dScreen`'s **direct-KMS**
+  transport is disabled — it does not become DRM master and does not modeset.
+  This is the seam where the QPA's transport layer is later switched to the
+  Wayland client path (D11); the blitter/`libetna2d` side is untouched.
+- **The `attachPrimaryFb` hook is the ancestor of a Wayland scanout
+  candidate.** In single-owner mode it stages an NV12 FB into the QPA's
+  commit; under Weston the same NV12 buffer becomes a `linux-dmabuf-v1`
+  surface that Weston promotes to a hardware plane. Same buffer, different
+  arbiter.
+
+---
+
+## QPA argument
 
 ```
 -platform etnaviv2d:plane=<mode>[,card=/dev/dri/cardN]
 ```
 
-`plane` modes:
+| Value      | Behaviour |
+|------------|-----------|
+| *(absent)* | **Default.** Auto: `$WAYLAND_DISPLAY` set → `wayland` handoff; else `primary`. |
+| `primary`  | Qt owns primary, full-screen, opaque. Legacy-compatible (also the atomic A/B oracle). |
+| `overlay`  | Qt renders full-screen ARGB8888 on the overlay with premultiplied `SRC_OVER`; leaves primary free for the in-process video path. Runnable standalone (see D6). |
+| `auto`     | Explicit form of *(absent)*. |
+| `wayland`  | Handoff stub: no DRM master, no modeset. Reserved for the future Wayland QPA. |
 
-| Value       | Behaviour |
-|-------------|-----------|
-| *(absent)*  | **Default.** Auto: if `$WAYLAND_DISPLAY` is set → `wayland` handoff; else → `primary`. |
-| `primary`   | Qt owns the primary plane, full-screen, opaque (current behaviour, legacy-compatible). |
-| `overlay`   | Qt renders ARGB onto the overlay plane with `SRC_OVER`; leaves primary free for a video producer. |
-| `auto`      | Same as absent but explicit. |
-| `wayland`   | Handoff stub: screen does not become DRM master; reserved for the future Wayland QPA. |
+Precedence: explicit QPA arg > `$QT_ETNAVIV2D_PLANE` env > `$WAYLAND_DISPLAY`
+presence > `primary` fallback.
 
-Selection precedence: explicit QPA arg  >  `$QT_ETNAVIV2D_PLANE` env  >
-`$WAYLAND_DISPLAY` presence  >  `primary` fallback.
+---
+
+## Overlay configuration (fully pinned)
+
+- FB format: `DRM_FORMAT_ARGB8888` (**not** the current hardcoded `XRGB8888`).
+- `source-alpha-mode = None` — per-pixel alpha from the FB.
+- `porter-duff-blend-mode = SRC_OVER`.
+- Source pixels: **premultiplied** (Qt native, no conversion — R1 spec-confirmed).
+- Geometry: **full-screen** overlay; transparent where no widget draws, video
+  shows through. `geometry()` stays full-screen (Qt sees a normal full screen).
+
+---
+
+## The single-commit / attach-hook contract
+
+`QEtnaviv2dScreen` is the **sole KMS committer**. Both planes land in one
+atomic commit → one page-flip event → tear-free plane sync and the existing
+`m_flipMutex` invariant is preserved.
+
+### `attachPrimaryFb()` — latched staging + three-buffer discipline
+
+```
+3 primary NV12 buffers, each with one bit: ON_SCREEN (else free).
+
+video thread (GStreamer appsink cb):
+    pick a buffer that is NOT on_screen AND NOT the current staged one
+    memcpy NV12 → that buffer                 ← DC is never reading it
+    attachPrimaryFb({fbId, ...})              ← flip lock: set staged = buffer,
+                                                 request wake-up (D12), return.
+                                                 Never blocks on vblank.
+
+QPA flip thread (pageFlip(), under m_flipMutex):
+    read staged buffer (last-write-wins)
+    drmModeAtomicCommit(overlay FB + staged primary FB, PAGE_FLIP_EVENT | NONBLOCK)
+    mark that primary buffer ON_SCREEN
+
+flip-event drain (existing handler):
+    clear ON_SCREEN on the buffer whose commit just completed → it becomes free
+```
+
+- **Decoupled:** the GStreamer thread never waits on display timing.
+- **Correct by construction (D9b, revised):** the producer picks *only* a
+  buffer that is neither `on_screen` (the DC is scanning it) nor the currently
+  `staged` one. It therefore can **never overwrite the buffer the display
+  controller is reading** — the failure the earlier "3-deep ring" and the naïve
+  "2-BO swap" both had (a fast producer running >1 frame ahead within one
+  vblank wraps onto the on-screen buffer). Three buffers with a single
+  `on_screen` bit (cleared on the flip event) is the minimal race-free design —
+  one bool per buffer, no state machine.
+- **Implicit drop / repeat:** producer too fast → it overwrites a free buffer,
+  newest-wins (old frame dropped). Consumer too fast → `staged` unchanged, the
+  same frame is re-committed (repeat). Both degenerate cases are automatically
+  correct.
+- **Overlay unchanged:** overlay keeps its existing **2-deep** double-buffer
+  (Qt renders it inline before the flip, so no extra slack needed).
+- **Shared release:** one atomic commit → one `DRM_MODE_PAGE_FLIP_EVENT`. When
+  it drains, the overlay back-buffer flips *and* the just-committed primary
+  buffer's `on_screen` bit is cleared — a single completion advances both
+  sides.
+
+### Video-driven present (the second commit trigger)
+
+Because `QEtnaviv2dScreen` is the **sole committer**, the primary (video) plane
+reaches the display only through the atomic commit that `pageFlip()` issues.
+There are two independent producers that must be able to cause a commit:
+
+- **The UI (overlay)** — Qt drives a commit whenever a window repaints
+  (`flush()` → `pageFlip()`), i.e. on animation, input, or damage.
+- **The video (primary)** — a new decoded frame must also be able to cause a
+  commit, *independently of UI activity*.
+
+If only the UI could trigger commits, a **static UI** (no animation, no input,
+no dirty region) would produce no repaints → no `flush()` → no `pageFlip()` →
+no commit, and the video would sit on its last committed frame while the
+GStreamer thread kept staging new ones. So by design the video producer is a
+**first-class present trigger**, symmetric with the UI.
+
+**Mechanism (D12).** `attachPrimaryFb()`, after staging its buffer, requests a
+present on the GUI side:
+
+- Post a **coalesced** update to the platform window
+  (`QWindow::requestUpdate()` / an update event on the QPA window),
+  marshalled to the **GUI thread** — the GStreamer thread must never call
+  `QWindow` APIs directly.
+- Coalesce to **≤ one request per vblank interval**, not one per decoded
+  frame: a fast producer must not flood the event loop or drive commits faster
+  than the display refresh. Last-write-wins on the staged buffer means the next
+  commit always carries the newest frame regardless of how many were dropped.
+- If a flip is already in flight, do nothing — the pending commit will pick up
+  the latest staged buffer when it runs.
+
+This preserves the "producer never blocks on vblank" property (D9) while making
+the video advance on its own cadence. It is also **Wayland-forward**: under
+Weston the same request becomes a present driven by a `wl_surface` frame
+callback, so "producer requests a present" maps directly across phases.
 
 ---
 
 ## Implementation steps
 
-### Step 0 — Preconditions (verify, no code)
+### Step 0 — Preconditions (verify, no code) — **DONE**
 
-- [ ] Confirm the driver advertises `DRM_CAP_ATOMIC` and the overlay plane is
-      enumerated with `DRM_CLIENT_CAP_UNIVERSAL_PLANES` (already set at
-      qetnaviv2dscreen.cpp:97). Dump with `modetest -M nuvoton -p`.
-- [ ] Confirm overlay `possible_crtcs` includes our CRTC
-      (`ma35_overlay_attach_crtc`, ma35_plane.c:891).
-- [ ] Confirm the overlay accepts `DRM_FORMAT_ARGB8888` and the
-      `porter-duff-blend-mode` / `source-alpha-mode` properties exist
-      (ma35_plane.c:654–679). Note their property IDs for atomic commits.
+Verified against `compositor/build/modetest.log` (`modetest -M ma35-drm -p`):
 
-### Step 1 — Convert the QPA scanout path from legacy to atomic KMS
+- [x] Planes enumerate under `DRM_CLIENT_CAP_UNIVERSAL_PLANES`: **3 planes** —
+      **31 Primary** (type 1, zpos 0), **38 Overlay** (type 0, zpos 1),
+      **49 Cursor** (type 2, zpos 2). All zpos `immutable` → **R2 confirmed:
+      overlay (1) above primary (0)**. Single CRTC **52**.
+- [x] `possible_crtcs = 0x00000001` on all three planes → all attach CRTC 52.
+- [x] Overlay (38) exposes `porter-duff-blend-mode` (enum, **SRC_OVER=3**,
+      default 3) and `source-alpha-mode` (enum, **None=0**, default None) →
+      **R1 wiring confirmed**.
+- [x] **NV12** listed in the format set of **both** primary and overlay →
+      **R4 confirmed**. Overlay also has `swizzle`, `colorkey-*`,
+      `destination-alpha-mode`, `source/destination-global-color`.
+- [x] Cursor (49) is **XR24 only**, 32×32 (unused by this plan).
 
-The current screen uses `drmModeSetCrtc` + `drmModePageFlip`
-(qetnaviv2dscreen.cpp:218,276), which implicitly binds the CRTC's *primary*
-plane only. Plane targeting requires the atomic API.
+**Contract carried into Step 1 (from the dump):**
+- The blend props (`porter-duff-blend-mode`=40, `source-alpha-mode`=41,
+  `destination-alpha-mode`=42) exist **only on the overlay plane**; the primary
+  has none. Cache blend props on the **overlay object only**; the primary path
+  must never touch them.
+- Property IDs are **per-object and hardware-assigned** (e.g. `swizzle` is 33 on
+  primary, 45 on overlay; `zpos` is 37/48/51). **Always resolve property IDs by
+  name at runtime per object** — never hardcode an ID.
+- The QPA opens the card **by path** (`m_cardPath`, qetnaviv2dscreen.cpp:92), so
+  there is no `-M ma35-drm` driver-name coupling; `card=` just needs to resolve
+  to the ma35-drm node (single GPU node).
 
-- [ ] Add `drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1)` next to the existing
-      universal-planes cap.
-- [ ] Enumerate planes with `drmModeGetPlaneResources` + `drmModeGetPlane`;
-      classify each by its `type` property (PRIMARY/OVERLAY/CURSOR) and check
-      `possible_crtcs`.
-- [ ] Cache the object-property IDs needed for commits: on the plane
-      (`FB_ID`, `CRTC_ID`, `SRC_{X,Y,W,H}`, `CRTC_{X,Y,W,H}`, `zpos`,
-      `porter-duff-blend-mode`, `source-alpha-mode`) and on the CRTC
-      (`ACTIVE`, `MODE_ID`) and connector (`CRTC_ID`).
-- [ ] Replace `pageFlip()`'s `drmModePageFlip` with
-      `drmModeAtomicCommit(..., DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK, ...)`
-      on the selected plane's `FB_ID`. Keep the existing vblank-event drain
-      loop and the `m_flipMutex` / `m_shuttingDown` guards unchanged.
-- [ ] Keep a legacy fallback path guarded by a build flag in case atomic is
-      unavailable, but atomic is the primary path.
+### Step 1 — Legacy → atomic KMS (build-time oracle kept)
 
-**Verify:** `plane=primary` on atomic reproduces the exact current behaviour
-(all existing QPA tests still pass, no tearing, clean Ctrl-C).
+Current path is legacy (`drmModeSetCrtc`/`drmModePageFlip`,
+qetnaviv2dscreen.cpp:218,276) — implicitly primary-only. Plane targeting needs
+atomic.
 
-### Step 2 — Plumb the `plane` argument through the plugin
+- [ ] Add `drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1)`.
+- [ ] Enumerate planes (`drmModeGetPlaneResources` + `drmModeGetPlane`),
+      classify by `type`, check `possible_crtcs`.
+- [ ] Cache object-property IDs **by name, per object** (IDs are
+      hardware-assigned and differ per plane — see Step 0 contract): plane
+      (`FB_ID`, `CRTC_ID`, `SRC_*`, `CRTC_*`, `zpos`), CRTC (`ACTIVE`,
+      `MODE_ID`), connector (`CRTC_ID`). Cache the blend props
+      (`porter-duff-blend-mode`, `source-alpha-mode`) on the **overlay object
+      only**; assert they are absent on the primary.
+- [ ] Replace `pageFlip()`'s flip with `drmModeAtomicCommit(...,
+      PAGE_FLIP_EVENT | ATOMIC_NONBLOCK, ...)`. Keep the vblank-event drain
+      loop and the `m_flipMutex` / `m_shuttingDown` guards **unchanged**.
+- [ ] Replace `cleanup()`'s `drmModeSetCrtc` restore (qetnaviv2dscreen.cpp:334)
+      with a `drmModeAtomicCommit(ALLOW_MODESET)` that sets `ACTIVE=0` (or
+      restores the saved mode blob). **Required:** once `DRM_CLIENT_CAP_ATOMIC`
+      is set, mixing legacy `drmModeSetCrtc` calls on the same CRTC returns
+      `EINVAL`.
+- [ ] Keep legacy code behind a **build-time `#ifdef`** as a frozen A/B
+      regression oracle (`plane=primary` only). Atomic is the default and the
+      only plane-capable path. (Display driver is owned in-house; atomic is
+      always available — no runtime fallback, D7.)
 
-- [ ] `QEtnaviv2dIntegration`: parse `plane=` and `card=` from the platform
-      argument string; resolve the precedence chain (arg > env > wayland-probe
-      > primary) into an enum `PlaneMode { Primary, Overlay, Wayland }`.
-- [ ] Pass the resolved mode into `QEtnaviv2dScreen`'s constructor.
-- [ ] `QEtnaviv2dScreen::initialize()`:
-      - `Wayland` → return early as a no-op stub (log "handoff mode"); do not
-        open card as master, do not modeset.
-      - `Primary` → target the primary plane, full-screen, opaque (Step 1).
-      - `Overlay` → target the overlay plane; set ARGB8888,
-        `porter-duff-blend-mode = SRC_OVER`, `source-alpha-mode = None`
-        (per-pixel alpha), position = full CRTC or a configurable rect.
+**Verify:** `plane=primary` on atomic reproduces current behaviour — full QPA
+suite passes, no tearing, clean Ctrl-C. Re-run the whole suite (R3).
 
-**Verify:** `plane=overlay` shows the Qt UI blended over whatever the primary
-plane holds (initially the background color); `plane=wayland` starts the app
-without touching KMS.
+### Step 2 — Plumb the `plane` argument
 
-### Step 3 — Overlay blend correctness
+- [ ] `QEtnaviv2dIntegration`: parse `plane=` / `card=`; resolve precedence
+      (arg > env > wayland-probe > primary) into
+      `PlaneMode { Primary, Overlay, Wayland }`.
+- [ ] Pass the mode into `QEtnaviv2dScreen`.
+- [ ] `initialize()`:
+      - `Wayland` → return early, no-op stub (log "handoff mode"); no master,
+        no modeset.
+      - `Primary` → primary plane, full-screen, opaque (Step 1).
+      - `Overlay` → overlay plane, full-screen ARGB8888,
+        `SRC_OVER`, `source-alpha-mode = None`.
 
-The overlay blends with the driver's `SRC_OVER` against the primary plane.
-The QPA already produces `Format_ARGB32_Premultiplied` surfaces (matches the
-GC520 PE). Confirm the *scanout* alpha survives to the overlay:
+**Verify:** `plane=wayland` starts without touching KMS.
 
-- [ ] Ensure the overlay framebuffer format is `DRM_FORMAT_ARGB8888`
-      (not `XRGB8888`, which the current code hardcodes at
-      qetnaviv2dscreen.cpp:183) so the alpha channel is honoured.
-- [ ] Set `source-alpha-mode = None` so the driver uses the per-pixel alpha
-      from the FB rather than the global color (ma35_plane.c:101–105,
-      423–428).
-- [ ] Decide whether the QPA surface must be *straight* or *premultiplied*
-      alpha for the DE's overlay blend — the driver comment disables the
-      pre-multiplied alpha mode (ma35_plane.c:104), so verify on hardware
-      whether Qt's premultiplied output needs an un-premultiply pass or a
-      `SRC` (not `SRC_OVER`) mode with the compositor doing coverage.
+### Step 3 — Overlay blend correctness (over solid background)
 
-**Verify:** a semi-transparent Qt widget over a solid primary shows correct
-edge blending, no dark/bright halo (the classic premultiply mismatch tell).
+`plane=overlay` is standalone-runnable: with no primary FB attached, the
+primary shows the driver background color (`MA35_FRAMEBUFFER_BGCOLOR`,
+ma35_plane.c:395); the full-screen overlay blends over it (D6). This is the
+test rung between Step 2 and Step 4.
 
-### Step 4 — Video producer + split-plane test program
+- [ ] Overlay FB = `DRM_FORMAT_ARGB8888` (fix the `XRGB8888` hardcode,
+      qetnaviv2dscreen.cpp:183).
+- [ ] `source-alpha-mode = None`, `porter-duff-blend-mode = SRC_OVER`.
+- [ ] No premultiply conversion (R1 spec-confirmed premultiplied).
 
-Write `compositor/test_planes/` — a single-owner (model 1) program:
+**Acceptance (belt-and-suspenders, R1 already closed by spec):** a
+semi-transparent Qt widget over a solid primary shows correct edge blending,
+no dark/bright halo. This catches a *wiring* regression (FB left at XRGB8888,
+`source-alpha-mode` drift), not a math error.
 
-- [ ] Qt UI (etnaviv2d QPA, `plane=overlay`) draws an animated HUD with
-      translucent panels.
-- [ ] A GStreamer pipeline decodes video to NV12 dmabufs via `appsink`
-      (`... ! v4l2/videoconvert ! video/x-raw,format=NV12 ! appsink`), and the
-      program imports each dmabuf as a KMS FB (`drmModeAddFB2` with the dmabuf
-      handle) and commits it to the **primary** plane.
-- [ ] Both plane updates go in **one `drmModeAtomicCommit`** per frame, paced
-      by a single page-flip event — this is why the single-owner model is the
-      clean baseline: no cross-process flip contention.
-- [ ] CLI flags: `--video=<file>`, `--ui-rect=WxH+X+Y`, `--fps`, and a
-      `--separate-master` flag to exercise the DRM-lease path (Step 5).
+### Step 4 — In-process video path + split-plane test program
+
+`compositor/test_planes/` — single-owner, Qt is the only DRM master.
+
+- [ ] Qt UI (etnaviv2d QPA, `plane=overlay`) draws an animated translucent HUD,
+      full-screen.
+- [ ] GStreamer decodes to NV12 via `appsink` **into CPU memory**; the program
+      `memcpy`s each frame into a **free** primary buffer (one that is neither
+      `on_screen` nor `staged` — **3 buffers + `on_screen` bit**, D9b — no naïve
+      ring/swap), `drmModeAddFB2`s it, and calls `attachPrimaryFb()`.
+- [ ] The QPA folds the staged primary FB into its **single** atomic commit
+      (D3/D9). No separate committer.
+- [ ] `attachPrimaryFb()` drives a **coalesced GUI-thread repaint** so the
+      video advances even when the UI is static (D12) — verify with a static
+      HUD: the video must keep playing.
+- [ ] CLI: `--video=<file>`, `--fps`. (`--ui-rect` sub-rectangle is **v2**.)
 
 **Pass criteria:**
-- Video plays smoothly on the primary plane (YUV, no CPU copy).
-- Qt HUD blends over it on the overlay with correct alpha.
-- No tearing on either plane (single atomic commit → single vblank).
-- Frame rate matches the video source; UI animation stays fluid.
+- Video plays on the primary (NV12), Qt HUD blends over it on the overlay.
+- No tearing on either plane (single commit → single vblank).
+- **Video keeps playing when the UI is fully static** (no animation/input) —
+  the D12 wake-up path works.
+- **Fast decode with a static UI shows no tearing on the primary** — the D9b
+  `on_screen`-bit discipline prevents the producer from overwriting the
+  scanned-out buffer.
+- Frame rate tracks source; UI animation fluid.
+- If live decode + memcpy perf is unacceptable, fall back to **pre-decoded raw
+  NV12 frames** (like `test_kms_thread`'s frame cache) — accepted in D2.
 
-### Step 5 — DRM lease path (multi-process, optional but Wayland-honest)
+### Step 5 — Wayland-forward validation (design gate, no Weston yet)
 
-- [ ] Qt process (master) creates a lease for {primary plane, its FB props,
-      CRTC subset} via `drmModeCreateLease` and passes the lease fd to a child
-      GStreamer `kmssink` (`kmssink fd=<lease>` / `plane-id=<primary>`).
-- [ ] Qt keeps and commits only the overlay; GStreamer commits only the
-      primary on its leased fd.
-
-**Verify:** identical visual result to Step 4, but now two processes each own
-their plane — the true precursor to the Weston model, and proof that the QPA
-plane isolation is real.
-
-### Step 6 — Wayland-forward validation (design gate, no Weston yet)
-
-- [ ] Confirm `plane=wayland` handoff stub is a clean no-op: the app runs, the
-      QPA does not become DRM master, and `weston` could take the card.
-- [ ] Document the mapping for the future Wayland QPA:
-      `plane=overlay` (KMS) ⇄ `wl_surface` + `wl_subsurface` (Wayland);
-      `plane=primary` video ⇄ `linux-dmabuf-v1` scanout candidate. Weston's
-      DRM backend already promotes fullscreen dmabuf surfaces to hardware
-      planes — so the same NV12 dmabuf that Step 4 puts on the primary can be
-      handed to Weston and land on the same plane, unchanged.
+- [ ] Confirm `plane=wayland` handoff stub is a clean no-op: app runs, QPA's
+      direct-KMS transport is disabled, `weston` could take the card.
+- [ ] Document the future transport mapping (render layer unchanged):
+      `plane=overlay` (KMS) ⇄ `wl_surface`/`wl_subsurface`;
+      `plane=primary` video (attachPrimaryFb NV12) ⇄ `linux-dmabuf-v1` scanout
+      candidate. Weston's DRM backend already promotes fullscreen dmabuf
+      surfaces to hardware planes — the same NV12 buffer lands on the same
+      plane, unchanged. The etnaviv2d QPA is **adapted** to emit `wl_surface`
+      commits; `EtnaBlittable`/`libetna2d` remain the GPU-op layer (D11).
 
 ---
 
 ## Deliverables
 
 - `qpa/src/qetnaviv2dscreen.{h,cpp}` — atomic KMS, plane enumeration,
-  plane-target selection, overlay blend config.
-- `qpa/src/qetnaviv2dintegration.cpp` — `plane=`/`card=` argument parsing +
-  precedence resolution.
-- `compositor/test_planes/` — split-plane video+UI test (models 1 and 2).
+  plane-target selection, overlay ARGB8888/`SRC_OVER` config,
+  `attachPrimaryFb()` staging slot, 3-deep primary ring, shared flip-event
+  release.
+- `qpa/src/qetnaviv2dintegration.cpp` — `plane=`/`card=` parsing + precedence.
+- `compositor/test_planes/` — split-plane video+UI test (single-owner).
 - `compositor/plan.md` — this document.
-- Update `qpa/qt-test.md` with a `test_planes` section (layout, plane map,
-  run steps, pass criteria) mirroring the `test_kms_thread` entry.
+- `qpa/qt-test.md` — add a `test_planes` section (plane map, run rungs, pass
+  criteria) mirroring `test_kms_thread`.
 
-## Risks / open questions
+---
 
-- **R1 — premultiplied vs straight alpha on the overlay.** Driver disables
-  pre-multiplied alpha mode (ma35_plane.c:104). Resolve in Step 3; may force
-  an un-premultiply blit or a mode change. **Highest-risk item.**
-- **R2 — immutable zpos.** UI-on-overlay assumes overlay sits *above* primary
-  in the DT layer order. Verify `layer-id` ordering in the device tree; if
-  reversed, the split must be UI-on-primary / video-on-overlay, which breaks
-  UI alpha (primary doesn't blend). Confirm before Step 2.
-- **R3 — atomic vs legacy regression.** Existing tests assume legacy flip
-  timing. Keep the `m_flipMutex`/`m_shuttingDown` invariants; re-run the full
-  QPA suite after Step 1.
-- **R4 — dmabuf import format.** Confirm the driver's `AddFB2` accepts the
-  GStreamer decoder's NV12 stride/modifier layout without a copy.
+## Scope: v1 vs v2
+
+### v1 (this plan — acceptable milestone)
+
+- Atomic KMS conversion; legacy kept as build-time A/B oracle.
+- `plane=` argument: `primary`, `overlay`, `wayland` (handoff stub), `auto`.
+- **UI → full-screen overlay**, premultiplied `SRC_OVER`, over primary.
+- Single-owner model: Qt process owns both planes in **one atomic commit**.
+- Video via **software decode + CPU memcpy** into a **3-deep** NV12 primary
+  ring; `attachPrimaryFb()` latched staging.
+- `plane=overlay` standalone over background color.
+- `test_planes` covering the three rungs (primary regression / overlay-blend /
+  split-plane video).
+
+### v2 (deferred — implement last, in this order)
+
+1. **Zero-copy dmabuf video import** — GStreamer dmabuf `appsink` →
+   `drmModeAddFB2WithModifiers`, no CPU copy. **Gated on the VPU/KMS driver
+   being ready** (D2). Highest-value v2 item.
+2. **Sub-rectangle overlay** — `--ui-rect=WxH+X+Y` driving both overlay
+   position and Qt screen geometry; UI as a positioned panel, video
+   full-screen behind (D5).
+3. **Wayland transport + Weston multi-process** — adapt `QEtnaviv2dScreen`'s
+   transport layer to present via `wl_surface` + `linux-dmabuf-v1` instead of
+   direct KMS. `EtnaBlittable` and `libetna2d` are **unchanged** — GC520 GPU
+   ops are preserved. Qt and GStreamer become Wayland clients; Weston owns
+   plane assignment (Phase 3, D11). The `wayland` handoff stub is the seam.
+
+Explicit **non-goals** (not v1, not v2): DRM-lease multi-process (two raw-KMS
+processes on one card) — superseded by the Wayland compositor path (D4).
+
+---
+
+## Decisions log (from the /grilling session)
+
+| # | Decision | Rationale |
+|---|----------|-----------|
+| D1 | Single-owner model for the test program. | No IPC; one atomic commit = perfectly synced planes; de-risks the plane path. |
+| D2 | **(b)** Software decode + CPU memcpy into recycled BOs. Zero-copy dmabuf = v2. Pre-decoded raw frames acceptable if perf poor. | VPU/KMS driver not yet ready; can't dmabuf-import. |
+| D3 | **(a)** QPA owns the single atomic commit; video path attaches primary FB via a hook. | Keeps one committer; preserves `m_flipMutex` (Risk #5); single-vblank sync. |
+| D4 | **Cut** the DRM-lease multi-process path. Multi-process = Wayland only. | Two raw-KMS processes fighting over the card is exactly what a compositor solves. |
+| D5 | **(a)** Full-screen overlay for the UI. Sub-rect = v2. | QPA already owns a full screen-sized surface; smaller means teaching Qt reduced geometry. |
+| D6 | **(a)** `plane=overlay` runnable standalone over background color. | Makes the blend path testable in isolation between Steps 2 and 4. |
+| D7 | **(a)** Build-time `#ifdef` keeps legacy as a frozen A/B oracle; atomic is default/only plane path. Display driver owned in-house → atomic always available. | Regression comparison without maintaining two feature-complete paths. |
+| D8 | **(b)** Blend correctness confirmed from the MA35D1 display spec (premultiplied `SRC_OVER`, standard formula). No conversion. Hardware halo check kept as a wiring-regression guard. | Spec verified by the driver owner; matches Qt premultiplied output. |
+| D9 | **(a)** `attachPrimaryFb()` = latched, mutex-protected staging slot; last-write-wins; producer never blocks on vblank. | Reuses existing serialization; decouples GStreamer thread from display timing. |
+| D9b | Primary uses **3 buffers, each with one `on_screen` bit** (cleared on the flip event). The producer picks only a buffer that is neither `on_screen` nor `staged`. | A depth-only "ring" (or a 2-BO swap) has no ownership tracking: a producer running >1 frame ahead within a vblank overwrites the buffer the DC is scanning → tearing / torn NV12. One bit per buffer, cleared on the existing flip event, is minimal and race-free. |
+| D10 | **(a)** Shared single-event release; overlay **2-deep**, primary **3 buffers + on_screen bit** (D9b). | One commit → one flip event → the overlay flips and the committed primary buffer is freed together. Asymmetric because producers differ (inline Qt vs. decoupled video). |
+| D11 | Under Weston, the etnaviv2d QPA is **adapted, not replaced**: only `QEtnaviv2dScreen`'s transport switches from direct KMS to `wl_surface` + `linux-dmabuf-v1`. `EtnaBlittable`/`libetna2d` are unchanged. | The custom QPA is the sole holder of GC520 DE knowledge; the stock Wayland QPA has none. Retiring it would drop GPU acceleration under a compositor. Weston owns arbitration, not rendering. |
+| D12 | The video producer is a **first-class present trigger**: `attachPrimaryFb()` drives a coalesced GUI-thread present (`QWindow::requestUpdate()`) after staging. Coalesced to ≤1/vblank; skipped if a flip is already pending. | With a single committer, commits must be triggerable by *either* producer. Symmetric UI/video triggering means a static UI never stalls the video. Maps to a `wl_surface` frame callback under Weston. |
+
+### Risks — final status
+
+| Risk | Status |
+|------|--------|
+| R1 — premultiplied vs straight alpha on overlay | **Closed by spec** (D8). Premultiplied `SRC_OVER`, no conversion. Halo check as wiring guard. |
+| R2 — immutable zpos / layer order | **Closed** (DT confirmed: overlay zpos 1 > primary zpos 0). |
+| R3 — atomic vs legacy regression | **Mitigated** — legacy kept as build-time oracle (D7); re-run full QPA suite after Step 1. |
+| R4 — NV12 plane support | **Sufficient for v1** — `MA35_FORMAT_NV12` in plane format list. Zero-copy dmabuf import is v2. |
+| R5 — video stalls under a static UI | **Not a risk — by design** (D12). The video producer is a first-class present trigger via a coalesced GUI-thread present, symmetric with UI-driven commits. Pass criterion in Step 4. |
+| R6 — producer overwrites on-screen primary buffer | **Closed by design** (D9b) — 3 buffers + `on_screen` bit; producer never picks the scanned-out or staged buffer. Pass criterion: fast decode with a static UI shows no tearing on the primary. |
