@@ -291,20 +291,30 @@ No regressions. R3 closed.
       only plane-capable path. (Display driver is owned in-house; atomic is
       always available — no runtime fallback, D7.)
 
-### Step 2 — Plumb the `plane` argument
+### Step 2 — Plumb the `plane` argument — **DONE**
 
-- [ ] `QEtnaviv2dIntegration`: parse `plane=` / `card=`; resolve precedence
-      (arg > env > wayland-probe > primary) into
-      `PlaneMode { Primary, Overlay, Wayland }`.
-- [ ] Pass the mode into `QEtnaviv2dScreen`.
-- [ ] `initialize()`:
+- [x] `QEtnaviv2dIntegration`: parse `plane=` / `card=`; resolve precedence
+      (arg > `QT_ETNAVIV2D_PLANE` env > `$WAYLAND_DISPLAY` probe > primary)
+      into `PlaneMode { Primary, Overlay, Wayland }`.
+- [x] Pass the mode into `QEtnaviv2dScreen` (new constructor argument).
+- [x] `initialize()`:
       - `Wayland` → return early, no-op stub (log "handoff mode"); no master,
-        no modeset.
-      - `Primary` → primary plane, full-screen, opaque (Step 1).
-      - `Overlay` → overlay plane, full-screen ARGB8888,
-        `SRC_OVER`, `source-alpha-mode = None`.
+        no modeset. Nominal geometry set so Qt has a valid screen.
+      - `Primary` → primary plane, full-screen, opaque (Step 1 path).
+      - `Overlay` → overlay plane selected by `DRM_PLANE_TYPE_OVERLAY`
+        (blend props wired in Step 3).
 
-**Verify:** `plane=wayland` starts without touching KMS.
+**Bugs found and fixed during testing:**
+- (B) `plane=wayland`: backing store spammed "no scanout back surface" warnings.
+  Fixed: `isStub()` accessor on screen; flush silently skips when stub.
+- (A) `plane=primary` after `plane=overlay`: tearing / lost vsync.
+  Root cause: **driver bug** in `ma35_plane_atomic_disable` — the shared
+  callback only cleared `MA35_PRIMARY_ENABLE`, never `MA35_OVERLAY_ENABLE`,
+  so the overlay hardware layer stayed enabled with a stale DMA address after
+  the overlay session exited. Fixed in
+  `drivers/gpu/drm/nuvoton/ma35_plane.c`: branch on `drm_plane->type` to
+  clear `MA35_OVERLAY_CONFIG / MA35_OVERLAY_ENABLE` for the overlay case,
+  matching the `atomic_update` pattern.
 
 ### Step 3 — Overlay blend correctness (over solid background)
 

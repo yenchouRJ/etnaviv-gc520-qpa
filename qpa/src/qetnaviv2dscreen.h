@@ -34,6 +34,15 @@ QT_BEGIN_NAMESPACE
 
 static constexpr int KMS_NUM_BUFS = 2; /* double buffer */
 
+/* Which DRM plane this screen instance scans out on.
+ * Resolved once at integration init (arg > QT_ETNAVIV2D_PLANE env >
+ * WAYLAND_DISPLAY probe > Primary fallback) and passed to the screen. */
+enum class PlaneMode {
+    Primary,  /* PRIMARY plane, full-screen opaque (default)          */
+    Overlay,  /* OVERLAY plane, ARGB8888, SRC_OVER blend              */
+    Wayland,  /* handoff stub — no DRM master, no modeset             */
+};
+
 /* Minimal scanout framebuffer descriptor (mirrors kms_display's kms_fb). */
 struct EtnaKmsFb {
     uint32_t fb_id  = 0;
@@ -73,6 +82,7 @@ public:
      * etnaDev     shared etna2d device  (owned by integration)
      */
     QEtnaviv2dScreen(const QString &cardPath,
+                     PlaneMode      planeMode,
                      etna2d_context *etnaCtx,
                      etna2d_device  *etnaDev);
     ~QEtnaviv2dScreen() override;
@@ -102,6 +112,11 @@ public:
     /* Raw DRM fd (for drmHandleEvent poll if needed outside the screen). */
     int drmFd() const { return m_kfd; }
 
+    /* True when running in wayland handoff stub mode (no KMS, no scanout
+     * surfaces).  The backing store uses this to suppress the flush path
+     * silently instead of spamming "no scanout back surface" warnings. */
+    bool isStub() const { return m_planeMode == PlaneMode::Wayland; }
+
 private:
     void cleanup();
 
@@ -111,6 +126,7 @@ private:
                            const char *name);
 
     QString         m_cardPath;
+    PlaneMode       m_planeMode  = PlaneMode::Primary;
     etna2d_context *m_etnaCtx;
     etna2d_device  *m_etnadev;
 

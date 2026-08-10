@@ -89,8 +89,27 @@ bool QEtnaviv2dIntegration::initializeHardware()
                              QStringLiteral("512")).toInt();
     if (ctxOps < 64) ctxOps = 512;
 
+    /* Resolve plane mode: arg > QT_ETNAVIV2D_PLANE env > WAYLAND_DISPLAY
+     * probe > primary fallback. */
+    QString planeStr = parseParam(m_params, QStringLiteral("plane"), QString());
+    if (planeStr.isEmpty())
+        planeStr = qEnvironmentVariable("QT_ETNAVIV2D_PLANE");
+    if (planeStr.isEmpty() && !qEnvironmentVariable("WAYLAND_DISPLAY").isEmpty())
+        planeStr = QStringLiteral("wayland");
+    if (planeStr.isEmpty() || planeStr == QLatin1String("auto"))
+        planeStr = QStringLiteral("primary");
+
+    PlaneMode planeMode = PlaneMode::Primary;
+    if (planeStr == QLatin1String("overlay"))
+        planeMode = PlaneMode::Overlay;
+    else if (planeStr == QLatin1String("wayland"))
+        planeMode = PlaneMode::Wayland;
+    else if (planeStr != QLatin1String("primary"))
+        INTG_WARN << "unknown plane=" << planeStr << "— using primary";
+
     INTG_INFO << "initializing: card=" << cardPath
-              << "render=" << renderPath << "ctx_ops=" << ctxOps;
+              << "render=" << renderPath << "ctx_ops=" << ctxOps
+              << "plane=" << planeStr;
 
     /* 1. Open GPU render node. */
     if (etna2d_device_open(renderPath.toLocal8Bit().constData(),
@@ -110,7 +129,7 @@ bool QEtnaviv2dIntegration::initializeHardware()
     EtnaBlittablePlatformPixmap::setGlobalContext(m_etnaCtx, m_etnadev);
 
     /* 3. Create screen (opens card0, allocates scanout BOs, modeset). */
-    m_screen = new QEtnaviv2dScreen(cardPath, m_etnaCtx, m_etnadev);
+    m_screen = new QEtnaviv2dScreen(cardPath, planeMode, m_etnaCtx, m_etnadev);
     if (!m_screen->initialize()) {
         INTG_WARN << "QEtnaviv2dScreen::initialize() failed";
         delete m_screen;

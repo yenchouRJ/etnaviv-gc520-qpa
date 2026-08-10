@@ -1,25 +1,25 @@
 /*
  * qetnaviv2dscreen.cpp — KMS display screen implementation.
  *
- * Uses the Phase-3 kms_display helper directly (tested and hardware-verified)
- * rather than Qt's eglfs-oriented QKmsDevice.  KMS operations are serialised
- * by m_flipMutex so pageFlip() is safe to call from a render thread
- * (QT_THREADED_PAINTING=1) as well as the GUI thread.
+ * KMS operations are serialised by m_flipMutex so pageFlip() is safe to call
+ * from a render thread (QT_THREADED_PAINTING=1) as well as the GUI thread.
  *
- * Initialization sequence:
- *  1. Open /dev/dri/card0, pick connector + CRTC, query preferred mode.
- *  2. Allocate two dumb BOs via DRM_IOCTL_MODE_CREATE_DUMB.
- *  3. drmModeAddFB2 each BO as a KMS framebuffer.
- *  4. PRIME-export each BO → dma-buf fd.
- *  5. etna2d_surface_from_dmabuf(): import into etnaviv (GPU MMU maps it).
- *  6. Initial drmModeSetCrtc (modeset + first frame blank).
- *  7. Fill QFbScreen geometry fields so Qt knows the screen size.
+ * Initialization sequence (atomic path, default):
+ *  1. Open card node, set DRM_CLIENT_CAP_ATOMIC + UNIVERSAL_PLANES.
+ *  2. Enumerate connector → CRTC → plane (by type: primary or overlay).
+ *  3. Resolve all atomic property IDs by name per object.
+ *  4. Allocate two dumb BOs → drmModeAddFB2 → PRIME-export → etna2d import.
+ *  5. Initial atomic modeset (ALLOW_MODESET, synchronous).
+ *  6. Fill QFbScreen geometry fields.
  *
- * Page-flip sequence (called by backing store flush):
- *  1. etna2d_finish() was already called by the backing store.
- *  2. drmModePageFlip(back fb_id) — non-blocking, event-based.
- *  3. drmHandleEvent() poll loop until flip_pending clears.
+ * Page-flip sequence:
+ *  1. etna2d_finish() already called by the backing store.
+ *  2. drmModeAtomicCommit(FB_ID only, NONBLOCK | PAGE_FLIP_EVENT).
+ *  3. select() + drmHandleEvent() drain loop until flip_pending clears.
  *  4. Swap front/back indices.
+ *
+ * Cleanup: destroy the mode blob; free BOs and close the fd.  No teardown
+ * commit is issued — the kernel releases all KMS state on fd close.
  */
 #include "qetnaviv2dscreen.h"
 
@@ -92,10 +92,12 @@ uint32_t QEtnaviv2dScreen::propId(int fd, uint32_t objId, uint32_t objType,
  * QEtnaviv2dScreen — construction / destruction
  * ----------------------------------------------------------------------- */
 QEtnaviv2dScreen::QEtnaviv2dScreen(const QString &cardPath,
+                                   PlaneMode      planeMode,
                                    etna2d_context *etnaCtx,
                                    etna2d_device  *etnaDev)
     : QFbScreen()
     , m_cardPath(cardPath)
+    , m_planeMode(planeMode)
     , m_etnaCtx(etnaCtx)
     , m_etnadev(etnaDev)
 {
@@ -115,6 +117,19 @@ QEtnaviv2dScreen::~QEtnaviv2dScreen()
  * ----------------------------------------------------------------------- */
 bool QEtnaviv2dScreen::initialize()
 {
+    /* --- Wayland handoff stub: no DRM master, no modeset.
+     *     The QPA's direct-KMS transport is disabled; a future Weston
+     *     client path switches only this transport, leaving libetna2d/
+     *     EtnaBlittable untouched (D11). --- */
+    if (m_planeMode == PlaneMode::Wayland) {
+        SCR_INFO << "plane=wayland: handoff stub — no KMS ops";
+        mGeometry     = QRect(0, 0, 1920, 1080); /* nominal until Weston provides geometry */
+        mDepth        = 32;
+        mFormat       = QImage::Format_ARGB32_Premultiplied;
+        mPhysicalSize = QSizeF(527, 296);         /* nominal 96 dpi for 1920x1080 */
+        return true;
+    }
+
     /* --- 1. Open card0 --- */
     m_kfd = open(m_cardPath.toLocal8Bit().constData(), O_RDWR | O_CLOEXEC);
     if (m_kfd < 0) {
@@ -162,6 +177,10 @@ bool QEtnaviv2dScreen::initialize()
         }
     }
 
+    /* Read physical size while we still hold the connector. */
+    int mmW = conn->mmWidth;
+    int mmH = conn->mmHeight;
+
     /* Find a CRTC for this connector. */
     for (int i = 0; i < conn->count_encoders && m_crtcId == 0; ++i) {
         drmModeEncoder *enc = drmModeGetEncoder(m_kfd, conn->encoders[i]);
@@ -182,8 +201,9 @@ bool QEtnaviv2dScreen::initialize()
         cleanup();
         return false;
     }
+#ifdef ETNAVIV2D_LEGACY_KMS
     m_savedCrtc = drmModeGetCrtc(m_kfd, m_crtcId);
-
+#endif
     SCR_INFO << "KMS: conn=" << m_connId << "crtc=" << m_crtcId
              << "mode=" << m_modeInfo.name
              << m_modeInfo.hdisplay << "x" << m_modeInfo.vdisplay
@@ -196,12 +216,15 @@ bool QEtnaviv2dScreen::initialize()
     int h = m_modeInfo.vdisplay;
 
 #ifndef ETNAVIV2D_LEGACY_KMS
-    /* --- 2b. Atomic: pick a PRIMARY plane for our CRTC, resolve props --- */
+    /* --- 2b. Atomic: pick the plane for our CRTC based on m_planeMode --- */
     if (m_crtcIndex < 0) {
         SCR_WARN << "no CRTC index captured";
         cleanup();
         return false;
     }
+    const uint32_t targetType = (m_planeMode == PlaneMode::Overlay)
+                                ? DRM_PLANE_TYPE_OVERLAY
+                                : DRM_PLANE_TYPE_PRIMARY;
     {
         drmModePlaneRes *pres = drmModeGetPlaneResources(m_kfd);
         if (!pres) {
@@ -222,7 +245,7 @@ bool QEtnaviv2dScreen::initialize()
                     if (pp) {
                         for (uint32_t k = 0; k < pp->count_props; ++k) {
                             if (pp->props[k] == tid &&
-                                pp->prop_values[k] == DRM_PLANE_TYPE_PRIMARY) {
+                                pp->prop_values[k] == targetType) {
                                 m_planeId = pl->plane_id;
                                 break;
                             }
@@ -236,7 +259,8 @@ bool QEtnaviv2dScreen::initialize()
         drmModeFreePlaneResources(pres);
     }
     if (m_planeId == 0) {
-        SCR_WARN << "no PRIMARY plane for CRTC index" << m_crtcIndex;
+        SCR_WARN << "no" << (targetType == DRM_PLANE_TYPE_OVERLAY ? "OVERLAY" : "PRIMARY")
+                 << "plane for CRTC index" << m_crtcIndex;
         cleanup();
         return false;
     }
@@ -281,7 +305,8 @@ bool QEtnaviv2dScreen::initialize()
     }
 
     SCR_INFO << "Atomic: plane=" << m_planeId
-             << "(primary) props resolved; mode blob=" << m_modeBlobId;
+             << (m_planeMode == PlaneMode::Overlay ? "(overlay)" : "(primary)")
+             << "props resolved; mode blob=" << m_modeBlobId;
 #endif // !ETNAVIV2D_LEGACY_KMS
 
     /* --- 3. Allocate dumb BOs and DRM FBs --- */
@@ -384,28 +409,8 @@ bool QEtnaviv2dScreen::initialize()
     mDepth       = 32;
     mFormat      = QImage::Format_ARGB32_Premultiplied;
 
-    /* Physical size: derive from DRM connector mm values if available,
-     * else assume 96 dpi. */
-    int mmW = 0, mmH = 0;
-    {
-        /* Re-open connector briefly to read mm size. */
-        drmModeRes *r2 = drmModeGetResources(m_kfd);
-        if (r2) {
-            for (int i = 0; i < r2->count_connectors; ++i) {
-                drmModeConnector *c2 = drmModeGetConnector(m_kfd, r2->connectors[i]);
-                if (c2 && c2->connector_id == m_connId) {
-                    mmW = c2->mmWidth;
-                    mmH = c2->mmHeight;
-                    drmModeFreeConnector(c2);
-                    break;
-                }
-                if (c2) drmModeFreeConnector(c2);
-            }
-            drmModeFreeResources(r2);
-        }
-    }
+    /* Physical size — read from connector above; fall back to 96 dpi. */
     if (mmW <= 0 || mmH <= 0) {
-        /* fallback: 96 dpi */
         mmW = w * 25.4 / 96.0;
         mmH = h * 25.4 / 96.0;
     }
@@ -490,7 +495,7 @@ int QEtnaviv2dScreen::pageFlip()
     /* Swap front/back — but only if we are not shutting down.
      * If cleanup() set m_shuttingDown while we were waiting for vblank the
      * flip has already been presented; skip the swap so cleanup() finds
-     * m_frontIdx/m_backIdx in a consistent state for drmModeSetCrtc. */
+     * m_frontIdx/m_backIdx in a consistent state. */
     if (!m_shuttingDown)
         std::swap(m_frontIdx, m_backIdx);
     SCR_DBG << "pageFlip done — front=" << m_frontIdx
@@ -521,29 +526,17 @@ void QEtnaviv2dScreen::cleanup()
         m_savedCrtc = nullptr;
     }
 #else
-    /* Atomic teardown: disable the plane + CRTC.  Once DRM_CLIENT_CAP_ATOMIC
-     * is set, a legacy drmModeSetCrtc on this CRTC returns EINVAL, so we must
-     * disable via an atomic ALLOW_MODESET commit.  Runs after the flip drain
-     * above, so no commit is in flight. */
-    if (m_kfd >= 0 && m_planeId && m_crtcProps.active) {
-        drmModeAtomicReq *req = drmModeAtomicAlloc();
-        if (req) {
-            drmModeAtomicAddProperty(req, m_planeId, m_planeProps.fb_id,   0);
-            drmModeAtomicAddProperty(req, m_planeId, m_planeProps.crtc_id, 0);
-            drmModeAtomicAddProperty(req, m_connId,  m_connProps.crtc_id,  0);
-            drmModeAtomicAddProperty(req, m_crtcId,  m_crtcProps.active,   0);
-            drmModeAtomicAddProperty(req, m_crtcId,  m_crtcProps.mode_id,  0);
-            if (drmModeAtomicCommit(m_kfd, req,
-                                    DRM_MODE_ATOMIC_ALLOW_MODESET, nullptr))
-                SCR_WARN << "atomic disable commit:" << strerror(errno);
-            drmModeAtomicFree(req);
-        }
-    }
+    /* Atomic path: no teardown commit needed.  The kernel releases all KMS
+     * state (plane FBs, CRTC, connector binding) when the DRM fd is closed.
+     * Issuing an explicit disable commit here caused EINVAL because
+     * detaching the connector while ACTIVE=1 is an invalid atomic transition,
+     * and setting ACTIVE=0 triggers atomic_disable → drm_crtc_vblank_off
+     * which would break the next session's vsync.  Just let the fd close. */
     if (m_modeBlobId && m_kfd >= 0) {
         drmModeDestroyPropertyBlob(m_kfd, m_modeBlobId);
         m_modeBlobId = 0;
     }
-    if (m_savedCrtc) {              /* saved but unused in atomic mode */
+    if (m_savedCrtc) {
         drmModeFreeCrtc(m_savedCrtc);
         m_savedCrtc = nullptr;
     }

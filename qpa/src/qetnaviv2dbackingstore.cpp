@@ -101,7 +101,11 @@ void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
     etna2d_surface *scanoutBack = m_screen->backSurface();
 
     if (!scanoutBack) {
-        BS_WARN << "flush: no scanout back surface";
+        /* In wayland stub mode there is no KMS scanout surface — this is
+         * expected and silent.  Any other mode with a missing back surface
+         * is a real error. */
+        if (!m_screen->isStub())
+            BS_WARN << "flush: no scanout back surface";
         return;
     }
 
