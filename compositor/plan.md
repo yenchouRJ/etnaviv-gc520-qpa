@@ -6,9 +6,7 @@ QPA, using one atomic KMS commit. Design the plane layer so a Wayland
 compositor (Weston) can later own multi-process plane assignment with **no
 change** to `libetna2d` or the QPA blitter.
 
-> **Status:** Design locked via `/grilling` session. See "Decisions log" at
-> the end for the reasoning behind each choice. Implementation has **not**
-> started — this document is the artifact of shared understanding.
+> **Status:** Steps 0–3 complete and hardware-verified. Step 4 is next.
 
 ---
 
@@ -36,12 +34,17 @@ change** to `libetna2d` or the QPA blitter.
               └──────── /dev/dri/card0
 ```
 
-**There is deliberately no in-between.** Two raw-KMS processes never co-own
-`card0`. Single process → the QPA owns everything in one atomic commit.
-Multi-process → a Wayland compositor owns plane *arbitration*; the etnaviv2d
-QPA is **adapted** (not replaced) to present via `wl_surface` instead of direct
-KMS, keeping all GC520 GPU knowledge (D11). The DRM-lease multi-process path is
-a **non-goal** (cut during design; see Decisions log D4).
+**There is deliberately no in-between.** Two raw-KMS processes cannot both hold
+DRM master on `card0` — the kernel grants master to the first opener; a second
+`open()` shares the master object but has `is_master=0` and its commits are
+rejected with `EACCES`.  The correct path for multi-process plane arbitration is
+**DRM leasing** (kernel 6.6 supports `DRM_IOCTL_MODE_CREATE_LEASE`): the master
+carves out a set of objects (plane + CRTC) and hands a leased fd to the client,
+which then has exclusive rights.  That is what a Wayland compositor does.  For a
+single-process program, sharing the one master fd directly is both simpler and
+correct — no leasing needed.  The DRM-lease multi-process path is therefore a
+**non-goal** (D4): either one process owns everything, or a Wayland compositor
+owns arbitration.
 
 **The GPU-op layer is invariant across all phases.** `libetna2d` and
 `EtnaBlittable` only ever render into an `etna2d_surface` — they never learn
@@ -316,22 +319,77 @@ No regressions. R3 closed.
   clear `MA35_OVERLAY_CONFIG / MA35_OVERLAY_ENABLE` for the overlay case,
   matching the `atomic_update` pattern.
 
-### Step 3 — Overlay blend correctness (over solid background)
+### Step 3 — Overlay blend correctness — **DONE**
 
-`plane=overlay` is standalone-runnable: with no primary FB attached, the
-primary shows the driver background color (`MA35_FRAMEBUFFER_BGCOLOR`,
-ma35_plane.c:395); the full-screen overlay blends over it (D6). This is the
-test rung between Step 2 and Step 4.
+**What changed from the original goal:** Step 3 was originally scoped as a
+standalone `plane=overlay` test over the driver background colour (D6).  During
+implementation it became a **single-process, two-plane test** — one
+`QApplication` driving both the primary background (Qt widget, ~60 fps) and the
+overlay (direct `QEtnaviv2dScreen` instance, ~60 fps) — and surfaced a
+fundamental DRM ownership constraint that reshaped how multi-plane use works in
+this codebase.
 
-- [ ] Overlay FB = `DRM_FORMAT_ARGB8888` (fix the `XRGB8888` hardcode,
-      qetnaviv2dscreen.cpp:183).
-- [ ] `source-alpha-mode = None`, `porter-duff-blend-mode = SRC_OVER`.
-- [ ] No premultiply conversion (R1 spec-confirmed premultiplied).
+**Why two processes don't work (and why we didn't use DRM leasing):**
 
-**Acceptance (belt-and-suspenders, R1 already closed by spec):** a
-semi-transparent Qt widget over a solid primary shows correct edge blending,
-no dark/bright halo. This catches a *wiring* regression (FB left at XRGB8888,
-`source-alpha-mode` drift), not a math error.
+The Linux kernel's DRM object model (`drm_mode_object_find`, 6.6) requires that
+every atomic commit referencing a CRTC, connector, or plane be made from a fd
+that is either the **DRM master** or holds a **DRM lease** for those objects.
+A second `open()` of `card0` — even from the same process — gets
+`file_priv->is_master = 0` (it shares the master object but is not master
+itself).  Any commit from that fd that references a CRTC or plane returns
+`EACCES`.
+
+DRM leasing (`DRM_IOCTL_MODE_CREATE_LEASE`, fully supported in 6.6) is the
+correct multi-process answer: the master carves out a subset of objects and
+passes a leased fd to the client process, which then has exclusive rights over
+those objects.  That is what a Wayland compositor does (Phase 3, D4).  For a
+single-process program it is unnecessary overhead — sharing the one master fd
+directly is both simpler and correct.
+
+**The fix — `sharedKfd` constructor parameter:**
+
+`QEtnaviv2dScreen` now accepts an optional `sharedKfd` fd.  When provided it
+skips `open()` and does not close the fd on destruction (caller owns lifetime).
+Both screen instances commit through the same `struct drm_file` in the kernel —
+the one that has `is_master = 1` — so both are permitted without leasing.
+
+**Plane updates and vsync:** each `pageFlip()` issues its own
+`drmModeAtomicCommit(..., NONBLOCK | PAGE_FLIP_EVENT)`.  Since both planes share
+CRTC 52 they share the same vblank interrupt; if both commits land before the
+deadline they apply atomically in the same vblank.  The test drives them with
+independent timers (not coordinated) — Step 4 replaces this with a **single
+commit containing both plane FB_IDs** so they are always vblank-locked.
+
+**QPA changes (all in `qetnaviv2dscreen.{h,cpp}`):**
+
+- `sharedKfd = -1` constructor param + `m_ownsKfd` flag: shared fd is not
+  opened or closed by the borrowing instance.
+- `etnaCtx()` / `etnadev()` read accessors: needed to pass the GPU context to
+  the sibling overlay screen.
+- FB format: `DRM_FORMAT_ARGB8888` for overlay FBs (was hardcoded `XRGB8888` —
+  without this the alpha byte is ignored by the hardware).
+- Overlay modeset skips CRTC/connector props and uses `flags=0` (plane-only
+  commit); the CRTC is already active from the primary commit and only a
+  topology-changing commit requires master privilege.
+- `porter-duff-blend-mode = 3` (SRC_OVER) and `source-alpha-mode = 0`
+  (per-pixel) added to the overlay modeset req (these were resolved but never
+  set — the plane was compositing as opaque).
+
+**Test: `compositor/tests/test_alpha_blend/`**
+
+Single binary, single process.  QPA (`plane=primary`) drives a background image
+widget at ~60 fps.  `OverlayDriver` directly instantiates a second
+`QEtnaviv2dScreen` (overlay, shared fd), paints into the BO via `QPainter` +
+`memcpy`, and calls `pageFlip()` at ~60 fps.
+
+| Patch | Content | Pass criterion |
+|-------|---------|----------------|
+| T1 | α=0 transparent | Primary image shows through; no overlay tint |
+| T2 | α=128 premultiplied red | 50% red blended over primary |
+| T3 | α=255 opaque white | Primary completely blocked |
+| HUD | α=160 animated cyan box, live fps counter | Smooth animation; correct semi-transparent blend |
+
+All criteria passed on hardware at 59–60 fps.
 
 ### Step 4 — In-process video path + split-plane test program
 
@@ -464,7 +522,7 @@ processes on one card) — superseded by the Wayland compositor path (D4).
 | D1 | Single-owner model for the test program. | No IPC; one atomic commit = perfectly synced planes; de-risks the plane path. |
 | D2 | **(b)** Software decode + CPU memcpy into recycled BOs. Zero-copy dmabuf = v2. Pre-decoded raw frames acceptable if perf poor. | VPU/KMS driver not yet ready; can't dmabuf-import. |
 | D3 | **(a)** QPA owns the single atomic commit; video path attaches primary FB via a hook. | Keeps one committer; preserves `m_flipMutex` (Risk #5); single-vblank sync. |
-| D4 | **Cut** the DRM-lease multi-process path. Multi-process = Wayland only. | Two raw-KMS processes fighting over the card is exactly what a compositor solves. |
+| D4 | **Cut** the DRM-lease multi-process path. Multi-process = Wayland only. | DRM leasing (`DRM_IOCTL_MODE_CREATE_LEASE`, supported in 6.6) is the correct kernel mechanism for per-process plane ownership — the master carves out objects and passes a leased fd whose commits pass the `_drm_lease_held()` check. But leasing is what a Wayland compositor *is*: it holds master, leases (or directly commits) planes per client. Building our own lease protocol duplicates that work and couples us to raw KMS forever. Two raw-KMS processes fighting over the card is exactly what a compositor solves. |
 | D5 | **(a)** Full-screen overlay for the UI. Sub-rect = v2. | QPA already owns a full screen-sized surface; smaller means teaching Qt reduced geometry. |
 | D6 | **(a)** `plane=overlay` runnable standalone over background color. | Makes the blend path testable in isolation between Steps 2 and 4. |
 | D7 | **(a)** Build-time `#ifdef` keeps legacy as a frozen A/B oracle; atomic is default/only plane path. Display driver owned in-house → atomic always available. | Regression comparison without maintaining two feature-complete paths. |

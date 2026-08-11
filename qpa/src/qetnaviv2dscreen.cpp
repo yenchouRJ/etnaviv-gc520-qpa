@@ -9,7 +9,11 @@
  *  2. Enumerate connector → CRTC → plane (by type: primary or overlay).
  *  3. Resolve all atomic property IDs by name per object.
  *  4. Allocate two dumb BOs → drmModeAddFB2 → PRIME-export → etna2d import.
- *  5. Initial atomic modeset (ALLOW_MODESET, synchronous).
+ *  5. Initial atomic modeset:
+ *       - Primary plane: ALLOW_MODESET commit (sets CRTC ACTIVE, MODE_ID,
+ *         connector CRTC_ID, plane FB_ID + geometry).  Requires DRM master.
+ *       - Overlay plane: plane-only commit (FB_ID + geometry, flags=0).
+ *         The CRTC is already active; no master needed.
  *  6. Fill QFbScreen geometry fields.
  *
  * Page-flip sequence:
@@ -94,13 +98,17 @@ uint32_t QEtnaviv2dScreen::propId(int fd, uint32_t objId, uint32_t objType,
 QEtnaviv2dScreen::QEtnaviv2dScreen(const QString &cardPath,
                                    PlaneMode      planeMode,
                                    etna2d_context *etnaCtx,
-                                   etna2d_device  *etnaDev)
+                                   etna2d_device  *etnaDev,
+                                   int             sharedKfd)
     : QFbScreen()
     , m_cardPath(cardPath)
     , m_planeMode(planeMode)
     , m_etnaCtx(etnaCtx)
     , m_etnadev(etnaDev)
+    , m_ownsKfd(sharedKfd < 0)
 {
+    if (sharedKfd >= 0)
+        m_kfd = sharedKfd;
     for (auto &fb : m_fb) fb = EtnaKmsFb{};
     memset(&m_modeInfo, 0, sizeof(m_modeInfo));
     m_dmabuf[0] = m_dmabuf[1] = -1;
@@ -130,11 +138,13 @@ bool QEtnaviv2dScreen::initialize()
         return true;
     }
 
-    /* --- 1. Open card0 --- */
-    m_kfd = open(m_cardPath.toLocal8Bit().constData(), O_RDWR | O_CLOEXEC);
-    if (m_kfd < 0) {
-        SCR_WARN << "open(" << m_cardPath << "):" << strerror(errno);
-        return false;
+    /* --- 1. Open card0 (skip if a shared fd was provided at construction) --- */
+    if (m_ownsKfd) {
+        m_kfd = open(m_cardPath.toLocal8Bit().constData(), O_RDWR | O_CLOEXEC);
+        if (m_kfd < 0) {
+            SCR_WARN << "open(" << m_cardPath << "):" << strerror(errno);
+            return false;
+        }
     }
     drmSetClientCap(m_kfd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
 #ifndef ETNAVIV2D_LEGACY_KMS
@@ -329,7 +339,10 @@ bool QEtnaviv2dScreen::initialize()
         uint32_t handles[4] = {creq.handle};
         uint32_t pitches[4] = {creq.pitch};
         uint32_t offsets[4] = {};
-        if (drmModeAddFB2(m_kfd, w, h, DRM_FORMAT_XRGB8888,
+        uint32_t fmt = (m_planeMode == PlaneMode::Overlay)
+                       ? DRM_FORMAT_ARGB8888
+                       : DRM_FORMAT_XRGB8888;
+        if (drmModeAddFB2(m_kfd, w, h, fmt,
                           handles, pitches, offsets, &m_fb[i].fb_id, 0)) {
             SCR_WARN << "drmModeAddFB2[" << i << "]:" << strerror(errno);
             cleanup();
@@ -379,9 +392,28 @@ bool QEtnaviv2dScreen::initialize()
             cleanup();
             return false;
         }
-        drmModeAtomicAddProperty(req, m_crtcId, m_crtcProps.mode_id, m_modeBlobId);
-        drmModeAtomicAddProperty(req, m_crtcId, m_crtcProps.active,  1);
-        drmModeAtomicAddProperty(req, m_connId, m_connProps.crtc_id, m_crtcId);
+        /* ALLOW_MODESET is needed only when we are the one bringing the CRTC
+         * up: setting ACTIVE, MODE_ID, and connector CRTC_ID.  This is
+         * required when the CRTC is not yet active (first opener, or after a
+         * full teardown).  When sharing an fd with an already-active CRTC
+         * (e.g. overlay added after primary) we skip these properties and
+         * commit with flags=0 — a plane-only commit that does not require
+         * master privilege beyond holding the shared fd. */
+        uint32_t flags = 0;
+        bool crtcAlreadyActive = false;
+        {
+            drmModeCrtc *crtc = drmModeGetCrtc(m_kfd, m_crtcId);
+            if (crtc) {
+                crtcAlreadyActive = crtc->mode_valid;
+                drmModeFreeCrtc(crtc);
+            }
+        }
+        if (!crtcAlreadyActive) {
+            drmModeAtomicAddProperty(req, m_crtcId, m_crtcProps.mode_id, m_modeBlobId);
+            drmModeAtomicAddProperty(req, m_crtcId, m_crtcProps.active,  1);
+            drmModeAtomicAddProperty(req, m_connId, m_connProps.crtc_id, m_crtcId);
+            flags = DRM_MODE_ATOMIC_ALLOW_MODESET;
+        }
         drmModeAtomicAddProperty(req, m_planeId, m_planeProps.fb_id,   m_fb[m_frontIdx].fb_id);
         drmModeAtomicAddProperty(req, m_planeId, m_planeProps.crtc_id, m_crtcId);
         drmModeAtomicAddProperty(req, m_planeId, m_planeProps.src_x,  0);
@@ -392,8 +424,17 @@ bool QEtnaviv2dScreen::initialize()
         drmModeAtomicAddProperty(req, m_planeId, m_planeProps.crtc_y, 0);
         drmModeAtomicAddProperty(req, m_planeId, m_planeProps.crtc_w, w);
         drmModeAtomicAddProperty(req, m_planeId, m_planeProps.crtc_h, h);
-        int rc = drmModeAtomicCommit(m_kfd, req,
-                                     DRM_MODE_ATOMIC_ALLOW_MODESET, nullptr);
+        /* Overlay blend props: set once at modeset, persist for all flips.
+         * porter-duff-blend-mode=3 (SRC_OVER), source-alpha-mode=0 (None = per-pixel). */
+        if (m_planeMode == PlaneMode::Overlay) {
+            if (m_planeProps.blend_mode)
+                drmModeAtomicAddProperty(req, m_planeId,
+                                         m_planeProps.blend_mode, 3);
+            if (m_planeProps.source_alpha_mode)
+                drmModeAtomicAddProperty(req, m_planeId,
+                                         m_planeProps.source_alpha_mode, 0);
+        }
+        int rc = drmModeAtomicCommit(m_kfd, req, flags, nullptr);
         drmModeAtomicFree(req);
         if (rc) {
             SCR_WARN << "atomic modeset commit:" << strerror(errno);
@@ -562,7 +603,7 @@ void QEtnaviv2dScreen::cleanup()
         }
     }
 
-    if (m_kfd >= 0) {
+    if (m_kfd >= 0 && m_ownsKfd) {
         close(m_kfd);
         m_kfd = -1;
     }

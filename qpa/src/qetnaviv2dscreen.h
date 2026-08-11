@@ -81,10 +81,14 @@ public:
      * etnaCtx     shared etna2d context (owned by integration)
      * etnaDev     shared etna2d device  (owned by integration)
      */
+    /* sharedKfd: if >= 0 the screen uses this pre-opened DRM master fd and
+     * does NOT close it on destruction (caller owns the fd lifetime).
+     * Pass -1 (default) to let the screen open card0 itself. */
     QEtnaviv2dScreen(const QString &cardPath,
                      PlaneMode      planeMode,
                      etna2d_context *etnaCtx,
-                     etna2d_device  *etnaDev);
+                     etna2d_device  *etnaDev,
+                     int             sharedKfd = -1);
     ~QEtnaviv2dScreen() override;
 
     /* QPlatformScreen */
@@ -112,6 +116,10 @@ public:
     /* Raw DRM fd (for drmHandleEvent poll if needed outside the screen). */
     int drmFd() const { return m_kfd; }
 
+    /* etna2d handles (for constructing a sibling screen with shared context). */
+    etna2d_context *etnaCtx()  const { return m_etnaCtx;  }
+    etna2d_device  *etnadev()  const { return m_etnadev;  }
+
     /* True when running in wayland handoff stub mode (no KMS, no scanout
      * surfaces).  The backing store uses this to suppress the flush path
      * silently instead of spamming "no scanout back surface" warnings. */
@@ -129,6 +137,7 @@ private:
     PlaneMode       m_planeMode  = PlaneMode::Primary;
     etna2d_context *m_etnaCtx;
     etna2d_device  *m_etnadev;
+    bool            m_ownsKfd    = true;  /* false when sharedKfd was provided */
 
     /* KMS state (replicated from kms_display internals for Qt integration). */
     int             m_kfd         = -1;
