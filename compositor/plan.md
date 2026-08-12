@@ -117,6 +117,16 @@ zpos order supports this natively.
   commit; under Weston the same NV12 buffer becomes a `linux-dmabuf-v1`
   surface that Weston promotes to a hardware plane. Same buffer, different
   arbiter.
+- **Direct-KMS and Wayland are mutually exclusive — the QPA never does both.**
+  Steps 1–4 (`primary` / `overlay` / `composite`) issue `drmModeAtomicCommit`
+  because Qt is sole DRM master. Under Wayland the QPA is **not** master and
+  issues **zero** KMS commits: `composite`'s dual-plane single-commit logic is
+  *not reused* — Weston owns all three planes and does its own plane assignment
+  and the sole `drmModeAtomicCommit`. Our QPA is invoked only for **GC520 GPU
+  ops** (`EtnaBlittable` → `etna2d_surface`), then presents the resulting
+  dmabuf via `wl_surface` + `linux-dmabuf-v1`. The `composite` committer and
+  the Wayland client path are two disjoint transports selected once at init;
+  they never run together.
 
 ---
 
@@ -131,6 +141,7 @@ zpos order supports this natively.
 | *(absent)* | **Default.** Auto: `$WAYLAND_DISPLAY` set → `wayland` handoff; else `primary`. |
 | `primary`  | Qt owns primary, full-screen, opaque. Legacy-compatible (also the atomic A/B oracle). |
 | `overlay`  | Qt renders full-screen ARGB8888 on the overlay with premultiplied `SRC_OVER`; leaves primary free for the in-process video path. Runnable standalone (see D6). |
+| `composite`| **Single-committer dual-plane (Step 4, D13/D14).** One screen drives UI on the overlay (ARGB8888, `SRC_OVER`) *and* video on the primary (NV12 via `attachPrimaryFb`), folding both plane FB_IDs into one atomic commit. Qt is sole DRM master. |
 | `auto`     | Explicit form of *(absent)*. |
 | `wayland`  | Handoff stub: no DRM master, no modeset. Reserved for the future Wayland QPA. |
 
@@ -152,9 +163,10 @@ presence > `primary` fallback.
 
 ## The single-commit / attach-hook contract
 
-`QEtnaviv2dScreen` is the **sole KMS committer**. Both planes land in one
-atomic commit → one page-flip event → tear-free plane sync and the existing
-`m_flipMutex` invariant is preserved.
+`QEtnaviv2dScreen` is the **sole KMS committer** *in `plane=composite` mode*. Both
+planes land in one atomic commit → one page-flip event → tear-free plane sync
+and the existing `m_flipMutex` invariant is preserved. (Step 3's two-instance
+overlay path is a separate, non-composite capability — see D13.)
 
 ### `attachPrimaryFb()` — latched staging + three-buffer discipline
 
@@ -391,29 +403,103 @@ widget at ~60 fps.  `OverlayDriver` directly instantiates a second
 
 All criteria passed on hardware at 59–60 fps.
 
-### Step 4 — In-process video path + split-plane test program
+### Step 4 — In-process compositor: single-commit video + UI (`plane=composite`)
 
-`compositor/test_planes/` — single-owner, Qt is the only DRM master.
+`compositor/tests/test_composite/` — single-owner, Qt is the only DRM master.
 
-- [ ] Qt UI (etnaviv2d QPA, `plane=overlay`) draws an animated translucent HUD,
-      full-screen.
-- [ ] GStreamer decodes to NV12 via `appsink` **into CPU memory**; the program
-      `memcpy`s each frame into a **free** primary buffer (one that is neither
+> **Architecture change from Step 3 (D13).** Step 3 proved a *two-instance*
+> model — a primary `QEtnaviv2dScreen` plus a second, manually-constructed
+> overlay `QEtnaviv2dScreen` sharing the fd, **each issuing its own
+> `drmModeAtomicCommit`**. That works for blend correctness but the two commits
+> are not vblank-locked (they can land one frame apart, plan §Step 3). Step 4
+> requires the **single-commit / single-vblank** guarantee (D3/D9/D10), so it
+> uses a **single-committer, single-instance** model instead: **one**
+> `QEtnaviv2dScreen` enumerates **both** planes and folds both FB_IDs into
+> **one** atomic commit. The shared-fd two-instance capability from Step 3 is
+> retained (and still tested by `test_alpha_blend`) but is **not** the Step 4
+> path.
+
+**QPA structural changes this forces (`qetnaviv2dscreen.{h,cpp}`):**
+
+- New `PlaneMode::Composite` (D14). In this mode `initialize()` enumerates **both**
+  the primary and overlay planes for the CRTC and resolves **two** plane-prop
+  sets (`m_planeProps` for overlay/UI, a new `m_primaryPlaneProps` for video).
+  `plane=primary` / `overlay` / `wayland` keep their existing single-plane
+  semantics for regression and the D6 isolation test.
+- The screen owns **two BO rings**: the existing overlay ARGB8888 **2-deep**
+  double-buffer (Qt renders inline), and a new primary NV12 **3-deep** ring
+  with the `on_screen` bit (D9b).
+- `pageFlip()` in `Composite` mode builds **one** `drmModeAtomicReq` carrying the
+  overlay FB_ID **and** the staged primary FB_ID, committed with
+  `NONBLOCK | PAGE_FLIP_EVENT`. One flip event drains both (D10): overlay
+  back-buffer swaps and the committed primary buffer's `on_screen` bit clears.
+- `attachPrimaryFb({fbId,...})` stages a primary NV12 FB under `m_flipMutex`
+  (last-write-wins) and drives the coalesced GUI-thread present (D12). It never
+  commits directly — the single committer folds it in.
+- Overlay blend props (SRC_OVER / source-alpha=None) set once at the `Composite`
+  modeset, exactly as in the `Overlay` path.
+
+**Test program (`compositor/tests/test_composite/`, written fresh — does NOT
+reuse `test_alpha_blend`'s two-instance structure, D15):**
+
+Design agreed (see D16–D18). A single plain Qt-widgets process run with
+`QT_QPA_PLATFORM=etnaviv2d QT_ETNAVIV2D_PLANE=composite`. Three actors:
+
+- **`HudWidget`** (fullscreen `QWidget`, GUI thread) — translucent HUD rendered
+  through the **normal QPA backing store** → overlay plane. Shows two live
+  counters: `ui=` (paint events) and `vid=` (video commits). Animation timer
+  stops when `--static-after=N` fires.
+- **`VideoThread`** (`QThread`) — owns the **3× NV12 BO ring + per-buffer atomic
+  `on_screen` bit** (D9b). Each tick: pick a buffer that is neither `on_screen`
+  nor `staged`, fill it (synthetic generator by default, GStreamer if
+  `--video=`), `drmModeAddFB2` via `screen->drmFd()`, then
+  `screen->attachPrimaryFb({fbId})`. Runs at `--video-fps`.
+- **`main`** (GUI thread) — resolves
+  `static_cast<QEtnaviv2dScreen*>(QGuiApplication::primaryScreen()->handle())`,
+  asserts composite mode, registers the release callback, starts both.
+
+Checklist:
+
+- [ ] Qt UI runs under the etnaviv2d QPA in **`plane=composite`**; **one** screen
+      drives both planes. HUD is full-screen on the overlay via the backing store
+      (D16 — real plugin integration path, not a directly-constructed screen).
+- [ ] Video source is a **synthetic NV12 generator** by default (a moving hard
+      vertical edge + frame-number bar — the classic tear detector). Two real-file
+      alternatives are supported: `--raw-video=FILE --video-size=WxH` replays a
+      pre-decoded flat NV12 file in a **loop** (frame size = W×H×3/2; seeks back
+      to offset 0 after the last frame; loop counter shown in HUD); `--video=FILE`
+      optionally swaps in GStreamer `appsink` (D17). The confirmed target file is
+      `compositor/images/earth_nv12_1024x600.raw` (300 frames, 921,600 bytes/frame,
+      run as `--raw-video=./earth_nv12_1024x600.raw --video-size=1024x600`).
+      The test `memcpy`s each frame into a **free** primary buffer (neither
       `on_screen` nor `staged` — **3 buffers + `on_screen` bit**, D9b — no naïve
       ring/swap), `drmModeAddFB2`s it, and calls `attachPrimaryFb()`.
 - [ ] The QPA folds the staged primary FB into its **single** atomic commit
-      (D3/D9). No separate committer.
+      (D3/D9). No separate committer, no second screen instance.
+- [ ] **Screen public API is exactly two entry points** (D18): `attachPrimaryFb()`
+      (stage + D12 wake, thread-safe) and `setPrimaryReleaseCallback()`. The screen
+      fires the release callback with the retired `fbId` on the flip-drain thread;
+      the test clears that buffer's **atomic** `on_screen` bit (no marshalling).
+      Both map to Wayland (`linux-dmabuf-v1` stage / `wl_buffer.release`) — the
+      test is transport-agnostic and touches none of the composite commit code.
 - [ ] `attachPrimaryFb()` drives a **coalesced GUI-thread repaint** so the
-      video advances even when the UI is static (D12) — verify with a static
-      HUD: the video must keep playing.
-- [ ] CLI: `--video=<file>`, `--fps`. (`--ui-rect` sub-rectangle is **v2**.)
+      video advances even when the UI is static (D12).
+- [ ] CLI: `--raw-video=FILE --video-size=WxH` (pre-decoded NV12 loop),
+      `--video=FILE` (GStreamer), `--video-fps=N` (default 30), `--static-after=N`,
+      `--frames=N` (auto-quit after N video frames), `--verbose`.
+      (`--ui-rect` sub-rectangle is **v2**.)
 
-**Pass criteria:**
-- Video plays on the primary (NV12), Qt HUD blends over it on the overlay.
-- No tearing on either plane (single commit → single vblank).
-- **Video keeps playing when the UI is fully static** (no animation/input) —
-  the D12 wake-up path works.
-- **Fast decode with a static UI shows no tearing on the primary** — the D9b
+**Pass criteria (each mapped to an on-screen observable):**
+- **Blend:** HUD translucency over the moving video reads as correct SRC_OVER
+  (no halo, no dark/bright edge).
+- **No tearing on either plane — single commit → single vblank:** the synthetic
+  **hard vertical edge** on the primary stays clean/unsheared (only achievable
+  because Step 4 uses the single-committer model, unlike Step 3).
+- **Video keeps playing when the UI is static (D12):** after `--static-after=N`,
+  the HUD `ui=` counter freezes while `vid=` keeps climbing and the video keeps
+  moving.
+- **Fast decode with a static UI shows no tearing on the primary (D9b):**
+  `--video-fps=120` with a static UI — the primary edge stays clean; the
   `on_screen`-bit discipline prevents the producer from overwriting the
   scanned-out buffer.
 - Frame rate tracks source; UI animation fluid.
@@ -471,14 +557,15 @@ all existing tests are unaffected.
 ## Deliverables
 
 - `qpa/src/qetnaviv2dscreen.{h,cpp}` — atomic KMS, plane enumeration,
-  plane-target selection, overlay ARGB8888/`SRC_OVER` config,
-  `attachPrimaryFb()` staging slot, 3-deep primary ring, shared flip-event
-  release.
-- `qpa/src/qetnaviv2dintegration.cpp` — `plane=`/`card=` parsing + precedence.
-- `compositor/test_planes/` — split-plane video+UI test (single-owner).
+  plane-target selection, `PlaneMode::Composite` dual-plane enumeration (two
+  plane-prop sets), overlay ARGB8888/`SRC_OVER` config, `attachPrimaryFb()`
+  staging slot, 3-deep primary ring, shared flip-event release.
+- `qpa/src/qetnaviv2dintegration.cpp` — `plane=`/`card=` parsing + precedence
+  (incl. `composite`).
+- `compositor/tests/test_composite/` — split-plane video+UI test (single-owner,
+  single-committer, `plane=composite`). `compositor/tests/test_alpha_blend/`
+  retained as the Step 3 blend-correctness regression (two-instance shared-fd).
 - `compositor/plan.md` — this document.
-- `qpa/qt-test.md` — add a `test_planes` section (plane map, run rungs, pass
-  criteria) mirroring `test_kms_thread`.
 
 ---
 
@@ -493,8 +580,9 @@ all existing tests are unaffected.
 - Video via **software decode + CPU memcpy** into a **3-deep** NV12 primary
   ring; `attachPrimaryFb()` latched staging.
 - `plane=overlay` standalone over background color.
-- `test_planes` covering the three rungs (primary regression / overlay-blend /
-  split-plane video).
+- `test_composite` covering the single-committer split-plane path (video on
+  primary + blended UI on overlay, one atomic commit); `test_alpha_blend`
+  retained for the overlay-blend rung; `plane=primary` for the regression rung.
 
 ### v2 (deferred — implement last, in this order)
 
@@ -532,6 +620,12 @@ processes on one card) — superseded by the Wayland compositor path (D4).
 | D10 | **(a)** Shared single-event release; overlay **2-deep**, primary **3 buffers + on_screen bit** (D9b). | One commit → one flip event → the overlay flips and the committed primary buffer is freed together. Asymmetric because producers differ (inline Qt vs. decoupled video). |
 | D11 | Under Weston, the etnaviv2d QPA is **adapted, not replaced**: only `QEtnaviv2dScreen`'s transport switches from direct KMS to `wl_surface` + `linux-dmabuf-v1`. `EtnaBlittable`/`libetna2d` are unchanged. | The custom QPA is the sole holder of GC520 DE knowledge; the stock Wayland QPA has none. Retiring it would drop GPU acceleration under a compositor. Weston owns arbitration, not rendering. |
 | D12 | The video producer is a **first-class present trigger**: `attachPrimaryFb()` drives a coalesced GUI-thread present (`QWindow::requestUpdate()`) after staging. Coalesced to ≤1/vblank; skipped if a flip is already pending. | With a single committer, commits must be triggerable by *either* producer. Symmetric UI/video triggering means a static UI never stalls the video. Maps to a `wl_surface` frame callback under Weston. |
+| D13 | Step 4 uses a **single-committer, single-instance** model (one `QEtnaviv2dScreen` drives both planes in one atomic commit), **not** Step 3's proven two-instance model (two screens, two independent commits). | Step 3's two-instance shared-fd model is correct for *blend correctness* but its two commits share CRTC 52's single vblank without coordination — they can land one frame apart (tearing between planes). Step 4's whole point (D3/D9/D10) is the single-vblank tear-free guarantee, which is only reachable when both plane FB_IDs are in **one** commit. The two-instance capability is retained (tested by `test_alpha_blend`) but is not the video path. |
+| D14 | Add `PlaneMode::Composite` rather than overloading `plane=primary`. | `Composite` enumerates both planes and holds two plane-prop sets + two BO rings; overloading `primary` would make its behaviour depend on whether the video path happens to call `attachPrimaryFb()`, muddying the single-plane regression/isolation modes (`primary`, `overlay`, D6). A distinct mode keeps single-plane semantics clean. |
+| D15 | Write Step 4's `test_composite` **fresh**; keep Step 3's `test_alpha_blend` unchanged as a blend-correctness regression. | `test_alpha_blend`'s structure *is* the two-instance model D13 rejects; refactoring it into the single-committer shape would churn already-passing code and lose the standalone record that shared-fd two-instance blending works. Two tests, two purposes. |
+| D16 | `test_composite` drives the screen through the **QPA plugin** (`plane=composite`, real backing store), **not** by directly constructing the screen (the Step 3 approach). | Step 4's whole point is "a single Qt process drives both planes *through the QPA*." Direct-construct bypasses the integration/backing-store path a real app uses. The test is a plain Qt-widgets app resolving the screen via `QGuiApplication::primaryScreen()->handle()`. |
+| D17 | Primary video source is a **synthetic NV12 generator** by default (moving hard vertical edge = tear detector); `--video=FILE` GStreamer is optional. | The thing under test is the single-commit dual-plane path + D9b buffer discipline, not GStreamer. Synthetic gives a deterministic, no-codec-dep, rate-adjustable stimulus that can deliberately stress producer-faster-than-vblank and static-UI cases. GStreamer stays as a realism check. |
+| D18 | Screen's video-facing public API is exactly two entry points: `attachPrimaryFb()` (stage + D12 wake) and `setPrimaryReleaseCallback()` (fires the retired `fbId` on the flip-drain thread; test clears an **atomic** `on_screen` bit). The **test owns the NV12 ring**; the screen only stages, commits, and reports release. | Keeps the composite commit code untouched by the test (your "not surgery on the composite commit code"). Both entry points map 1:1 to Wayland (`linux-dmabuf-v1` stage / `wl_buffer.release`), so the test is transport-agnostic. Atomic release bit avoids cross-thread marshalling while honouring the `m_flipMutex` discipline. |
 
 ### Risks — final status
 
