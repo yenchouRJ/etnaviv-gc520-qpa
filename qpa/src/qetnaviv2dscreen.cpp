@@ -14,13 +14,21 @@
  *         connector CRTC_ID, plane FB_ID + geometry).  Requires DRM master.
  *       - Overlay plane: plane-only commit (FB_ID + geometry, flags=0).
  *         The CRTC is already active; no master needed.
+ *       - Composite: ALLOW_MODESET with primary ARGB placeholder, then
+ *         overlay added as plane-only in the same commit.
  *  6. Fill QFbScreen geometry fields.
  *
- * Page-flip sequence:
+ * Page-flip sequence (non-composite):
  *  1. etna2d_finish() already called by the backing store.
  *  2. drmModeAtomicCommit(FB_ID only, NONBLOCK | PAGE_FLIP_EVENT).
  *  3. select() + drmHandleEvent() drain loop until flip_pending clears.
  *  4. Swap front/back indices.
+ *
+ * Page-flip sequence (composite):
+ *  1. Build one drmModeAtomicReq with overlay FB_ID (back buffer) AND
+ *     staged primary FB_ID (last-write-wins, from attachPrimaryFb()).
+ *  2. One PAGE_FLIP_EVENT drains both: overlay swaps, primary on_screen
+ *     bit cleared via release callback.
  *
  * Cleanup: destroy the mode blob; free BOs and close the fd.  No teardown
  * commit is issued — the kernel releases all KMS state on fd close.
@@ -28,6 +36,7 @@
 #include "qetnaviv2dscreen.h"
 
 #include <QDebug>
+#include <QCoreApplication>
 #include <qpa/qwindowsysteminterface.h>
 
 #include <errno.h>
@@ -63,6 +72,64 @@ static void flipHandler(int /*fd*/, unsigned int /*seq*/,
                         void *user)
 {
     *static_cast<volatile int *>(user) = 0;
+}
+
+/* -----------------------------------------------------------------------
+ * Helper: find a DRM plane of a given type for m_crtcIndex.
+ * Returns the plane id, or 0 on failure.
+ * ----------------------------------------------------------------------- */
+uint32_t QEtnaviv2dScreen::findPlaneByType(uint32_t planeType)
+{
+    uint32_t found = 0;
+    drmModePlaneRes *pres = drmModeGetPlaneResources(m_kfd);
+    if (!pres)
+        return 0;
+    for (uint32_t i = 0; i < pres->count_planes && found == 0; ++i) {
+        drmModePlane *pl = drmModeGetPlane(m_kfd, pres->planes[i]);
+        if (!pl)
+            continue;
+        if (pl->possible_crtcs & (1u << m_crtcIndex)) {
+            uint32_t tid = propId(m_kfd, pl->plane_id,
+                                  DRM_MODE_OBJECT_PLANE, "type");
+            if (tid) {
+                drmModeObjectProperties *pp = drmModeObjectGetProperties(
+                    m_kfd, pl->plane_id, DRM_MODE_OBJECT_PLANE);
+                if (pp) {
+                    for (uint32_t k = 0; k < pp->count_props; ++k) {
+                        if (pp->props[k] == tid &&
+                            pp->prop_values[k] == planeType) {
+                            found = pl->plane_id;
+                            break;
+                        }
+                    }
+                    drmModeFreeObjectProperties(pp);
+                }
+            }
+        }
+        drmModeFreePlane(pl);
+    }
+    drmModeFreePlaneResources(pres);
+    return found;
+}
+
+/* -----------------------------------------------------------------------
+ * Helper: resolve all atomic plane property IDs into dst.
+ * ----------------------------------------------------------------------- */
+void QEtnaviv2dScreen::resolvePlaneProps(uint32_t planeId, EtnaPlaneProps &dst)
+{
+    dst.fb_id   = propId(m_kfd, planeId, DRM_MODE_OBJECT_PLANE, "FB_ID");
+    dst.crtc_id = propId(m_kfd, planeId, DRM_MODE_OBJECT_PLANE, "CRTC_ID");
+    dst.src_x   = propId(m_kfd, planeId, DRM_MODE_OBJECT_PLANE, "SRC_X");
+    dst.src_y   = propId(m_kfd, planeId, DRM_MODE_OBJECT_PLANE, "SRC_Y");
+    dst.src_w   = propId(m_kfd, planeId, DRM_MODE_OBJECT_PLANE, "SRC_W");
+    dst.src_h   = propId(m_kfd, planeId, DRM_MODE_OBJECT_PLANE, "SRC_H");
+    dst.crtc_x  = propId(m_kfd, planeId, DRM_MODE_OBJECT_PLANE, "CRTC_X");
+    dst.crtc_y  = propId(m_kfd, planeId, DRM_MODE_OBJECT_PLANE, "CRTC_Y");
+    dst.crtc_w  = propId(m_kfd, planeId, DRM_MODE_OBJECT_PLANE, "CRTC_W");
+    dst.crtc_h  = propId(m_kfd, planeId, DRM_MODE_OBJECT_PLANE, "CRTC_H");
+    dst.zpos    = propId(m_kfd, planeId, DRM_MODE_OBJECT_PLANE, "zpos");
+    dst.blend_mode        = propId(m_kfd, planeId, DRM_MODE_OBJECT_PLANE, "porter-duff-blend-mode");
+    dst.source_alpha_mode = propId(m_kfd, planeId, DRM_MODE_OBJECT_PLANE, "source-alpha-mode");
 }
 
 /* -----------------------------------------------------------------------
@@ -226,74 +293,45 @@ bool QEtnaviv2dScreen::initialize()
     int h = m_modeInfo.vdisplay;
 
 #ifndef ETNAVIV2D_LEGACY_KMS
-    /* --- 2b. Atomic: pick the plane for our CRTC based on m_planeMode --- */
+    /* --- 2b. Atomic: pick plane(s) based on m_planeMode --- */
     if (m_crtcIndex < 0) {
         SCR_WARN << "no CRTC index captured";
         cleanup();
         return false;
     }
-    const uint32_t targetType = (m_planeMode == PlaneMode::Overlay)
-                                ? DRM_PLANE_TYPE_OVERLAY
-                                : DRM_PLANE_TYPE_PRIMARY;
-    {
-        drmModePlaneRes *pres = drmModeGetPlaneResources(m_kfd);
-        if (!pres) {
-            SCR_WARN << "drmModeGetPlaneResources failed";
-            cleanup();
-            return false;
-        }
-        for (uint32_t i = 0; i < pres->count_planes && m_planeId == 0; ++i) {
-            drmModePlane *pl = drmModeGetPlane(m_kfd, pres->planes[i]);
-            if (!pl)
-                continue;
-            if (pl->possible_crtcs & (1u << m_crtcIndex)) {
-                uint32_t tid = propId(m_kfd, pl->plane_id,
-                                      DRM_MODE_OBJECT_PLANE, "type");
-                if (tid) {
-                    drmModeObjectProperties *pp = drmModeObjectGetProperties(
-                        m_kfd, pl->plane_id, DRM_MODE_OBJECT_PLANE);
-                    if (pp) {
-                        for (uint32_t k = 0; k < pp->count_props; ++k) {
-                            if (pp->props[k] == tid &&
-                                pp->prop_values[k] == targetType) {
-                                m_planeId = pl->plane_id;
-                                break;
-                            }
-                        }
-                        drmModeFreeObjectProperties(pp);
-                    }
-                }
-            }
-            drmModeFreePlane(pl);
-        }
-        drmModeFreePlaneResources(pres);
-    }
-    if (m_planeId == 0) {
-        SCR_WARN << "no" << (targetType == DRM_PLANE_TYPE_OVERLAY ? "OVERLAY" : "PRIMARY")
-                 << "plane for CRTC index" << m_crtcIndex;
-        cleanup();
-        return false;
-    }
 
-    /* Resolve property IDs by name (per object; 0 == not exposed). */
-    m_planeProps.fb_id   = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "FB_ID");
-    m_planeProps.crtc_id = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "CRTC_ID");
-    m_planeProps.src_x   = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "SRC_X");
-    m_planeProps.src_y   = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "SRC_Y");
-    m_planeProps.src_w   = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "SRC_W");
-    m_planeProps.src_h   = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "SRC_H");
-    m_planeProps.crtc_x  = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "CRTC_X");
-    m_planeProps.crtc_y  = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "CRTC_Y");
-    m_planeProps.crtc_w  = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "CRTC_W");
-    m_planeProps.crtc_h  = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "CRTC_H");
-    m_planeProps.zpos    = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "zpos");
-    /* overlay-only custom props — expected 0 on the primary plane */
-    m_planeProps.blend_mode        = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "porter-duff-blend-mode");
-    m_planeProps.source_alpha_mode = propId(m_kfd, m_planeId, DRM_MODE_OBJECT_PLANE, "source-alpha-mode");
-
+    /* Resolve CRTC and connector props by name before checking planes. */
     m_crtcProps.active  = propId(m_kfd, m_crtcId, DRM_MODE_OBJECT_CRTC, "ACTIVE");
     m_crtcProps.mode_id = propId(m_kfd, m_crtcId, DRM_MODE_OBJECT_CRTC, "MODE_ID");
     m_connProps.crtc_id = propId(m_kfd, m_connId, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID");
+
+    if (m_planeMode == PlaneMode::Composite) {
+        /* Composite: enumerate BOTH primary and overlay planes. */
+        m_primaryPlaneId = findPlaneByType(DRM_PLANE_TYPE_PRIMARY);
+        m_planeId        = findPlaneByType(DRM_PLANE_TYPE_OVERLAY);
+        if (!m_primaryPlaneId || !m_planeId) {
+            SCR_WARN << "composite: primary plane=" << m_primaryPlaneId
+                     << "overlay plane=" << m_planeId;
+            cleanup();
+            return false;
+        }
+        resolvePlaneProps(m_primaryPlaneId, m_primaryPlaneProps);
+        resolvePlaneProps(m_planeId,        m_planeProps);
+        SCR_INFO << "Composite: primary plane=" << m_primaryPlaneId
+                 << "overlay plane=" << m_planeId;
+    } else {
+        const uint32_t targetType = (m_planeMode == PlaneMode::Overlay)
+                                    ? DRM_PLANE_TYPE_OVERLAY
+                                    : DRM_PLANE_TYPE_PRIMARY;
+        m_planeId = findPlaneByType(targetType);
+        if (m_planeId == 0) {
+            SCR_WARN << "no" << (targetType == DRM_PLANE_TYPE_OVERLAY ? "OVERLAY" : "PRIMARY")
+                     << "plane for CRTC index" << m_crtcIndex;
+            cleanup();
+            return false;
+        }
+        resolvePlaneProps(m_planeId, m_planeProps);
+    }
 
     if (!m_planeProps.fb_id || !m_planeProps.crtc_id ||
         !m_crtcProps.active || !m_crtcProps.mode_id || !m_connProps.crtc_id) {
@@ -307,6 +345,13 @@ bool QEtnaviv2dScreen::initialize()
         return false;
     }
 
+    if (m_planeMode == PlaneMode::Composite &&
+        (!m_primaryPlaneProps.fb_id || !m_primaryPlaneProps.crtc_id)) {
+        SCR_WARN << "composite: primary plane props missing";
+        cleanup();
+        return false;
+    }
+
     if (drmModeCreatePropertyBlob(m_kfd, &m_modeInfo, sizeof(m_modeInfo),
                                   &m_modeBlobId)) {
         SCR_WARN << "drmModeCreatePropertyBlob:" << strerror(errno);
@@ -315,7 +360,9 @@ bool QEtnaviv2dScreen::initialize()
     }
 
     SCR_INFO << "Atomic: plane=" << m_planeId
-             << (m_planeMode == PlaneMode::Overlay ? "(overlay)" : "(primary)")
+             << (m_planeMode == PlaneMode::Overlay   ? "(overlay)"
+              : m_planeMode == PlaneMode::Composite  ? "(overlay/composite)"
+              :                                        "(primary)")
              << "props resolved; mode blob=" << m_modeBlobId;
 #endif // !ETNAVIV2D_LEGACY_KMS
 
@@ -339,7 +386,8 @@ bool QEtnaviv2dScreen::initialize()
         uint32_t handles[4] = {creq.handle};
         uint32_t pitches[4] = {creq.pitch};
         uint32_t offsets[4] = {};
-        uint32_t fmt = (m_planeMode == PlaneMode::Overlay)
+        uint32_t fmt = (m_planeMode == PlaneMode::Overlay ||
+                        m_planeMode == PlaneMode::Composite)
                        ? DRM_FORMAT_ARGB8888
                        : DRM_FORMAT_XRGB8888;
         if (drmModeAddFB2(m_kfd, w, h, fmt,
@@ -426,13 +474,29 @@ bool QEtnaviv2dScreen::initialize()
         drmModeAtomicAddProperty(req, m_planeId, m_planeProps.crtc_h, h);
         /* Overlay blend props: set once at modeset, persist for all flips.
          * porter-duff-blend-mode=3 (SRC_OVER), source-alpha-mode=0 (None = per-pixel). */
-        if (m_planeMode == PlaneMode::Overlay) {
+        if (m_planeMode == PlaneMode::Overlay || m_planeMode == PlaneMode::Composite) {
             if (m_planeProps.blend_mode)
                 drmModeAtomicAddProperty(req, m_planeId,
                                          m_planeProps.blend_mode, 3);
             if (m_planeProps.source_alpha_mode)
                 drmModeAtomicAddProperty(req, m_planeId,
                                          m_planeProps.source_alpha_mode, 0);
+        }
+        /* Composite: also set up the primary plane with a black ARGB placeholder.
+         * The VideoThread will call attachPrimaryFb() to replace this with NV12
+         * once it has allocated its BO ring. */
+        if (m_planeMode == PlaneMode::Composite) {
+            drmModeAtomicAddProperty(req, m_primaryPlaneId, m_primaryPlaneProps.fb_id,   m_fb[m_frontIdx].fb_id);
+            drmModeAtomicAddProperty(req, m_primaryPlaneId, m_primaryPlaneProps.crtc_id, m_crtcId);
+            drmModeAtomicAddProperty(req, m_primaryPlaneId, m_primaryPlaneProps.src_x,  0);
+            drmModeAtomicAddProperty(req, m_primaryPlaneId, m_primaryPlaneProps.src_y,  0);
+            drmModeAtomicAddProperty(req, m_primaryPlaneId, m_primaryPlaneProps.src_w,  (uint64_t)w << 16);
+            drmModeAtomicAddProperty(req, m_primaryPlaneId, m_primaryPlaneProps.src_h,  (uint64_t)h << 16);
+            drmModeAtomicAddProperty(req, m_primaryPlaneId, m_primaryPlaneProps.crtc_x, 0);
+            drmModeAtomicAddProperty(req, m_primaryPlaneId, m_primaryPlaneProps.crtc_y, 0);
+            drmModeAtomicAddProperty(req, m_primaryPlaneId, m_primaryPlaneProps.crtc_w, w);
+            drmModeAtomicAddProperty(req, m_primaryPlaneId, m_primaryPlaneProps.crtc_h, h);
+            flags |= DRM_MODE_ATOMIC_ALLOW_MODESET; /* primary needs modeset too */
         }
         int rc = drmModeAtomicCommit(m_kfd, req, flags, nullptr);
         drmModeAtomicFree(req);
@@ -494,8 +558,29 @@ int QEtnaviv2dScreen::pageFlip()
             m_flipPending = 0;
             return -1;
         }
-        drmModeAtomicAddProperty(req, m_planeId, m_planeProps.fb_id,
-                                 m_fb[m_backIdx].fb_id);
+
+        if (m_planeMode == PlaneMode::Composite) {
+            /* Overlay (UI) flip: use the back buffer. */
+            drmModeAtomicAddProperty(req, m_planeId, m_planeProps.fb_id,
+                                     m_fb[m_backIdx].fb_id);
+            /* Primary (video) flip: use the staged NV12 FB if available.
+             * Last-write-wins: if no new frame was staged since last flip,
+             * we re-commit the same on-screen FB (frame repeat, correct by
+             * design — see D9). */
+            if (m_hasStagedPrimary) {
+                m_onScreenPrimary  = m_stagedPrimary;
+                m_hasStagedPrimary = false;
+            }
+            if (m_onScreenPrimary.fbId) {
+                drmModeAtomicAddProperty(req, m_primaryPlaneId,
+                                         m_primaryPlaneProps.fb_id,
+                                         m_onScreenPrimary.fbId);
+            }
+        } else {
+            drmModeAtomicAddProperty(req, m_planeId, m_planeProps.fb_id,
+                                     m_fb[m_backIdx].fb_id);
+        }
+
         int rc = drmModeAtomicCommit(m_kfd, req,
                      DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT,
                      static_cast<void *>(const_cast<int *>(&m_flipPending)));
@@ -508,7 +593,15 @@ int QEtnaviv2dScreen::pageFlip()
     }
 #endif
 
-    /* Wait for the flip event via select + drmHandleEvent. */
+    /* Snapshot the on-screen primary info before releasing the lock for the
+     * drain loop — we need it for the release callback after the event. */
+    PrimaryFbInfo committedPrimary = m_onScreenPrimary;
+
+    /* Wait for the flip event via select + drmHandleEvent.
+     * The mutex is held throughout (original behaviour) so that other threads
+     * see m_flipPending atomically with the lock.  attachPrimaryFb() just
+     * stages under the same mutex and returns; it will succeed as soon as
+     * this flip completes (within one vblank, ~16 ms). */
     drmEventContext ev = {};
     ev.version           = DRM_EVENT_CONTEXT_VERSION;
     ev.page_flip_handler = flipHandler;
@@ -539,6 +632,20 @@ int QEtnaviv2dScreen::pageFlip()
      * m_frontIdx/m_backIdx in a consistent state. */
     if (!m_shuttingDown)
         std::swap(m_frontIdx, m_backIdx);
+
+    /* Fire the primary release callback.  The just-completed commit retired
+     * the previous on-screen primary buffer; the producer can now clear its
+     * on_screen bit.  We snapshot the callback under the lock then call it
+     * after releasing to avoid holding the lock during an unknown callback. */
+    std::function<void(const PrimaryFbInfo &)> releaseCb;
+    if (m_planeMode == PlaneMode::Composite && committedPrimary.fbId)
+        releaseCb = m_primaryReleaseCb;
+
+    lock.unlock();
+
+    if (releaseCb && committedPrimary.fbId)
+        releaseCb(committedPrimary);
+
     SCR_DBG << "pageFlip done — front=" << m_frontIdx
             << "back=" << m_backIdx;
     return 0;
@@ -607,6 +714,43 @@ void QEtnaviv2dScreen::cleanup()
         close(m_kfd);
         m_kfd = -1;
     }
+}
+
+/* -----------------------------------------------------------------------
+ * attachPrimaryFb() — stage an externally-produced NV12 FB (composite only)
+ *
+ * Called from the video producer thread.  Stages info under m_flipMutex
+ * (last-write-wins) then posts a coalesced repaint request to the GUI thread
+ * so the video advances even when the Qt UI is completely static (D12).
+ *
+ * The caller must not recycle the buffer until the release callback fires.
+ * ----------------------------------------------------------------------- */
+void QEtnaviv2dScreen::attachPrimaryFb(const PrimaryFbInfo &info)
+{
+    {
+        QMutexLocker lock(&m_flipMutex);
+        if (m_shuttingDown)
+            return;
+        m_stagedPrimary    = info;
+        m_hasStagedPrimary = true;
+    }
+
+    /* D12: drive a coalesced GUI-thread repaint so the video advances even
+     * when the Qt UI has no pending damage.  QCoreApplication::postEvent()
+     * is thread-safe; the event is coalesced by Qt's event loop (multiple
+     * posts before the GUI thread processes them collapse to one repaint). */
+    QCoreApplication::postEvent(QCoreApplication::instance(),
+                                new QEvent(QEvent::UpdateRequest));
+}
+
+/* -----------------------------------------------------------------------
+ * setPrimaryReleaseCallback() — register the on-screen buffer release hook
+ * ----------------------------------------------------------------------- */
+void QEtnaviv2dScreen::setPrimaryReleaseCallback(
+        std::function<void(const PrimaryFbInfo &)> cb)
+{
+    QMutexLocker lock(&m_flipMutex);
+    m_primaryReleaseCb = std::move(cb);
 }
 
 QT_END_NAMESPACE

@@ -102,6 +102,8 @@ bool QEtnaviv2dIntegration::initializeHardware()
     PlaneMode planeMode = PlaneMode::Primary;
     if (planeStr == QLatin1String("overlay"))
         planeMode = PlaneMode::Overlay;
+    else if (planeStr == QLatin1String("composite"))
+        planeMode = PlaneMode::Composite;
     else if (planeStr == QLatin1String("wayland"))
         planeMode = PlaneMode::Wayland;
     else if (planeStr != QLatin1String("primary"))
