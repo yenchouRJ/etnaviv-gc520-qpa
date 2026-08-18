@@ -525,18 +525,55 @@ bool QEtnaviv2dScreen::initialize()
 }
 
 /* -----------------------------------------------------------------------
+ * doRedraw() — called on the GUI thread by QFbScreen::event(UpdateRequest).
+ *
+ * We suppress the QFbScreen software compositor (return empty region), but
+ * in composite mode we use this path as the D12 video-present trigger:
+ * when attachPrimaryFb() staged a new frame and the UI is static (no pending
+ * flush()), scheduleUpdate() delivers an UpdateRequest here, and we call
+ * pageFlip() to commit the staged primary FB.
+ *
+ * If flush() runs first (UI repaint arrived), it calls pageFlip() and clears
+ * m_videoPresent — doRedraw() then skips to avoid a double-flip.
+ * ----------------------------------------------------------------------- */
+QRegion QEtnaviv2dScreen::doRedraw()
+{
+    if (m_planeMode == PlaneMode::Composite) {
+        bool doFlip = false;
+        {
+            QMutexLocker lock(&m_flipMutex);
+            if (m_videoPresent) {
+                m_videoPresent = false;
+                doFlip = true;
+            }
+        }
+        if (doFlip) {
+            SCR_DBG << "D12: doRedraw triggering pageFlip (video-present path)";
+            pageFlip(/*videoOnly=*/true);
+        }
+    }
+    return QRegion();
+}
+
+/* -----------------------------------------------------------------------
  * pageFlip() — flip back buffer to display, block for vblank.
  *
  * Serialised by m_flipMutex so render-thread and GUI-thread flushes cannot
  * race.  Returns immediately with -1 if teardown is already in progress
  * (m_shuttingDown), avoiding an EBUSY from a late Ctrl-C flush.
  * ----------------------------------------------------------------------- */
-int QEtnaviv2dScreen::pageFlip()
+int QEtnaviv2dScreen::pageFlip(bool videoOnly)
 {
     QMutexLocker lock(&m_flipMutex);
 
     if (m_shuttingDown)
         return -1;
+
+    /* Clear the D12 video-present flag: whichever path reaches pageFlip()
+     * first (flush() from a UI repaint, or doRedraw() from scheduleUpdate())
+     * owns this commit.  The other will see m_videoPresent=false in doRedraw()
+     * and skip, preventing a double-flip. */
+    m_videoPresent = false;
 
     m_flipPending = 1;
 #ifdef ETNAVIV2D_LEGACY_KMS
@@ -560,16 +597,25 @@ int QEtnaviv2dScreen::pageFlip()
         }
 
         if (m_planeMode == PlaneMode::Composite) {
-            /* Overlay (UI) flip: use the back buffer. */
+            /* Overlay (UI): video-only path re-commits the front buffer (the
+             * one currently on screen) so the UI stays frozen without flutter.
+             * UI path commits the back buffer (just painted by the backing store). */
+            int overlayIdx = videoOnly ? m_frontIdx : m_backIdx;
             drmModeAtomicAddProperty(req, m_planeId, m_planeProps.fb_id,
-                                     m_fb[m_backIdx].fb_id);
-            /* Primary (video) flip: use the staged NV12 FB if available.
-             * Last-write-wins: if no new frame was staged since last flip,
-             * we re-commit the same on-screen FB (frame repeat, correct by
-             * design — see D9). */
+                                     m_fb[overlayIdx].fb_id);
+            /* Primary (video) flip: advance staged → on-screen.
+             * Snapshot the buffer that is currently on-screen BEFORE replacing
+             * it — that is the one the flip event will retire, so it is the
+             * one the release callback must free. */
             if (m_hasStagedPrimary) {
+                m_retiredPrimary   = m_onScreenPrimary; /* what the DC is about to stop scanning */
                 m_onScreenPrimary  = m_stagedPrimary;
                 m_hasStagedPrimary = false;
+                SCR_DBG << "D12: pageFlip retiring fbId=" << m_retiredPrimary.fbId
+                        << "committing fbId=" << m_onScreenPrimary.fbId;
+            } else {
+                /* No new frame — re-committing the same buffer; nothing to retire. */
+                m_retiredPrimary = PrimaryFbInfo{};
             }
             if (m_onScreenPrimary.fbId) {
                 drmModeAtomicAddProperty(req, m_primaryPlaneId,
@@ -593,9 +639,10 @@ int QEtnaviv2dScreen::pageFlip()
     }
 #endif
 
-    /* Snapshot the on-screen primary info before releasing the lock for the
-     * drain loop — we need it for the release callback after the event. */
-    PrimaryFbInfo committedPrimary = m_onScreenPrimary;
+    /* Snapshot the retired primary buffer — the one the DC was scanning before
+     * this commit.  After the flip event it is safe to release back to the
+     * producer.  m_retiredPrimary was set above before advancing m_onScreenPrimary. */
+    PrimaryFbInfo committedPrimary = m_retiredPrimary;
 
     /* Wait for the flip event via select + drmHandleEvent.
      * The mutex is held throughout (original behaviour) so that other threads
@@ -626,11 +673,10 @@ int QEtnaviv2dScreen::pageFlip()
             drmHandleEvent(m_kfd, &ev);
     }
 
-    /* Swap front/back — but only if we are not shutting down.
-     * If cleanup() set m_shuttingDown while we were waiting for vblank the
-     * flip has already been presented; skip the swap so cleanup() finds
-     * m_frontIdx/m_backIdx in a consistent state. */
-    if (!m_shuttingDown)
+    /* Swap front/back — but only for UI-driven flips where the back buffer
+     * was just painted.  Video-only flips re-committed the front buffer;
+     * no swap needed (and swapping would corrupt the next UI flip). */
+    if (!m_shuttingDown && !videoOnly)
         std::swap(m_frontIdx, m_backIdx);
 
     /* Fire the primary release callback.  The just-completed commit retired
@@ -733,14 +779,19 @@ void QEtnaviv2dScreen::attachPrimaryFb(const PrimaryFbInfo &info)
             return;
         m_stagedPrimary    = info;
         m_hasStagedPrimary = true;
+        m_videoPresent     = true;
     }
 
-    /* D12: drive a coalesced GUI-thread repaint so the video advances even
-     * when the Qt UI has no pending damage.  QCoreApplication::postEvent()
-     * is thread-safe; the event is coalesced by Qt's event loop (multiple
-     * posts before the GUI thread processes them collapse to one repaint). */
-    QCoreApplication::postEvent(QCoreApplication::instance(),
-                                new QEvent(QEvent::UpdateRequest));
+    /* D12: drive a coalesced GUI-thread commit via QFbScreen::scheduleUpdate().
+     * scheduleUpdate() posts QEvent::UpdateRequest to *this* (the screen
+     * QObject) and is coalesced (only one pending request at a time).  The
+     * event is delivered on the GUI thread → QFbScreen::event() → doRedraw()
+     * → pageFlip().  If a UI repaint arrives first, flush() calls pageFlip()
+     * and clears m_videoPresent; doRedraw() then skips to avoid a double-flip.
+     */
+    SCR_DBG << "D12: attachPrimaryFb fbId=" << info.fbId
+            << "calling scheduleUpdate()";
+    scheduleUpdate();
 }
 
 /* -----------------------------------------------------------------------

@@ -87,7 +87,7 @@ public:
             if (m_staticAfter > 0 && m_uiFrames >= m_staticAfter) {
                 m_timer->stop();
                 qDebug() << "[hud] UI animation stopped at frame" << m_uiFrames
-                         << "— vid= counter should keep climbing";
+                         << "— primary video continues to advance";
             }
             update();
         });
@@ -196,16 +196,22 @@ private:
 };
 
 /* =========================================================================
- * NV12 BO ring — 3 buffers each with one atomic on_screen bit (D9b)
+ * NV12 BO ring — 3 buffers (D9b)
+ *
+ * Buffer states tracked by two atomic pointers in VideoThread:
+ *   m_staged  : buffer handed to the screen, waiting for next commit
+ *   m_onScreen: buffer currently scanned by the display controller
+ *
+ * pickFree() skips both.  With 3 buffers at most 1 staged + 1 on-screen
+ * at any time → always at least 1 free.  No per-buffer state needed.
  * ========================================================================= */
 static constexpr int NV12_RING_SIZE = 3;
 
 struct NV12Buf {
-    uint32_t          handle = 0;
-    uint32_t          fbId   = 0;
-    void             *map    = nullptr;  /* CPU-accessible mmap for memcpy */
-    size_t            size   = 0;
-    std::atomic<int>  onScreen{0};       /* 1 = currently scanned out */
+    uint32_t  handle = 0;
+    uint32_t  fbId   = 0;
+    void     *map    = nullptr;
+    size_t    size   = 0;
 };
 
 /* =========================================================================
@@ -258,15 +264,16 @@ protected:
         }
 
         /* --- Register the release callback (D18).
-         * Called on the flip-event drain (GUI thread, after m_flipMutex
-         * released).  Clears the on_screen bit so the producer can reuse
-         * the buffer.  The callback must be fast and non-blocking. */
+         * Called after the flip-event drain (GUI thread).  The screen passes
+         * back info.cookie — the NV12Buf that just left the display controller.
+         * Clear m_onScreen so pickFree() can reuse that slot. */
         m_screen->setPrimaryReleaseCallback([this](const PrimaryFbInfo &info) {
-            NV12Buf *buf = static_cast<NV12Buf *>(info.cookie);
-            if (buf)
-                buf->onScreen.store(0);
+            /* Flip event fired: the previously-on-screen buffer is now free.
+             * Unconditionally clear m_onScreen — only one buffer can be
+             * retired at a time (sequential flip events, single CRTC). */
+            m_onScreen.store(nullptr);
             if (m_verbose)
-                qDebug() << "[video] release fbId=" << info.fbId;
+                qDebug() << "[video] released fbId=" << info.fbId;
         });
 
         /* --- Open the raw NV12 file. --- */
@@ -290,6 +297,9 @@ protected:
         int loopCount = 0, frame = 0;
 
         while (!isInterruptionRequested()) {
+            /* Pick a free buffer: not on_screen AND not the currently staged
+             * one.  With 3 buffers there is always at least one free as long
+             * as at most one is on_screen and one is staged. */
             NV12Buf *buf = pickFree();
             if (!buf) {
                 QThread::usleep(500);
@@ -310,9 +320,14 @@ protected:
                 continue;
             }
 
-            /* Stage the buffer (D9b: mark on_screen before staging so the
-             * release callback can safely clear it after the flip). */
-            buf->onScreen.store(1);
+            /* Advance the ring state:
+             *   m_onScreen ← previous m_staged (it's about to be committed)
+             *   m_staged   ← buf (the new staging candidate)
+             * pickFree() skips both, so 2 buffers are "consumed" and 1 is
+             * always available. */
+            m_onScreen.store(m_staged.load());
+            m_staged.store(buf);
+
             PrimaryFbInfo info;
             info.fbId   = buf->fbId;
             info.cookie = buf;
@@ -333,9 +348,11 @@ protected:
                 break;
             }
 
-            /* Pace to --video-fps. */
+            /* Pace to --video-fps: sleep until next frame deadline.
+             * Cap sleep to one frame interval to avoid stalling if the clock
+             * jumped (e.g. debugger pause). */
             qint64 sleepMs = (qint64)frame * intervalMs - clock.elapsed();
-            if (sleepMs > 1)
+            if (sleepMs > 1 && sleepMs <= intervalMs)
                 QThread::msleep((unsigned long)sleepMs);
         }
 
@@ -355,7 +372,6 @@ private:
     {
         for (int i = 0; i < NV12_RING_SIZE; ++i) {
             NV12Buf &b = m_bufs[i];
-            b.onScreen.store(0);
 
             struct drm_mode_create_dumb creq = {};
             creq.width  = W;
@@ -425,20 +441,25 @@ private:
 
     NV12Buf *pickFree()
     {
-        for (int i = 0; i < NV12_RING_SIZE; ++i)
-            if (m_bufs[i].onScreen.load() == 0)
+        NV12Buf *staged   = m_staged.load();
+        NV12Buf *onScreen = m_onScreen.load();
+        for (int i = 0; i < NV12_RING_SIZE; ++i) {
+            if (&m_bufs[i] != staged && &m_bufs[i] != onScreen)
                 return &m_bufs[i];
+        }
         return nullptr;
     }
 
-    QEtnaviv2dScreen *m_screen;
-    QString           m_rawFile;
-    QSize             m_videoSize;
-    int               m_fps;
-    int               m_maxFrames;
-    bool              m_verbose;
-    HudWidget        *m_hud;
-    NV12Buf           m_bufs[NV12_RING_SIZE];
+    QEtnaviv2dScreen             *m_screen;
+    QString                       m_rawFile;
+    QSize                         m_videoSize;
+    int                           m_fps;
+    int                           m_maxFrames;
+    bool                          m_verbose;
+    HudWidget                    *m_hud;
+    NV12Buf                       m_bufs[NV12_RING_SIZE];
+    std::atomic<NV12Buf *>        m_staged{nullptr};
+    std::atomic<NV12Buf *>        m_onScreen{nullptr};
 };
 
 /* =========================================================================

@@ -120,8 +120,11 @@ public:
     QImage::Format format() const override { return mFormat; }
     QSizeF physicalSize()   const override { return mPhysicalSize; }
 
-    /* QFbScreen — suppress the software compositor; backing store drives flip. */
-    QRegion doRedraw() override { return QRegion(); }
+    /* QFbScreen — suppress the software compositor; backing store drives flip.
+     * In composite mode, also called from the scheduleUpdate() path when the
+     * video thread stages a new primary FB (D12): drives pageFlip() so the
+     * video advances even when the Qt UI is completely static. */
+    QRegion doRedraw() override;
 
     /* Initialize KMS: open card, allocate BOs, modeset. Returns false on error. */
     bool initialize() override;
@@ -132,9 +135,14 @@ public:
     etna2d_surface *backSurface() const { return m_scanoutSurf[m_backIdx]; }
 
     /* Flip back buffer to display; waits for vblank.
+     * videoOnly=true: video-driven commit (D12 path) — overlay uses the
+     *   front buffer (already on screen) so the UI stays frozen with no
+     *   flutter; front/back indices are NOT swapped.
+     * videoOnly=false (default): UI-driven commit (flush() path) — overlay
+     *   uses the back buffer (just painted); front/back swap as normal.
      * Returns 0 on success, -1 on error or if shutting down.
      * Thread-safe: serialised by m_flipMutex. */
-    int pageFlip();
+    int pageFlip(bool videoOnly = false);
 
     /* Raw DRM fd (for drmHandleEvent poll if needed outside the screen). */
     int drmFd() const { return m_kfd; }
@@ -227,8 +235,10 @@ private:
 
     /* Composite mode: staged primary NV12 FB (last-write-wins staging slot). */
     PrimaryFbInfo   m_stagedPrimary;            /* protected by m_flipMutex */
-    PrimaryFbInfo   m_onScreenPrimary;          /* the currently committed primary FB */
+    PrimaryFbInfo   m_onScreenPrimary;          /* buffer currently scanned by DC */
+    PrimaryFbInfo   m_retiredPrimary;           /* buffer retired by the last commit (for release cb) */
     bool            m_hasStagedPrimary = false; /* true when m_stagedPrimary is valid */
+    bool            m_videoPresent     = false; /* set by attachPrimaryFb, cleared by doRedraw/flush */
     std::function<void(const PrimaryFbInfo &)> m_primaryReleaseCb; /* protected by m_flipMutex */
 
     /* Saved mode info for geometry. */
