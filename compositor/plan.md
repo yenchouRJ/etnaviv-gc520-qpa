@@ -6,7 +6,7 @@ QPA, using one atomic KMS commit. Design the plane layer so a Wayland
 compositor (Weston) can later own multi-process plane assignment with **no
 change** to `libetna2d` or the QPA blitter.
 
-> **Status:** Steps 0–4 complete and hardware-verified. Step 5 is next.
+> **Status:** Steps 0–5 complete and hardware-verified. Step 6 is next.
 
 ---
 
@@ -525,51 +525,129 @@ Checklist:
   **✓ Hardware-verified.**
 - Frame rate tracks source; UI animation fluid. **✓ Hardware-verified.**
 
-### Step 5 — Wayland-forward validation (design gate, no Weston yet)
+### Step 5 — Wayland-forward validation (design gate, no Weston yet) — **DONE**
 
-- [ ] Confirm `plane=wayland` handoff stub is a clean no-op: app runs, QPA's
-      direct-KMS transport is disabled, `weston` could take the card.
-- [ ] Document the future transport mapping (render layer unchanged):
-      `plane=overlay` (KMS) ⇄ `wl_surface`/`wl_subsurface`;
-      `plane=primary` video (attachPrimaryFb NV12) ⇄ `linux-dmabuf-v1` scanout
-      candidate. Weston's DRM backend already promotes fullscreen dmabuf
-      surfaces to hardware planes — the same NV12 buffer lands on the same
-      plane, unchanged. The etnaviv2d QPA is **adapted** to emit `wl_surface`
-      commits; `EtnaBlittable`/`libetna2d` remain the GPU-op layer (D11).
+- [x] Confirmed `plane=wayland` handoff stub is a clean no-op: `initialize()`
+      returns immediately after setting nominal geometry; no DRM master acquired,
+      no modeset. `flush()` hits `isStub()` and returns silently — the GC520
+      render path (`EtnaBlittable`, `etna2d_blit`) still executes but the
+      transport (`pageFlip()`) is disabled. Weston could take the card.
+- [x] Transport mapping documented (render layer unchanged, D11):
+      `plane=overlay` (direct KMS) ⇄ `wl_surface` + `linux-dmabuf-v1`;
+      `attachPrimaryFb` NV12 ⇄ `linux-dmabuf-v1` scanout candidate.
+      The `isStub()` early-return in `flush()` is the precise seam where D11
+      plugs in: replace it with dmabuf-export + `wl_surface_commit`, leaving
+      `etna2d_blit` / `etna2d_finish` above it untouched.
 
-### Step 6 — *(Optional)* SW-render mode for GPU vs CPU benchmark
+### Step 6 — Weston plane-promotion gate (`linux-dmabuf-v1` validation)
 
-**Purpose:** isolate the GC520 DE contribution by holding the display path
-constant.  The comparison `our SW mode` vs `our GPU mode` answers the question
-*"is the GC520 DE faster than the CPU for 2D ops?"* cleanly.  Comparing against
-linuxfb conflates two variables (rendering engine **and** display path); this
-step removes the display-path variable entirely.
+**Replaces** the original SW-render benchmark (dropped — SW render adds a
+`memcpy` cost that would likely measure *worse* than the GPU path, giving no
+actionable comparison).
 
-**What changes (small, self-contained):**
+**Purpose:** Validate the Phase-3 "Weston owns plane arbitration" model
+on-device — prove a Wayland client's fullscreen NV12 **dmabuf** surface is
+promoted by Weston's DRM backend to a **hardware plane** (not GL-composited),
+tear-free, at source frame rate.
 
-| Component | Change |
-|-----------|--------|
-| `QEtnaviv2dScreen` | `mmap` the dumb BOs at allocation (`DRM_IOCTL_MODE_MAP_DUMB`); expose the CPU pointer alongside `m_fb[]`. |
-| `QEtnaviv2dBackingStore` | In SW mode: hold a plain `QImage` as the paint target. In `flush()`: `memcpy` dirty rect into the scanout BO mmap; skip `etna2d_blit` / `etna2d_finish`. |
-| `QEtnaviv2dIntegration` | If SW mode: skip `etna2d_device_open` + `setGlobalContext`; construct screen in a no-GPU state. |
+**This step also de-risks D11.** The custom dmabuf client written here
+implements the exact same `linux-dmabuf-v1` + `wl_buffer_release` lifecycle
+that the QPA's future Wayland transport (D11) will use. When D11 comes, the
+QPA's `flush()` replaces its `isStub()` early-return with this proven transport;
+only the buffer source changes (GC520 `etna2d_surface` ARGB BO instead of NV12
+ring). The Weston plane-promotion path, protocol wiring, and buffer-release
+discipline proven here are reused verbatim.
 
-**Trigger:** `QT_ETNAVIV2D_SW=1` env var (or equivalently `render=none` QPA
-arg).  No new files.  `libetna2d`, the blitter, and the atomic KMS path are
-untouched.
+#### Buildroot config required
 
-**What the comparison measures:**
+| Config symbol | Purpose |
+|---|---|
+| `BR2_PACKAGE_WESTON` | Weston compositor; auto-selects `WAYLAND`, `WAYLAND_PROTOCOLS`, `LIBDRM`, `XKEYBOARD_CONFIG` |
+| `BR2_PACKAGE_WESTON_DRM` | DRM backend — mandatory for hardware plane promotion |
+| `BR2_PACKAGE_WESTON_SHELL_KIOSK` | Kiosk shell — fullscreen surface per output, aggressive plane promotion, embedded-appliance idiom |
+| `BR2_PACKAGE_WESTON_SIMPLE_CLIENTS` | Optional: `weston-simple-dmabuf-*` for a stock dmabuf sanity check before our client |
+
+Not required for Step 6 (deferred to D11 / two-client phase):
+- `qt5wayland` — Qt Wayland QPA plugin (deferred with D11)
+- `BR2_PACKAGE_GST1_PLUGINS_BAD_PLUGIN_WAYLAND` — `waylandsink` (deferred to VPU-ready path, see future hint below)
+
+#### Client: `compositor/tests/test_weston/`
+
+A small custom Wayland client — the faithful mirror of Step 4's
+`test_composite`. Reuses the 3-buffer NV12 discipline (`m_staged`/`m_onScreen`,
+`pickFree()`) and the same `.raw` file source, but presents each frame via
+`wl_surface` + `linux-dmabuf-v1` instead of `attachPrimaryFb()`. No VPU or
+codec required.
 
 ```
-our SW mode   =  CPU paint  +  memcpy  +  vblank wait
-our GPU mode  =  GPU paint  +  etna2d_blit  +  etna2d_finish  +  vblank wait
-linuxfb       =  CPU paint  (direct fb0 mmap write, no copy, no vblank)
+weston --backend=drm --shell=kiosk \
+       --logger-scopes=drm-backend &
+
+./test_weston \
+    --raw-video=./images/earth_nv12_1024x600.raw \
+    --video-size=1024x600 [--video-fps=30] [--frames=N] [--verbose]
 ```
 
-The `memcpy` (width × height × 4 bytes) is the one overhead SW mode adds over
-linuxfb; it can be timed independently to isolate the display-step cost.
+Key transport differences from `test_composite`:
 
-**Not a regression risk:** SW mode is an opt-in path; the default GPU path and
-all existing tests are unaffected.
+| Step 4 (`test_composite`) | Step 6 (`test_weston`) |
+|---|---|
+| `drmModeAddFB2` → `attachPrimaryFb()` | `zwp_linux_dmabuf_v1_create_params` → `wl_buffer` |
+| `pageFlip()` in QPA (single atomic commit) | `wl_surface_attach` + `wl_surface_commit` |
+| Release: `setPrimaryReleaseCallback()` | Release: `wl_buffer_release` event |
+| Qt is DRM master | Weston is DRM master; client has no KMS access |
+
+**D11 integration boundary (for reference):**
+
+```
+Step 6 client:     NV12 BO (.raw memcpy) → dmabuf → linux-dmabuf-v1
+                       → Weston (kiosk DRM) → primary plane
+
+D11 QPA flush():   ARGB BO (etna2d_blit output) → dmabuf → linux-dmabuf-v1
+                       → Weston (kiosk/desktop DRM) → overlay plane
+                       ↑ same transport code, different BO source + plane
+```
+
+The `isStub()` guard in `qetnaviv2dbackingstore.cpp:flush()` is replaced by:
+1. export completed `etna2d_surface` BO as dmabuf fd
+2. `zwp_linux_dmabuf_v1_create_params` → `wl_buffer` (reuse Step 6 helpers)
+3. `wl_surface_attach` + `wl_surface_commit` (replacing `pageFlip()`)
+
+`EtnaBlittable`, `etna2d_blit`, `etna2d_finish` above that line are untouched.
+
+**Future hint (VPU-ready path, not built now):**
+Once the VPU decoder + GStreamer dmabuf pipeline is available, replace the
+`.raw`-file client with:
+```
+gst-launch-1.0 filesrc location=video.h264 ! h264parse ! vpudec ! \
+    video/x-raw,format=NV12 ! waylandsink
+```
+(`waylandsink` from `gst1-plugins-bad`, `BR2_PACKAGE_GST1_PLUGINS_BAD_PLUGIN_WAYLAND`)
+Same Weston plane-promotion path, no client code changes needed.
+
+#### Pass criteria
+
+| Criterion | Evidence |
+|---|---|
+| NV12 surface promoted to hardware plane (not GL-composited) | Weston `drm-backend` debug log: surface assigned to a hardware plane, not the renderer |
+| Kernel confirms NV12 FB on primary plane | `/sys/kernel/debug/dri/0/state`: primary plane `FB_ID` matches the client's NV12 FB |
+| Tear-free playback at source rate | Visual inspection |
+
+#### Checklist
+
+- [ ] Buildroot image built with `WESTON`, `WESTON_DRM`, `WESTON_SHELL_KIOSK`
+- [ ] Weston boots on MA35D1 with DRM backend, kiosk shell, no crash
+- [ ] `test_weston` client connects, creates `wl_surface` + `linux-dmabuf-v1`
+      buffers from NV12 dumb BOs, submits frames at target fps
+- [ ] Weston `drm-backend` log confirms hardware plane assignment
+- [ ] `/sys/kernel/debug/dri/0/state` cross-check confirms NV12 FB on primary
+- [ ] Tear-free playback passes visual inspection
+- [ ] `wl_buffer_release` fires correctly; 3-buffer ring never exhausts
+
+**Deferred (two-client phase, alongside D11):**
+- Qt-etnaviv2d app as a second Weston client (overlay plane) — needs
+  `qt5wayland` + the D11 QPA Wayland transport.
+- GStreamer `waylandsink` path — needs VPU decoder driver.
 
 ---
 
@@ -584,6 +662,8 @@ all existing tests are unaffected.
 - `compositor/tests/test_composite/` — split-plane video+UI test (single-owner,
   single-committer, `plane=composite`). `compositor/tests/test_alpha_blend/`
   retained as the Step 3 blend-correctness regression (two-instance shared-fd).
+- `compositor/tests/test_weston/` — Step 6 Wayland dmabuf client; mirrors
+  `test_composite`'s 3-buffer NV12 discipline over `linux-dmabuf-v1` + Weston.
 - `compositor/plan.md` — this document.
 
 ---
@@ -602,20 +682,26 @@ all existing tests are unaffected.
 - `test_composite` covering the single-committer split-plane path (video on
   primary + blended UI on overlay, one atomic commit); `test_alpha_blend`
   retained for the overlay-blend rung; `plane=primary` for the regression rung.
+- `test_weston` proving Weston hardware-plane promotion of a Wayland dmabuf
+  surface; de-risks D11 and validates the Phase-3 transport model.
 
 ### v2 (deferred — implement last, in this order)
 
-1. **Zero-copy dmabuf video import** — GStreamer dmabuf `appsink` →
-   `drmModeAddFB2WithModifiers`, no CPU copy. **Gated on the VPU/KMS driver
-   being ready** (D2). Highest-value v2 item.
+1. **Zero-copy dmabuf video import** — GStreamer dmabuf `appsink` / `waylandsink`
+   → `drmModeAddFB2WithModifiers`, no CPU copy. **Gated on the VPU/KMS driver
+   being ready** (D2). Highest-value v2 item. Under Weston: `waylandsink` feeds
+   NV12 dmabuf buffers directly; the `test_weston` `.raw`-file client is retired.
 2. **Sub-rectangle overlay** — `--ui-rect=WxH+X+Y` driving both overlay
    position and Qt screen geometry; UI as a positioned panel, video
    full-screen behind (D5).
-3. **Wayland transport + Weston multi-process** — adapt `QEtnaviv2dScreen`'s
-   transport layer to present via `wl_surface` + `linux-dmabuf-v1` instead of
-   direct KMS. `EtnaBlittable` and `libetna2d` are **unchanged** — GC520 GPU
-   ops are preserved. Qt and GStreamer become Wayland clients; Weston owns
-   plane assignment (Phase 3, D11). The `wayland` handoff stub is the seam.
+3. **Wayland transport + Weston multi-process (D11)** — adapt
+   `QEtnaviv2dScreen::flush()` to present via `wl_surface` + `linux-dmabuf-v1`
+   instead of direct KMS (replace the `isStub()` early-return). `EtnaBlittable`
+   and `libetna2d` are **unchanged** — GC520 GPU ops are preserved. Requires
+   `qt5wayland` buildroot package. Transport helpers proven in Step 6
+   (`test_weston`) are reused verbatim; only the buffer source changes
+   (`etna2d_surface` ARGB BO instead of NV12 ring). Qt and GStreamer become
+   Weston clients; Weston owns plane assignment (Phase 3).
 
 Explicit **non-goals** (not v1, not v2): DRM-lease multi-process (two raw-KMS
 processes on one card) — superseded by the Wayland compositor path (D4).
@@ -643,8 +729,12 @@ processes on one card) — superseded by the Wayland compositor path (D4).
 | D14 | Add `PlaneMode::Composite` rather than overloading `plane=primary`. | `Composite` enumerates both planes and holds two plane-prop sets + two BO rings; overloading `primary` would make its behaviour depend on whether the video path happens to call `attachPrimaryFb()`, muddying the single-plane regression/isolation modes (`primary`, `overlay`, D6). A distinct mode keeps single-plane semantics clean. |
 | D15 | Write Step 4's `test_composite` **fresh**; keep Step 3's `test_alpha_blend` unchanged as a blend-correctness regression. | `test_alpha_blend`'s structure *is* the two-instance model D13 rejects; refactoring it into the single-committer shape would churn already-passing code and lose the standalone record that shared-fd two-instance blending works. Two tests, two purposes. |
 | D16 | `test_composite` drives the screen through the **QPA plugin** (`plane=composite`, real backing store), **not** by directly constructing the screen (the Step 3 approach). | Step 4's whole point is "a single Qt process drives both planes *through the QPA*." Direct-construct bypasses the integration/backing-store path a real app uses. The test is a plain Qt-widgets app resolving the screen via `QGuiApplication::primaryScreen()->handle()`. |
-| D17 | Primary video source is a **synthetic NV12 generator** by default (moving hard vertical edge = tear detector); `--video=FILE` GStreamer is optional. | The thing under test is the single-commit dual-plane path + D9b buffer discipline, not GStreamer. Synthetic gives a deterministic, no-codec-dep, rate-adjustable stimulus that can deliberately stress producer-faster-than-vblank and static-UI cases. GStreamer stays as a realism check. |
+| D17 | Primary video source is a **`.raw` pre-decoded NV12 file** (`--raw-video=FILE`); GStreamer `appsink`/`waylandsink` = v2 (D2). | The thing under test is the single-commit dual-plane path + D9b buffer discipline, not GStreamer. Raw-file `memcpy` is deterministic, codec-free, and rate-adjustable. GStreamer stays as the v2 realism check gated on the VPU driver. |
 | D18 | Screen's video-facing public API is exactly two entry points: `attachPrimaryFb()` (stage + D12 wake) and `setPrimaryReleaseCallback()` (fires the retired `fbId` on the flip-drain thread; test clears an **atomic** `on_screen` bit). The **test owns the NV12 ring**; the screen only stages, commits, and reports release. | Keeps the composite commit code untouched by the test (your "not surgery on the composite commit code"). Both entry points map 1:1 to Wayland (`linux-dmabuf-v1` stage / `wl_buffer.release`), so the test is transport-agnostic. Atomic release bit avoids cross-thread marshalling while honouring the `m_flipMutex` discipline. |
+| D19 | Step 6 drops the original SW-render CPU-vs-GPU benchmark and replaces it with a **Weston plane-promotion gate** (`test_weston` custom dmabuf Wayland client). | SW-render would add a `memcpy` cost likely making it *worse* than the GPU path — not actionable. The Weston gate proves the Phase-3 transport model and de-risks D11 with bounded scope. |
+| D20 | Step 6 uses **kiosk-shell** (`BR2_PACKAGE_WESTON_SHELL_KIOSK`). | Embedded-appliance idiom; fullscreen surface per output → aggressive hardware plane promotion by Weston's DRM backend. Matches the product's use case. Desktop-shell adds chrome/arbitration complexity not needed for the single-client gate. |
+| D21 | Step 6 is a **single-client** gate (video only via `test_weston`). Two-client arbitration (Qt UI on overlay + video on primary, both as Weston clients) is deferred alongside D11. | Single-client proves the decisive claim — NV12 dmabuf → hardware plane — with minimal scope. Two-client requires the D11 QPA Wayland transport and `qt5wayland`, which are v2 work. |
+| D22 | Step 6 uses a **custom dmabuf Wayland client** (`test_weston`) rather than stock `gst-launch waylandsink`. | `waylandsink` fed `filesrc ! rawvideoparse` may silently fall back to SHM buffers (no plane promotion). The custom client uses dumb BOs exported as dmabuf via `linux-dmabuf-v1`, guaranteeing plane-promotion eligibility. It also directly mirrors Step 4's 3-buffer NV12 ring, making the transport code reusable for D11. Future: `waylandsink` replaces the `.raw` client once the VPU decoder driver is ready. |
 
 ### Risks — final status
 
