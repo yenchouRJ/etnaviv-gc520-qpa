@@ -331,6 +331,16 @@ bool QEtnaviv2dScreen::initialize()
             return false;
         }
         resolvePlaneProps(m_planeId, m_planeProps);
+        /* Overlay-only mode: also resolve the primary plane so we can add a
+         * black placeholder when bringing the CRTC up from a cold/torn-down
+         * state.  Most DRM drivers require the primary plane to have a valid
+         * FB when ACTIVE is set to 1.  m_primaryPlaneId stays 0 if there is
+         * no primary (unusual), in which case we skip the placeholder. */
+        if (m_planeMode == PlaneMode::Overlay) {
+            m_primaryPlaneId = findPlaneByType(DRM_PLANE_TYPE_PRIMARY);
+            if (m_primaryPlaneId)
+                resolvePlaneProps(m_primaryPlaneId, m_primaryPlaneProps);
+        }
     }
 
     if (!m_planeProps.fb_id || !m_planeProps.crtc_id ||
@@ -497,6 +507,48 @@ bool QEtnaviv2dScreen::initialize()
             drmModeAtomicAddProperty(req, m_primaryPlaneId, m_primaryPlaneProps.crtc_w, w);
             drmModeAtomicAddProperty(req, m_primaryPlaneId, m_primaryPlaneProps.crtc_h, h);
             flags |= DRM_MODE_ATOMIC_ALLOW_MODESET; /* primary needs modeset too */
+        }
+        /* Overlay-only mode: add a black ARGB placeholder on the primary plane
+         * whenever the primary is unattached (fb=0 / crtc=null), regardless of
+         * whether the CRTC was already active.  This covers two cases:
+         *   (a) CRTC inactive (cold start): primary placeholder + ACTIVE=1
+         *   (b) CRTC active but primary detached (e.g. Weston exit leaves
+         *       planes with crtc=null): plane-only re-attachment of primary.
+         * Without a valid primary FB the MA35D1 display engine does not
+         * scanout the overlay even if the overlay plane itself is set up. */
+        if (m_planeMode == PlaneMode::Overlay
+                && m_primaryPlaneId && m_primaryPlaneProps.fb_id) {
+            /* Check whether primary is currently attached.  If its CRTC_ID
+             * prop is 0 we must (re-)attach it, which requires ALLOW_MODESET. */
+            bool primaryDetached = true;
+            {
+                drmModeObjectProperties *pp = drmModeObjectGetProperties(
+                        m_kfd, m_primaryPlaneId, DRM_MODE_OBJECT_PLANE);
+                if (pp) {
+                    for (uint32_t i = 0; i < pp->count_props; ++i) {
+                        if (pp->props[i] == m_primaryPlaneProps.crtc_id) {
+                            primaryDetached = (pp->prop_values[i] == 0);
+                            break;
+                        }
+                    }
+                    drmModeFreeObjectProperties(pp);
+                }
+            }
+            if (primaryDetached) {
+                drmModeAtomicAddProperty(req, m_primaryPlaneId, m_primaryPlaneProps.fb_id,   m_fb[m_frontIdx].fb_id);
+                drmModeAtomicAddProperty(req, m_primaryPlaneId, m_primaryPlaneProps.crtc_id, m_crtcId);
+                drmModeAtomicAddProperty(req, m_primaryPlaneId, m_primaryPlaneProps.src_x,  0);
+                drmModeAtomicAddProperty(req, m_primaryPlaneId, m_primaryPlaneProps.src_y,  0);
+                drmModeAtomicAddProperty(req, m_primaryPlaneId, m_primaryPlaneProps.src_w,  (uint64_t)w << 16);
+                drmModeAtomicAddProperty(req, m_primaryPlaneId, m_primaryPlaneProps.src_h,  (uint64_t)h << 16);
+                drmModeAtomicAddProperty(req, m_primaryPlaneId, m_primaryPlaneProps.crtc_x, 0);
+                drmModeAtomicAddProperty(req, m_primaryPlaneId, m_primaryPlaneProps.crtc_y, 0);
+                drmModeAtomicAddProperty(req, m_primaryPlaneId, m_primaryPlaneProps.crtc_w, w);
+                drmModeAtomicAddProperty(req, m_primaryPlaneId, m_primaryPlaneProps.crtc_h, h);
+                flags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
+                SCR_INFO << "Overlay: primary plane" << m_primaryPlaneId
+                         << "detached — seeding black ARGB placeholder (ALLOW_MODESET)";
+            }
         }
         int rc = drmModeAtomicCommit(m_kfd, req, flags, nullptr);
         drmModeAtomicFree(req);
