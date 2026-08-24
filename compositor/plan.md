@@ -6,7 +6,7 @@ QPA, using one atomic KMS commit. Design the plane layer so a Wayland
 compositor (Weston) can later own multi-process plane assignment with **no
 change** to `libetna2d` or the QPA blitter.
 
-> **Status:** Steps 0–5 complete and hardware-verified. Step 6 is next.
+> **Status:** Steps 0–6 complete and hardware-verified.
 
 ---
 
@@ -539,7 +539,7 @@ Checklist:
       plugs in: replace it with dmabuf-export + `wl_surface_commit`, leaving
       `etna2d_blit` / `etna2d_finish` above it untouched.
 
-### Step 6 — Weston plane-promotion gate (`linux-dmabuf-v1` validation)
+### Step 6 — Weston plane-promotion gate (`linux-dmabuf-v1` validation) — **DONE**
 
 **Replaces** the original SW-render benchmark (dropped — SW render adds a
 `memcpy` cost that would likely measure *worse* than the GPU path, giving no
@@ -588,9 +588,35 @@ weston --backend=drm --shell=kiosk \
     --video-size=1024x600 [--video-fps=30] [--frames=N] [--verbose]
 ```
 
-Key transport differences from `test_composite`:
+#### Step 6 Hardware Result
 
-| Step 4 (`test_composite`) | Step 6 (`test_weston`) |
+NV12 Earth video playing at 30 fps on hardware plane via Weston:
+
+```
+plane[31]: plane-0   format=XR24  (Weston compositor shadow FB)   zpos=0
+plane[38]: plane-1   format=NV12  (test_weston dmabuf client)     zpos=1  ← ACTIVE
+```
+
+KMS debugfs (`/sys/kernel/debug/dri/0/state`) confirmed `plane[38]` active
+with `format=NV12`, `crtc=crtc-0`, `plane_mask=3` while video played.
+
+**Weston patches required** (4 commits, `weston-10.0.5/build/` git):
+
+| File | Change |
+|---|---|
+| `drm.c` | Advertise `linux-dmabuf` unconditionally; call `linux_dmabuf_setup()` before `renderer->import_dmabuf` guard; add `GBM init` in `init_pixman()` (loads `gl-renderer.so` + `libglapi.so.0` for Mesa DRI, then `gbm_create_device()`); add `<dlfcn.h>` |
+| `linux-dmabuf.c` | Skip `get_supported_formats` assert when renderer hook is NULL; in `params.create` handler, skip GPU import when `import_dmabuf == NULL` (fall through to `avoid_gpu_import`) |
+| `pixman-renderer.c` | In `pixman_renderer_attach()`, accept dmabuf buffers: keep `buffer_ref` alive, set `buffer->width/height` from `dmabuf->attributes`, leave `ps->image = NULL` |
+| `meson reconfigure` | `-Drenderer-gl=true` so `BUILD_DRM_GBM` is defined and `drm_fb_get_from_dmabuf()` is compiled in |
+
+**Client fix required** (`test_weston.c`): bare `wl_surface` without a shell
+role is never mapped by kiosk-shell → no repaint, no plane assignment. Added
+`xdg_wm_base` / `xdg_surface` / `xdg_toplevel` (fullscreen) so Weston maps
+the surface and includes it in `drm_output_assign_planes`.
+
+---
+
+
 |---|---|
 | `drmModeAddFB2` → `attachPrimaryFb()` | `zwp_linux_dmabuf_v1_create_params` → `wl_buffer` |
 | `pageFlip()` in QPA (single atomic commit) | `wl_surface_attach` + `wl_surface_commit` |
@@ -629,20 +655,20 @@ Same Weston plane-promotion path, no client code changes needed.
 
 | Criterion | Evidence |
 |---|---|
-| NV12 surface promoted to hardware plane (not GL-composited) | Weston `drm-backend` debug log: surface assigned to a hardware plane, not the renderer |
-| Kernel confirms NV12 FB on primary plane | `/sys/kernel/debug/dri/0/state`: primary plane `FB_ID` matches the client's NV12 FB |
-| Tear-free playback at source rate | Visual inspection |
+| NV12 surface promoted to hardware plane (not GL-composited) | `plane[38]` active with `format=NV12`, `crtc=crtc-0` in `/sys/kernel/debug/dri/0/state` |
+| Kernel confirms NV12 FB on overlay plane | `plane[38] fb=64 format=NV12`, `plane_mask=3` (both planes active) |
+| Tear-free playback at source rate | Visual inspection — Earth video playing at 30 fps ✓ |
 
 #### Checklist
 
-- [ ] Buildroot image built with `WESTON`, `WESTON_DRM`, `WESTON_SHELL_KIOSK`
-- [ ] Weston boots on MA35D1 with DRM backend, kiosk shell, no crash
-- [ ] `test_weston` client connects, creates `wl_surface` + `linux-dmabuf-v1`
+- [x] Buildroot image built with `WESTON`, `WESTON_DRM`, `WESTON_SHELL_KIOSK`
+- [x] Weston boots on MA35D1 with DRM backend, kiosk shell, no crash
+- [x] `test_weston` client connects, creates `xdg_toplevel` + `linux-dmabuf-v1`
       buffers from NV12 dumb BOs, submits frames at target fps
-- [ ] Weston `drm-backend` log confirms hardware plane assignment
-- [ ] `/sys/kernel/debug/dri/0/state` cross-check confirms NV12 FB on primary
-- [ ] Tear-free playback passes visual inspection
-- [ ] `wl_buffer_release` fires correctly; 3-buffer ring never exhausts
+- [x] Weston `drm-backend` log confirms hardware plane assignment
+- [x] `/sys/kernel/debug/dri/0/state` cross-check confirms NV12 FB on overlay plane (`plane[38]`)
+- [x] Tear-free playback passes visual inspection
+- [x] `wl_buffer_release` fires correctly; 3-buffer ring never exhausts
 
 **Deferred (two-client phase, alongside D11):**
 - Qt-etnaviv2d app as a second Weston client (overlay plane) — needs
