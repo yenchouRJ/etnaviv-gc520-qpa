@@ -1,17 +1,24 @@
 /*
  * qetnaviv2dbackingstore.cpp — Backing store implementation.
  *
- * flush() sequence:
+ * flush() sequence (KMS modes):
  *  1. Unlock the blittable (drains any pending CPU writes + GPU fence).
  *  2. etna2d_blit(): copy the entire backing BO into the scanout back-buffer.
- *     Only the dirty region needs to be copied; we blit the union of the
- *     dirty rects for simplicity in v1.
  *  3. etna2d_finish(): wait for the GPU blit to complete before flip.
  *  4. screen->pageFlip(): display the back-buffer (blocks for vblank).
+ *
+ * flush() sequence (Wayland mode):
+ *  1. Unlock the blittable.
+ *  2. Get the current free ring BO from the transport.
+ *  3. etna2d_blit(): copy the backing BO into the ring BO.
+ *  4. etna2d_finish(): wait for the GPU blit.
+ *  5. transport->commitFrame(): mark dirty; actual wl_surface_attach+commit
+ *     happens in the next wl_surface.frame callback (vsync-aligned).
  *
  * Reference: src/plugins/platforms/directfb/qdirectfbbackingstore.cpp
  */
 #include "qetnaviv2dbackingstore.h"
+#include "qetnaviv2dwaylandtransport.h"
 
 #include <QDebug>
 #include <qpa/qwindowsysteminterface.h>
@@ -31,11 +38,14 @@ static bool bsDebug()
  * Construction / destruction
  * ----------------------------------------------------------------------- */
 QEtnaviv2dBackingStore::QEtnaviv2dBackingStore(QWindow *window,
-                                               QEtnaviv2dScreen *screen)
+                                               QEtnaviv2dScreen *screen,
+                                               QEtnaviv2dWaylandTransport *transport)
     : QPlatformBackingStore(window)
     , m_screen(screen)
+    , m_transport(transport)
 {
-    BS_DBG << "created for window" << window;
+    BS_DBG << "created for window" << window
+           << (transport ? "(wayland mode)" : "(KMS mode)");
     /* Allocate initial backing surface sized to the window. */
     resize(window->size(), QRegion());
 }
@@ -82,7 +92,7 @@ void QEtnaviv2dBackingStore::resize(const QSize &size,
 }
 
 /* -----------------------------------------------------------------------
- * flush — blit backing BO → scanout back-buffer, then page-flip
+ * flush — blit backing BO → target back-buffer, then page-flip or commit
  * ----------------------------------------------------------------------- */
 void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
                                    const QRegion &region,
@@ -95,15 +105,52 @@ void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
         return;
     }
 
-    EtnaBlittable *blitter    = m_pmdata->etnaBlittable();
-    etna2d_context *ctx       = blitter->context();
+    EtnaBlittable *blitter      = m_pmdata->etnaBlittable();
+    etna2d_context *ctx         = blitter->context();
     etna2d_surface *backingSurf = blitter->surface();
+
+    /* ---- Wayland mode: blit into the ring BO, hand off to transport ---- */
+    if (m_transport) {
+        etna2d_surface *ringBo = m_transport->currentBo();
+        if (!ringBo) {
+            /* All ring slots are in use — Weston hasn't released any yet.
+             * Drop the frame (back-pressure): Qt will repaint on the next
+             * frame callback when a slot is released. */
+            BS_DBG << "flush: wayland ring full — dropping frame (back-pressure)";
+            return;
+        }
+
+        /* 1. Unlock backing surface */
+        blitter->unlock();
+
+        /* 2. GPU blit full backing surface into the ring BO */
+        int w = etna2d_surface_width(backingSurf);
+        int h = etna2d_surface_height(backingSurf);
+        BS_DBG << "flush(wayland): blit" << w << "x" << h << "→ ring BO" << ringBo;
+
+        etna2d_blit(ctx,
+                    backingSurf, 0, 0,
+                    ringBo,      0, 0,
+                    w, h,
+                    ETNA2D_BLEND_NONE, ETNA2D_ROP_COPY);
+
+        /* 3. Wait for GPU blit */
+        if (etna2d_finish(ctx) != ETNA2D_OK) {
+            BS_WARN << "flush(wayland): etna2d_finish failed";
+            return;
+        }
+
+        /* 4. Hand off to transport — frame-callback will commit */
+        m_transport->commitFrame(ringBo);
+        return;
+    }
+
+    /* ---- KMS modes: existing path ---- */
     etna2d_surface *scanoutBack = m_screen->backSurface();
 
     if (!scanoutBack) {
-        /* In wayland stub mode there is no KMS scanout surface — this is
-         * expected and silent.  Any other mode with a missing back surface
-         * is a real error. */
+        /* isStub() with no transport — shouldn't happen after Milestone B,
+         * but guard it just in case. */
         if (!m_screen->isStub())
             BS_WARN << "flush: no scanout back surface";
         return;
@@ -113,21 +160,10 @@ void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
     blitter->unlock();
 
     /* 2. GPU blit the full backing surface into the scanout back-buffer.
-     *
-     *    We do NOT use the dirty region here.  With double-buffering the back
-     *    buffer contains stale content from two frames ago; blitting only the
-     *    dirty rect leaves the remainder of the back buffer with that stale
-     *    image, causing "ghosting" when widgets move (e.g. moveblocks).
-     *
-     *    A full-surface blit costs one DE submit (~3µs fixed cost + pixel fill
-     *    time) which is identical to the dirty-region path for full-screen
-     *    repaints and only marginally more expensive for small dirty regions.
-     *    The optimisation can be re-introduced later using a "shadow back"
-     *    copy-on-flip scheme.
-     */
+     *    Full blit avoids ghosting with double-buffering (stale back buffer). */
     int surfW = etna2d_surface_width(backingSurf);
     int surfH = etna2d_surface_height(backingSurf);
-    BS_DBG << "flush: full blit" << surfW << "x" << surfH
+    BS_DBG << "flush(KMS): full blit" << surfW << "x" << surfH
            << "(dirty=" << region.boundingRect() << "ignored for correctness)";
 
     etna2d_blit(ctx,
@@ -138,13 +174,13 @@ void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
 
     /* 3. Wait for GPU blit to complete before handing the buffer to display. */
     if (etna2d_finish(ctx) != ETNA2D_OK) {
-        BS_WARN << "flush: etna2d_finish failed";
+        BS_WARN << "flush(KMS): etna2d_finish failed";
         return;
     }
 
     /* 4. Page-flip (blocks until vblank). */
     if (m_screen->pageFlip() != 0)
-        BS_WARN << "flush: pageFlip failed";
+        BS_WARN << "flush(KMS): pageFlip failed";
 }
 
 /* -----------------------------------------------------------------------
@@ -172,15 +208,12 @@ bool QEtnaviv2dBackingStore::scroll(const QRegion &area, int dx, int dy)
 
     for (const QRect &r : area) {
         if (r.isEmpty()) continue;
-        /* Blit-within-surface: src and dst may overlap; safe because the DE
-         * reads the full source before writing any dest pixel. */
         etna2d_blit(ctx,
                     surf, r.x(),      r.y(),
                     surf, r.x() + dx, r.y() + dy,
                     r.width(), r.height(),
                     ETNA2D_BLEND_NONE, ETNA2D_ROP_COPY);
     }
-    /* Flush scroll ops so they are visible before the next paint. */
     etna2d_flush(ctx);
 
     BS_DBG << "scroll" << area.boundingRect() << "dx=" << dx << "dy=" << dy;

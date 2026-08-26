@@ -156,6 +156,11 @@ public:
      * silently instead of spamming "no scanout back surface" warnings. */
     bool isStub() const { return m_planeMode == PlaneMode::Wayland; }
 
+    /* Update screen geometry after the Wayland configure round-trip.
+     * Only meaningful in plane=wayland mode; updates mGeometry + mPhysicalSize
+     * and notifies Qt so the window system sees the correct output size. */
+    void setWaylandGeometry(const QRect &geo);
+
     /* ---- Composite-mode video API (plane=composite only) ---- */
 
     /*

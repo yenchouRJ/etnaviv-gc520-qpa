@@ -5,6 +5,10 @@
  * and the backing store).  Creates the KMS screen and wires all Qt platform
  * hooks.
  *
+ * In plane=wayland mode, also owns a QEtnaviv2dWaylandTransport instance that
+ * replaces the KMS transport.  The screen is still created (for QFbScreen
+ * geometry/format state) but does no KMS ops.
+ *
  * Modelled on QLinuxFbIntegration (linuxfb) + QDirectFbIntegration (directfb).
  */
 #ifndef QETNAVIV2DINTEGRATION_H
@@ -21,6 +25,7 @@ extern "C" {
 QT_BEGIN_NAMESPACE
 
 class QEtnaviv2dScreen;
+class QEtnaviv2dWaylandTransport;
 class QFbVtHandler;
 
 class QEtnaviv2dIntegration : public QPlatformIntegration,
@@ -50,6 +55,9 @@ public:
     QPlatformServices      *services()     const override;
     QPlatformNativeInterface *nativeInterface() const override;
 
+    /* Wayland transport accessor — used by BackingStore in wayland mode. */
+    QEtnaviv2dWaylandTransport *waylandTransport() const { return m_waylandTransport; }
+
 private:
     void createInputHandlers();
 
@@ -60,7 +68,8 @@ private:
     etna2d_context *m_etnaCtx = nullptr;
 
     /* Display. */
-    QEtnaviv2dScreen *m_screen = nullptr;  /* owned */
+    QEtnaviv2dScreen            *m_screen           = nullptr; /* owned by Qt after handleScreenAdded */
+    QEtnaviv2dWaylandTransport  *m_waylandTransport = nullptr; /* owned; non-null in wayland mode only */
 
     QScopedPointer<QPlatformFontDatabase> m_fontDb;
     QScopedPointer<QPlatformServices>     m_services;
@@ -71,3 +80,4 @@ private:
 QT_END_NAMESPACE
 
 #endif // QETNAVIV2DINTEGRATION_H
+

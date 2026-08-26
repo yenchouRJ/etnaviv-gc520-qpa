@@ -38,17 +38,19 @@ qtHaveModule(kms_support-private): QT += kms_support-private
 qtHaveModule(input_support-private): QT += input_support-private
 
 SOURCES = \
-    main.cpp                    \
-    qetnaviv2dintegration.cpp   \
-    qetnaviv2dscreen.cpp        \
-    qetnaviv2dblitter.cpp       \
-    qetnaviv2dbackingstore.cpp
+    main.cpp                         \
+    qetnaviv2dintegration.cpp        \
+    qetnaviv2dscreen.cpp             \
+    qetnaviv2dblitter.cpp            \
+    qetnaviv2dbackingstore.cpp       \
+    qetnaviv2dwaylandtransport.cpp
 
 HEADERS = \
-    qetnaviv2dintegration.h     \
-    qetnaviv2dscreen.h          \
-    qetnaviv2dblitter.h         \
-    qetnaviv2dbackingstore.h
+    qetnaviv2dintegration.h          \
+    qetnaviv2dscreen.h               \
+    qetnaviv2dblitter.h              \
+    qetnaviv2dbackingstore.h         \
+    qetnaviv2dwaylandtransport.h
 
 INCLUDEPATH += $$PWD
 
@@ -64,6 +66,66 @@ INCLUDEPATH += $$KMS_INCDIR
 
 # libdrm (BO alloc, PRIME, etnaviv cmd_stream, KMS ioctls) — present in sysroot
 LIBS += -ldrm -ldrm_etnaviv
+
+# -----------------------------------------------------------------------
+# Wayland protocol code generation (Milestone B)
+#
+# wayland-scanner is a host tool; the XMLs live in the sysroot's
+# wayland-protocols datadir.  We generate two C sources + two headers:
+#   xdg-shell              (xdg_wm_base / xdg_surface / xdg_toplevel)
+#   linux-dmabuf-unstable-v1 (zwp_linux_dmabuf_v1)
+#
+# The generated files land in the qmake build directory ($$OUT_PWD) so
+# they are never committed.  Header-only .h rules use variable_out=HEADERS
+# so moc/compiler picks them up; .c rules use variable_out=SOURCES.
+# -----------------------------------------------------------------------
+WL_SCANNER   = $$system(which wayland-scanner 2>/dev/null)
+isEmpty(WL_SCANNER) {
+    WL_SCANNER = /home/joeylu/Documents/workspace/ma35d1/ma35d1_br24_qt5/output/host/bin/wayland-scanner
+}
+WL_PROTO_DIR = /home/joeylu/Documents/workspace/ma35d1/ma35d1_br24_qt5/output/host/aarch64-nuvoton-linux-gnu/sysroot/usr/share/wayland-protocols
+
+# xdg-shell — private-code (C source)
+xdg_shell_src.name   = xdg-shell-protocol.c
+xdg_shell_src.input  = XDG_SHELL_XML
+xdg_shell_src.output = xdg-shell-protocol.c
+xdg_shell_src.commands = $$WL_SCANNER private-code ${QMAKE_FILE_IN} ${QMAKE_FILE_OUT}
+xdg_shell_src.variable_out = SOURCES
+QMAKE_EXTRA_COMPILERS += xdg_shell_src
+XDG_SHELL_XML = $$WL_PROTO_DIR/stable/xdg-shell/xdg-shell.xml
+
+# xdg-shell — client-header (H header)
+xdg_shell_hdr.name   = xdg-shell-client-protocol.h
+xdg_shell_hdr.input  = XDG_SHELL_XML
+xdg_shell_hdr.output = xdg-shell-client-protocol.h
+xdg_shell_hdr.commands = $$WL_SCANNER client-header ${QMAKE_FILE_IN} ${QMAKE_FILE_OUT}
+xdg_shell_hdr.variable_out = HEADERS
+QMAKE_EXTRA_COMPILERS += xdg_shell_hdr
+
+# linux-dmabuf-unstable-v1 — private-code (C source)
+dmabuf_src.name   = linux-dmabuf-unstable-v1-protocol.c
+dmabuf_src.input  = DMABUF_XML
+dmabuf_src.output = linux-dmabuf-unstable-v1-protocol.c
+dmabuf_src.commands = $$WL_SCANNER private-code ${QMAKE_FILE_IN} ${QMAKE_FILE_OUT}
+dmabuf_src.variable_out = SOURCES
+QMAKE_EXTRA_COMPILERS += dmabuf_src
+DMABUF_XML = $$WL_PROTO_DIR/unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml
+
+# linux-dmabuf-unstable-v1 — client-header (H header)
+dmabuf_hdr.name   = linux-dmabuf-unstable-v1-client-protocol.h
+dmabuf_hdr.input  = DMABUF_XML
+dmabuf_hdr.output = linux-dmabuf-unstable-v1-client-protocol.h
+dmabuf_hdr.commands = $$WL_SCANNER client-header ${QMAKE_FILE_IN} ${QMAKE_FILE_OUT}
+dmabuf_hdr.variable_out = HEADERS
+QMAKE_EXTRA_COMPILERS += dmabuf_hdr
+
+# Generated headers are in OUT_PWD — add to include path
+INCLUDEPATH += $$OUT_PWD
+
+# libwayland-client (target sysroot)
+SYSROOT = /home/joeylu/Documents/workspace/ma35d1/ma35d1_br24_qt5/output/host/aarch64-nuvoton-linux-gnu/sysroot
+LIBS += -L$$SYSROOT/usr/lib -lwayland-client
+INCLUDEPATH += $$SYSROOT/usr/include
 
 OTHER_FILES += etnaviv2d.json
 

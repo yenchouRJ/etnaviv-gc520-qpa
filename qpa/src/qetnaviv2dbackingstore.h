@@ -4,13 +4,11 @@
  * Strategy (option B, decided in plan.md):
  *  - paintDevice() returns a QPixmap backed by an EtnaBlittablePlatformPixmap
  *    (an offscreen GPU surface).  Qt paints into it via QBlitterPaintEngine.
- *  - flush() blits the offscreen backing BO into the current scanout back-
- *    buffer via etna2d_blit(), then calls screen->pageFlip().
- *
- * This keeps the flush path simple and avoids vsync/locking races that arise
- * from painting directly into the scanout BO.  A zero-copy upgrade (option A)
- * can be introduced later by replacing the offscreen surface with the scanout
- * surface in resize().
+ *  - flush() blits the offscreen backing BO into the current target back-buffer
+ *    via etna2d_blit(), then either:
+ *      (a) KMS modes: calls screen->pageFlip().
+ *      (b) Wayland mode: calls transport->commitFrame() which drives the
+ *          wl_surface.frame-callback paced commit to Weston.
  */
 #ifndef QETNAVIV2DBACKINGSTORE_H
 #define QETNAVIV2DBACKINGSTORE_H
@@ -23,17 +21,20 @@
 
 QT_BEGIN_NAMESPACE
 
+class QEtnaviv2dWaylandTransport;
+
 class QEtnaviv2dBackingStore : public QPlatformBackingStore
 {
 public:
     explicit QEtnaviv2dBackingStore(QWindow *window,
-                                    QEtnaviv2dScreen *screen);
+                                    QEtnaviv2dScreen *screen,
+                                    QEtnaviv2dWaylandTransport *transport = nullptr);
     ~QEtnaviv2dBackingStore() override;
 
     /* Qt paints into this device. */
     QPaintDevice *paintDevice() override;
 
-    /* Blit backing surface → scanout back-buffer, then page-flip. */
+    /* Blit backing surface → scanout/ring back-buffer, then page-flip or commit. */
     void flush(QWindow *window, const QRegion &region, const QPoint &offset) override;
 
     /* Reallocate the backing surface when the window is resized. */
@@ -46,11 +47,13 @@ public:
     bool scroll(const QRegion &area, int dx, int dy) override;
 
 private:
-    QEtnaviv2dScreen         *m_screen;  /* borrowed */
-    QScopedPointer<QPixmap>   m_pixmap;  /* wraps the blittable */
+    QEtnaviv2dScreen            *m_screen;     /* borrowed */
+    QEtnaviv2dWaylandTransport  *m_transport;  /* borrowed; non-null in wayland mode */
+    QScopedPointer<QPixmap>      m_pixmap;     /* wraps the blittable */
     EtnaBlittablePlatformPixmap *m_pmdata = nullptr; /* raw ptr into m_pixmap */
 };
 
 QT_END_NAMESPACE
 
 #endif // QETNAVIV2DBACKINGSTORE_H
+

@@ -21,6 +21,7 @@
 #include "qetnaviv2dblitter.h"
 #include "qetnaviv2dscreen.h"
 #include "qetnaviv2dbackingstore.h"
+#include "qetnaviv2dwaylandtransport.h"
 
 #include <QtFontDatabaseSupport/private/qgenericunixfontdatabase_p.h>
 #include <QtServiceSupport/private/qgenericunixservices_p.h>
@@ -47,6 +48,10 @@
 #include <QDebug>
 #include <QCoreApplication>
 #include <csignal>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstring>
 
 QT_BEGIN_NAMESPACE
 
@@ -130,7 +135,7 @@ bool QEtnaviv2dIntegration::initializeHardware()
     /* 2. Publish context so EtnaBlittablePlatformPixmap can allocate BOs. */
     EtnaBlittablePlatformPixmap::setGlobalContext(m_etnaCtx, m_etnadev);
 
-    /* 3. Create screen (opens card0, allocates scanout BOs, modeset). */
+    /* 3. Create screen (opens card0 for KMS modes, allocates scanout BOs). */
     m_screen = new QEtnaviv2dScreen(cardPath, planeMode, m_etnaCtx, m_etnadev);
     if (!m_screen->initialize()) {
         INTG_WARN << "QEtnaviv2dScreen::initialize() failed";
@@ -139,16 +144,60 @@ bool QEtnaviv2dIntegration::initializeHardware()
         return false;
     }
 
+    /* 3b. In wayland mode: create and connect the Wayland transport.
+     *     The transport opens a separate wl_display connection and drives the
+     *     frame lifecycle.  The screen's KMS path stays dormant (isStub()).
+     *     We need the card fd from the screen to allocate dumb BOs for the ring. */
+    if (planeMode == PlaneMode::Wayland) {
+        /* Open a DRM fd for BO allocation (transport doesn't hold DRM master) */
+        int ringCardFd = open(cardPath.toLocal8Bit().constData(), O_RDWR | O_CLOEXEC);
+        if (ringCardFd < 0) {
+            INTG_WARN << "wayland: open(" << cardPath << ") for ring alloc:" << strerror(errno);
+            delete m_screen; m_screen = nullptr;
+            return false;
+        }
+
+        m_waylandTransport = new QEtnaviv2dWaylandTransport(m_etnadev, ringCardFd);
+        if (!m_waylandTransport->connect()) {
+            INTG_WARN << "QEtnaviv2dWaylandTransport::connect() failed";
+            close(ringCardFd);
+            delete m_waylandTransport; m_waylandTransport = nullptr;
+            delete m_screen; m_screen = nullptr;
+            return false;
+        }
+
+        /* Update screen geometry to match what Weston reported */
+        QRect geo = m_waylandTransport->outputGeometry();
+        m_screen->setWaylandGeometry(geo);
+
+        if (!m_waylandTransport->allocateRing()) {
+            INTG_WARN << "QEtnaviv2dWaylandTransport::allocateRing() failed";
+            m_waylandTransport->disconnect();
+            delete m_waylandTransport; m_waylandTransport = nullptr;
+            close(ringCardFd);
+            delete m_screen; m_screen = nullptr;
+            return false;
+        }
+
+        INTG_INFO << "Wayland transport ready:"
+                  << geo.width() << "x" << geo.height();
+    }
+
     /* 4. Register screen. */
     QWindowSystemInterface::handleScreenAdded(m_screen);
     INTG_INFO << "screen registered:"
               << m_screen->geometry().width() << "x"
               << m_screen->geometry().height();
 
-    /* 5. Input handlers and VT. */
+    /* 5. Input handlers and VT.
+     *
+     * In wayland mode the QPA must NOT open /dev/input directly — Weston is
+     * the libinput master (it owns touchscreen calibration etc).  Input will
+     * arrive over wl_seat in Milestone I.  Skip evdev/libinput entirely here. */
     m_vtHandler.reset(new QFbVtHandler);
 
-    if (!qEnvironmentVariableIntValue("QT_QPA_ETNAVIV2D_DISABLE_INPUT"))
+    if (planeMode != PlaneMode::Wayland &&
+        !qEnvironmentVariableIntValue("QT_QPA_ETNAVIV2D_DISABLE_INPUT"))
         createInputHandlers();
 
     /* 6. Wire SIGINT/SIGTERM to a clean Qt shutdown so Ctrl-C works even
@@ -165,6 +214,12 @@ bool QEtnaviv2dIntegration::initializeHardware()
 
 QEtnaviv2dIntegration::~QEtnaviv2dIntegration()
 {
+    if (m_waylandTransport) {
+        m_waylandTransport->disconnect();
+        delete m_waylandTransport;
+        m_waylandTransport = nullptr;
+    }
+
     if (m_screen)
         QWindowSystemInterface::handleScreenRemoved(m_screen);
     /* m_screen deleted by Qt after handleScreenRemoved */
@@ -218,7 +273,7 @@ QPlatformPixmap *QEtnaviv2dIntegration::createPlatformPixmap(
 QPlatformBackingStore *QEtnaviv2dIntegration::createPlatformBackingStore(
         QWindow *window) const
 {
-    return new QEtnaviv2dBackingStore(window, m_screen);
+    return new QEtnaviv2dBackingStore(window, m_screen, m_waylandTransport);
 }
 
 QPlatformWindow *QEtnaviv2dIntegration::createPlatformWindow(

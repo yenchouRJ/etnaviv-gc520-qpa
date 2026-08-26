@@ -577,6 +577,24 @@ bool QEtnaviv2dScreen::initialize()
 }
 
 /* -----------------------------------------------------------------------
+ * setWaylandGeometry() — update screen geometry from Wayland configure
+ * Called from QEtnaviv2dIntegration after the xdg_surface configure roundtrip.
+ * ----------------------------------------------------------------------- */
+void QEtnaviv2dScreen::setWaylandGeometry(const QRect &geo)
+{
+    if (!isStub() || geo.isEmpty())
+        return;
+
+    mGeometry     = geo;
+    mPhysicalSize = QSizeF(geo.width() * 25.4 / 96.0,
+                           geo.height() * 25.4 / 96.0);
+
+    QWindowSystemInterface::handleScreenGeometryChange(this->screen(),
+                                                       mGeometry, mGeometry);
+    SCR_INFO << "Wayland geometry updated to" << mGeometry;
+}
+
+/* -----------------------------------------------------------------------
  * doRedraw() — called on the GUI thread by QFbScreen::event(UpdateRequest).
  *
  * We suppress the QFbScreen software compositor (return empty region), but
