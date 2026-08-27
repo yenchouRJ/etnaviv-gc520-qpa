@@ -8,8 +8,8 @@ zero-copy, both hardware-promoted, Weston owning plane arbitration. This is
 transport switches from direct KMS to Wayland; `libetna2d` / `EtnaBlittable` /
 the GC520 blitter are untouched.
 
-> **Status:** Planning complete. Phase 6 (Weston plane-promotion gate) is DONE
-> and hardware-verified. All buildroot configs for Phase 7 are prepared.
+> **Status (2026-08-27):** Milestones B and C are hardware-verified and closed.
+> Milestone A (`waylandsink`) is next.
 
 > **Prerequisite:** Phase 6 (`compositor/plan.md`) closed. `test_weston` proved
 > the NV12 dmabuf → hardware plane path with a bare C client; Phase 7 reuses that
@@ -33,12 +33,13 @@ the GC520 blitter are untouched.
                     ▼                    ▼
               Weston compositor (sole DRM master, sole input master)
                  │  drmModeAtomicCommit — assigns each client surface
-                 │  to a hardware plane by zpos; drops its own shadow FB
-                 │  when both surfaces fully cover the output
+                 │  to a hardware plane by zpos; PLANES_ONLY mode;
+                 │  no shadow FB (both surfaces cover the output)
                  └──────── /dev/dri/card0
                                 │
                     ┌───────────┴───────────┐
-              plane (zpos hi): Qt UI    plane (zpos lo): video
+              plane[31] zpos=0: video    plane[38] zpos=1: Qt UI
+              (primary, NV12)            (overlay, AR24)
 ```
 
 **The render layer is invariant.** `EtnaBlittable` still renders the Qt scene
@@ -63,14 +64,27 @@ capability. The only immutable hardware constraint is **fixed z-order (zpos)**:
 
 | Plane   | zpos | Formats | Role in Phase 7 |
 |---------|------|---------|-----------------|
-| PRIMARY | 0 (bottom) | RGB + YUV | video (NV12) — *or* UI; format-equivalent |
-| OVERLAY | 1 (middle) | RGB + YUV | Qt UI (ARGB) — *or* video; format-equivalent |
-| CURSOR  | 2 (top)    | XRGB8888 32×32 | unused |
+| PRIMARY [31] | 0 (bottom) | RGB + YUV | video (NV12) |
+| OVERLAY [38] | 1 (middle) | RGB + YUV | Qt UI (AR24) |
+| CURSOR  [49] | 2 (top)    | XRGB8888 32×32 | unused |
 
 Because the two planes are format-equivalent, the **key validation point is
 correct zpos-based plane allocation, not plane format capability**. The visual
 target is **UI on the higher-zpos plane (overlay, blended) over video on the
 lower-zpos plane (primary, opaque)** (§Decision D7-zpos).
+
+---
+
+## Weston patches (all committed, all applied on target)
+
+| Patch file | Commit in weston git | What |
+|---|---|---|
+| `0001-fbdev-backend.patch` | pre-existing | fbdev build fix |
+| `0002-drm-backend-linux-dmabuf-gbm-pixman-renderer-step6.patch` | `d467b6e`–`1fa8938` (4 commits) | GBM init in pixman mode; linux-dmabuf advertised without GL renderer; pixman-renderer accepts dmabuf buffers |
+| `0003-state-propose-planes-only-no-buffer-skip-dual-client.patch` | `21d9cf5` | **Fix 1:** skip no-buffer views (kiosk background) in PLANES_ONLY instead of aborting. **Fix 2:** allow topmost fullscreen view to try overlay when ≥2 client views exist, so dual fullscreen clients each get a plane. |
+
+`package/weston/` holds the canonical `.patch` files; `output/build/weston-10.0.5`
+is the tracked git tree. Edit in the git tree, `git format-patch` to regenerate.
 
 ---
 
@@ -122,22 +136,20 @@ qpa/src/
 - `wl_display`, `wl_registry`, `wl_compositor`
 - `xdg_wm_base`, `xdg_surface`, `xdg_toplevel` (single fullscreen surface)
 - `zwp_linux_dmabuf_v1`
-- the **ARGB8888 / LINEAR BO ring** (2–3 deep) and its cached `wl_buffer`s
+- the **ARGB8888 / LINEAR BO ring** (3 deep) and its cached `wl_buffer`s
 - `wl_surface.frame` callback state (throttling)
-- `wl_buffer.release` back-pressure (`pickFree()` discipline from D9b / `test_weston`)
-- a `QSocketNotifier` on `wl_display_get_fd()` for event-loop integration
-- (later) `wl_seat` + `wl_pointer` / `wl_touch` / `wl_keyboard`
+- `wl_buffer.release` back-pressure (`pickFree()` discipline)
+- a `QSocketNotifier` on `wl_display_get_fd()` armed lazily on first commit
+- (later, Milestone I) `wl_seat` + `wl_pointer` / `wl_touch` / `wl_keyboard`
 
 ### Zero-copy ARGB ring
 
-The blitter's target BOs are GBM/dumb allocations exported as dmabuf via
-`drmPrimeHandleToFD`. The transport allocates a **2–3 deep ring of exportable
+The blitter's target BOs are dumb allocations exported as dmabuf via
+`drmPrimeHandleToFD`. The transport allocates a **3-deep ring of exportable
 ARGB8888/LINEAR BOs**, wraps each as a *persistent* `wl_buffer` (created once via
 `zwp_linux_dmabuf_v1_create_params`, cached), and cycles them under
 `wl_buffer.release`. The GC520 blitter renders straight into whichever ring BO
-is currently free — **no per-frame ARGB memcpy**. (Verify at impl time: the
-blitter can target an arbitrary ring BO each frame; if the target is fixed at
-surface creation, a blit-then-swap is needed — code detail, not a design change.)
+is currently free — **no per-frame ARGB memcpy**.
 
 ### Surface / role model
 
@@ -146,8 +158,7 @@ child widgets, menus, popups, and dialogs into the top-level window's backing
 store when there is no native window manager — one fullscreen surface renders the
 entire Qt UI correctly. `xdg_popup` / subsurfaces are **not** implemented
 (kiosk-appliance product; no product value). Every non-primary `QWindow` the QPA
-is asked to create becomes a no-op / is composited by Qt into the primary
-surface.
+is asked to create becomes a no-op / is composited by Qt into the primary surface.
 
 ### Event-loop integration
 
@@ -159,6 +170,11 @@ deadlock. A flush hook on `QAbstractEventDispatcher::aboutToBlock` (and after
 each `wl_surface_commit`) calls `wl_display_flush`. No dispatch thread — the
 ring's `wl_buffer.release` handling stays on the main thread with the blitter and
 Qt, so no locking (§Decision D7-loop).
+
+The notifier is created **lazily on the first `commitFrame()` call** (after
+`QApplication::exec()` enters the event loop) to avoid the Qt warning
+`"QSocketNotifier: Can only be used with threads started with QThread"` and the
+silent disabling that follows it.
 
 ### Frame pacing
 
@@ -173,46 +189,31 @@ Two guards, distinct jobs (§Decision D7-pace):
   means at most one commit per vsync and none when nothing changed — correct for
   a low-power embedded kiosk.
 
-### Input (wl_seat) — sequenced after video
+### Input (wl_seat) — Milestone I, after A
 
 Under Weston the QPA **must not** open `/dev/input/*` itself — Weston is the
 input master (it owns libinput, incl. touchscreen calibration via `weston.ini`).
-So in wayland mode `createInputHandlers()` (`qetnaviv2dintegration.cpp:256`) is
-**skipped entirely** (no `QLibInputHandler` / evdev managers). Input instead
+So in wayland mode `createInputHandlers()` is **skipped entirely**. Input instead
 arrives over `wl_seat` → `wl_pointer` / `wl_touch` / `wl_keyboard`, which the
-transport translates into `QWindowSystemInterface::handleMouseEvent` /
-`handleTouchEvent` / `handleKeyEvent`. **This is implemented only after the video
-and core Wayland-client bindings are proven** (§Decision D7-input, staging).
+transport translates into `QWindowSystemInterface` events. **Implemented after
+Milestone A** (§Decision D7-input).
 
 ---
 
 ## Protocol bindings
 
-Generated at **build time** via `wayland-scanner` (§Decision D7-scanner), XML
-resolved from the sysroot `wayland-protocols` datadir
-(`pkg-config --variable=pkgdatadir wayland-protocols`). Generated for the QPA
-build:
+Generated at **build time** via `wayland-scanner`, XML from the sysroot
+`wayland-protocols` datadir. Generated for the QPA build:
 
 - `xdg-shell` — `xdg_wm_base` / `xdg_surface` / `xdg_toplevel`
 - `linux-dmabuf-unstable-v1` — `zwp_linux_dmabuf_v1`
 
 Core `wl_seat` / `wl_pointer` / `wl_touch` / `wl_keyboard` are in the core
-`wayland.xml` already provided by `libwayland-client` — no generation needed.
-`wayland-scanner` is available as a host tool in the buildroot host sysroot
-(since `wayland` is built). The QPA build (qmake `.pro` / Makefile) gets rules:
-`wayland-scanner private-code $XML > foo-protocol.c` and
-`wayland-scanner client-header $XML > foo-client-protocol.h`.
-
-> Do **not** borrow `test_weston`'s already-generated files (bad layering, version
-> drift). The QPA regenerates cleanly against its own sysroot.
+`wayland.xml` provided by `libwayland-client` — no generation needed.
 
 ---
 
 ## Directory layout
-
-`wayland/` is a top-level sibling of `compositor/`, mirroring its structure. It
-holds the **plan + disposable validation harnesses only**. The **shipping**
-transport class lives in place under `qpa/src/`.
 
 ```
 wayland/
@@ -232,101 +233,82 @@ qpa/src/
 
 ## Staged milestones
 
-The sequence is deliberately staged so each risk is isolated (§Decision D7-topology).
+### Milestone B — single QPA Weston client (UI → hardware plane) ✓ DONE
 
-### Milestone B — single QPA Weston client (UI → hardware plane) — **FIRST**
+**Gate B result (hardware-verified):**
+- Qt UI visible fullscreen (1024×600), animated gradient, alpha-blend patches.
+- Frames delivered via `linux-dmabuf-v1` (not SHM).
+- `plane[38] AR24 zpos=1` — Qt UI on hardware overlay plane.
+- `wl_buffer.release` cycling correctly through 3-slot ring.
+- `QSocketNotifier` armed lazily; frame-callback chain pacing at vsync.
 
-The QPA currently has a `plane=wayland` stub — it connects to Weston but never
-sends a frame. This milestone replaces the stub with a real Wayland client:
-the QPA exports its ARGB render buffer as a dmabuf, submits it to Weston via
-`linux-dmabuf-v1`, and drives the frame lifecycle (commit, release, next frame).
-It is done alone first so that if anything in the Qt↔Weston handoff is wrong,
-there is only one new moving part to debug.
+Notable bugs fixed during B:
+- `QSocketNotifier` created before `QApplication::exec()` → silently disabled →
+  `wl_buffer.release` events never dispatched → ring stalled, frame counter
+  frozen. Fixed by lazy `armNotifier()` on first `commitFrame()`.
 
-Steps:
+### Milestone C — two-plane arbitration (QPA UI + `test_weston` video) ✓ DONE
 
-1. **B0 — scaffold.** `wayland/` directory, Makefile, tests dir already created.
-   Add `wayland-scanner` rules to the QPA build for `xdg-shell` +
-   `linux-dmabuf-v1`.
-2. **B1 — transport class skeleton.** `QEtnaviv2dWaylandTransport`: connect
-   display, bind registry globals (`wl_compositor`, `xdg_wm_base`,
-   `zwp_linux_dmabuf_v1`), create fullscreen `xdg_toplevel`, wire the
-   `QSocketNotifier` + `aboutToBlock` flush + safe read sequence.
-3. **B2 — ARGB ring.** Allocate the 2–3 deep exportable ARGB8888/LINEAR BO ring;
-   export each via `drmPrimeHandleToFD`; create persistent `wl_buffer`s via
-   `zwp_linux_dmabuf_v1_create_params`; implement `pickFree()` +
-   `wl_buffer.release`.
-4. **B3 — flush integration.** In wayland mode, `BackingStore::flush()` blits into
-   the current free ring BO (as today) and marks dirty; the frame-callback handler
-   does `attach` + `damage_buffer` + `commit`; first frame bootstraps.
-   `Screen`'s KMS path is not entered (`isStub()`).
-5. **B4 — input disabled in wayland mode.** `createInputHandlers()` skipped when
-   `PlaneMode::Wayland` (no evdev/libinput). App is navigable-blind for now —
-   staging only.
-6. **B5 — validate.** Minimal Qt app (`wayland/tests/qt_ui_client/`) with
-   `QT_QPA_PLATFORM=etnaviv2d:plane=wayland` under a running Weston.
-
-**Gate B:**
-- **Hard:** Qt UI is visible on screen and frames are delivered to Weston via
-  `linux-dmabuf-v1` (not SHM — SHM means the protocol path itself failed and the
-  QPA fell back to shared memory instead of dmabuf export).
-- **Observed, not a blocker:** whether Weston promotes the surface to a hardware
-  plane or composites it in software. Weston's plane-assignment decision depends
-  on surface coverage, modifier negotiation, and the xdg configure round-trip
-  completing — these are properly verified in Milestone C, not here.
-
-> Rationale: GL/software fallback at this stage is a Weston plane-assignment
-> question, not a protocol question. The purpose of Milestone B is to confirm the
-> Qt↔Weston handoff is correct. Plane promotion is gated at Milestone C, where
-> both surfaces and the full scene are present for a meaningful check.
-
-### Milestone C — two-plane arbitration (QPA UI + `test_weston` video)
-
-Introduce two-plane arbitration using the **known-good** `test_weston` as the
-video partner, so any arbitration failure is unambiguously Weston/kernel, not
-`waylandsink`.
-
-Steps:
-
-1. **C0 — plane-availability observation.** Run `test_weston` (video) + the QPA
-   UI client together. Observe in `/sys/kernel/debug/dri/0/state`: are **both**
-   client surfaces on hardware planes, and does Weston **drop its shadow FB**
-   when both fully cover the output?
-2. **C1 — zpos verification.** Confirm the UI lands on the **higher-zpos** plane
-   (overlay) and video on the **lower-zpos** plane (primary), by natural Weston
-   stacking-to-plane mapping. If the observed order is wrong, add an explicit
-   stacking/pin mechanism then (not before — §Decision D7-zpos).
-3. **C2 — `verify_planes.sh`.** Script the `dri/0/state` dual-promotion +
-   zpos cross-check.
-
-**Gate C:** both surfaces hardware-promoted, correct zpos order, shadow FB
-dropped. Any GL fallback = gate failure (software integration bug, not a hardware
-limit — the planes are format-equivalent).
-
-### Milestone A — real `waylandsink` video client
-
-Swap the proven `test_weston` for the real GStreamer client:
-
+**Gate C result (hardware-verified, 220/220 frames PLANES_ONLY):**
 ```
+plane[31] primary   NV12  zpos=0  (test_weston video)
+plane[38] overlay   AR24  zpos=1  (qt_ui_client Qt UI)
+```
+- 100% `plane-only state composition` — no MIXED, no RENDERER_ONLY fallbacks.
+- No shadow FB on primary (Weston does not render into the dumb BO when both
+  client surfaces are on hardware planes).
+- Correct zpos: video below, UI on top, ARGB blending visible.
+- `--no-gradient` (semi-transparent Qt surface) confirmed: view-level alpha=1.0
+  is what matters for plane eligibility, not pixel-level transparency.
+
+Two Weston bugs found and fixed (now `0003-*.patch`):
+
+1. **kiosk-shell background surface blocked PLANES_ONLY** — the solid-colour
+   background view (no `wl_buffer`) triggered `force_renderer=true` in PLANES_ONLY
+   mode where `renderer_ok=false`, immediately aborting the state proposal. Fix:
+   skip no-buffer views with `continue`.
+
+2. **Dual fullscreen clients: topmost forced to primary, second had no plane** —
+   the `view_matches_entire_output && !scanout_has_view_assigned` guard refused
+   overlay for any fullscreen view when primary was unassigned, causing the
+   foreground view (Qt) to claim primary and leaving the background view (video)
+   with no plane. Fix: count views with valid buffers; only apply the guard for a
+   single client; with ≥2 clients let the topmost try overlay first.
+
+### Milestone A — real `waylandsink` video client ← NEXT
+
+Swap `test_weston` for the real GStreamer client. The Weston patches and QPA
+transport are already proven; the only new unknown is whether `waylandsink`
+negotiates dmabuf (expected) or falls back to SHM.
+
+```sh
+XDG_RUNTIME_DIR=/tmp/xdg WAYLAND_DISPLAY=wayland-1 \
 gst-launch-1.0 filesrc location=earth_nv12_1024x600.raw \
   ! rawvideoparse format=nv12 width=1024 height=600 framerate=30/1 \
-  ! waylandsink
+  ! waylandsink fullscreen=true
 ```
 
 Steps:
 
-1. **A0 — waylandsink dmabuf probe.** Confirm `waylandsink` uses
-   `zwp_linux_dmabuf_v1` (not SHM fallback) — check `dri/0/state` for the NV12
-   plane. GStreamer ≥ 1.18 `waylandsink` supports dmabuf when the compositor
-   advertises it (we do, post-Phase-6).
-2. **A1 — two real processes.** Qt QPA client (UI) + `waylandsink` (video),
-   both fullscreen, Weston arbitrating. Re-run `verify_planes.sh`.
+1. **A0 — waylandsink dmabuf probe.** Run `waylandsink` alone. Check
+   `/sys/kernel/debug/dri/0/state`: is `plane[38]` NV12 (dmabuf path) or is the
+   surface only on primary via shadow (SHM fallback)?
+   - SHM fallback: `waylandsink` receives a `wl_shm` buffer, pixman composites it
+     into the shadow FB, primary stays XR24. Escalation path: use `appsink` +
+     manual dmabuf import (v2, gated on VPU driver readiness).
+   - dmabuf: NV12 directly on a hardware plane → proceed.
+
+2. **A1 — two real processes.** `waylandsink` (video) + `qt_ui_client` (UI),
+   both running simultaneously. Re-run `verify_planes.sh`.
+
+3. **A2 — GStreamer pipeline tuning** (if needed). `waylandsink` caps negotiation,
+   `sync=false` vs `sync=true`, buffer pool size.
 
 **Gate A:** true product topology — two independent processes, both zero-copy
-hardware-promoted, correct zpos. If `waylandsink` falls back to SHM, escalate
-(may need `appsink` + manual dmabuf import, gated on VPU driver readiness — v2).
+hardware-promoted, correct zpos, `verify_planes.sh` passes. Any SHM fallback =
+gate failure; escalate to `appsink` + manual import.
 
-### Milestone I — input (wl_seat) — after A (or after B if prioritized)
+### Milestone I — input (wl_seat) — after A
 
 Bind `wl_seat` in the transport; translate `wl_pointer` / `wl_touch` /
 `wl_keyboard` → Qt events. Touchscreen: Weston owns libinput + calibration; the
@@ -335,36 +317,47 @@ in the Qt UI reaches widgets correctly.
 
 **Gate I:** interactive Qt UI over video, touch/mouse working.
 
+### Milestone IVI — ivi-shell (deferred, after I)
+
+Replace kiosk-shell with ivi-shell for **deterministic, programmatic z-order
+control** independent of client launch sequence. kiosk-shell is sufficient for
+the current validated configuration (video first → primary, Qt second → overlay);
+ivi-shell is required when layer assignment must be driven at runtime (e.g. swap
+video/UI layers on a button press, or guarantee a fixed layout regardless of
+startup order).
+
+**What changes with ivi-shell:**
+
+| Layer | Change | Owner |
+|---|---|---|
+| `weston.ini` | `shell=ivi-shell.so`; add `[ivi-shell]` section; configure `hmi-controller` surface-to-layer mapping | build system / config |
+| `test_weston.c` / `waylandsink` wrapper | Bind `ivi_application` protocol; call `ivi_application_surface_create(iva, IVI_ID_VIDEO, wl_surface)` at startup | us (compositor test / gst wrapper) |
+| QPA transport (`qetnaviv2dwaylandtransport.cpp`) | Bind `ivi_application`; call `ivi_application_surface_create(iva, IVI_ID_QT, wl_surface)` in `connect()` | us (QPA) |
+| `hmi-controller.so` config | Map IVI surface IDs to IVI layers; set layer zpos in `weston.ini` or via `ivi_hmi_controller` protocol at runtime | us (config) or separate HMI process |
+
+**Layer control responsibility:** the `hmi-controller` Weston plugin (loaded
+in-process) owns `ivi_layout` — it calls `ivi_layout_layer_create()`,
+`ivi_layout_surface_add_to_layer()`, `ivi_layout_layer_set_render_order()`. An
+external HMI process can drive runtime layout changes via the `ivi_hmi_controller`
+protocol. Without a controller, all surfaces share a default layer and z-order is
+undefined.
+
+The `0003-*.patch` plane-promotion fixes remain valid under ivi-shell — they are
+in the DRM backend, below the shell layer.
+
 ---
 
 ## Decision log (Phase 7)
 
 | ID | Decision | Rationale |
 |----|----------|-----------|
-| D7-topology | Staged: **(B)** single QPA client → **(C)** QPA + `test_weston` two-plane arbitration → **(A)** real `waylandsink`. First milestone is a single QPA Weston client. | The highest-risk unknown is the D11 QPA transport (`isStub()` → `linux-dmabuf-v1`). Prove it in isolation; then add arbitration with a known-good video partner; then swap in the real sink. Any failure is attributable to one layer at a time. |
-| D7-input | QPA binds `wl_seat` and translates Wayland input → Qt events; evdev/libinput path **disabled** in wayland mode. **Implemented after** video + core bindings are proven. | Under Weston the client must not open `/dev/input/*` (Weston is input master, owns touchscreen calibration). Binding `wl_seat` in the Option-A client loop is the self-contained continuation, mirroring stock qtwayland. Sequenced after video to isolate transport risk first. |
-| D7-buffer | **Zero-copy** ARGB8888/LINEAR BO ring (2–3 deep) exported as persistent `wl_buffer`s, cycled under `wl_buffer.release`. Blitter renders straight into the free ring BO. | etnaviv2d BOs are already exportable dmabuf; reuses D9b ring + `test_weston` transport verbatim; avoids a needless per-frame ARGB memcpy for a UI surface. |
-| D7-role | Single fullscreen `xdg_toplevel`; Qt composites all child/popup content into it. No `xdg_popup`/subsurfaces. | Kiosk appliance (kiosk-shell, D20). Qt already flattens child widgets/menus/dialogs into the top-level backing store with no window manager. Multi-surface support = large lifecycle complexity, zero product value here. |
-| D7-loop | Single-threaded `QSocketNotifier` on `wl_display_get_fd()`; flush on `aboutToBlock`; `prepare_read`/`read_events`/`dispatch_pending` sequence. | Matches stock qtwayland; no threads means `wl_buffer.release`/ring handling stays on the main thread with the blitter — no locking. Avoids the Wayland fd-starvation deadlock. |
-| D7-pace | `wl_surface.frame`-callback throttled commits (vsync-aligned, coalesced) + `wl_buffer.release` ring back-pressure. | Distinct jobs: frame callback = *when* (vsync, coalescing static UI); release = *whether a buffer is free*. Correct, low-power behavior for a bursty, mostly-static kiosk UI; matches `QWindow::requestUpdate`. |
-| D7-zpos | MA35D1 planes are **format-equivalent** (RGB+YUV both). Only immutable constraint is zpos. Target: **UI on higher-zpos plane (overlay) over video on lower-zpos (primary)**. Rely on Weston's natural stacking-to-plane mapping; verify in (C); add explicit pin only if observed order is wrong. GL fallback = gate failure (software issue, not hardware). Weston shadow FB drops when both surfaces cover the output. | Format equivalence removes the plane-count-vs-format fight. The real validation is correct zpos allocation, verified via `/sys/kernel/debug/dri/0/state`. No pinning mechanism pre-built for a mapping that may already be correct. |
-| D7-struct | Dedicated `QEtnaviv2dWaylandTransport` class owns all libwayland state; `BackingStore::flush()` delegates in wayland mode; KMS `Screen` path untouched; blitter/`EtnaBlittable` untouched. | Makes the D11 principle literal — "adapted, not replaced; only transport switches". Sibling transports never interleave; the two paths stay clean. Natural home for the later `wl_seat` input code. |
-| D7-scanner | Generate protocol bindings at **build time** via `wayland-scanner`, XML from the sysroot `wayland-protocols` datadir. | Guarantees generated code matches the installed protocol version (avoids `DRM_FORMAT_MOD_INVALID`-class surprises); keeps the QPA self-contained; canonical approach. Not borrowed from `test_weston` (bad layering / drift). |
-| D7-layout | Top-level `wayland/` sibling of `compositor/`, mirroring its structure — plan + disposable validation harnesses only. Shipping transport class in place under `qpa/src/`. | The transport is integral shipping QPA code, not a throwaway test. `wayland/` holds only Phase 7 planning + validation scaffolding, same split as Phase 6's `compositor/` + `test_weston`. |
-
----
-
-## Open items to resolve at implementation time (not blocking)
-
-- **Blitter target flexibility** — can the GC520 blitter render into an arbitrary
-  ring BO each frame, or is its target fixed at surface creation? If fixed, a
-  blit-then-swap wrapper is needed (code detail; D7-buffer still holds).
-- **Weston shadow-FB drop** — confirm Weston's DRM backend drops its compositor
-  shadow FB when both client surfaces fully cover the output (observed for a
-  single client in Phase 6; verify for two in milestone C0).
-- **Natural zpos mapping** — whether Weston stacks the UI above the video by
-  default under kiosk-shell (creation/focus order). Observed in C1; pin only if
-  wrong.
-- **`waylandsink` dmabuf vs SHM** — confirm dmabuf path in A0; SHM fallback
-  escalates to `appsink` + manual import (v2, VPU-gated).
-```
+| D7-topology | Staged: **(B)** single QPA client → **(C)** QPA + `test_weston` two-plane arbitration → **(A)** real `waylandsink`. ivi-shell deferred to after Milestone I. | The highest-risk unknown was the D11 QPA transport. Prove in isolation, then add arbitration with a known-good video partner, then swap in the real sink. ivi-shell deferred: kiosk-shell + `0003-*.patch` is sufficient for the validated configuration; ivi-shell only needed for runtime layer control. |
+| D7-input | QPA binds `wl_seat` and translates Wayland input → Qt events; evdev/libinput path **disabled** in wayland mode. **Implemented after Milestone A.** | Under Weston the client must not open `/dev/input/*`. Sequenced after video to isolate transport risk first. |
+| D7-buffer | **Zero-copy** ARGB8888/LINEAR BO ring (3 deep) exported as persistent `wl_buffer`s, cycled under `wl_buffer.release`. Blitter renders straight into the free ring BO. | etnaviv2d BOs are already exportable dmabuf; reuses D9b ring + `test_weston` transport; avoids a needless per-frame ARGB memcpy. |
+| D7-role | Single fullscreen `xdg_toplevel`; Qt composites all child/popup content into it. No `xdg_popup`/subsurfaces. | Kiosk appliance. Qt already flattens child widgets into the top-level backing store with no WM. Multi-surface support = large lifecycle complexity, zero product value here. |
+| D7-loop | Single-threaded `QSocketNotifier` on `wl_display_get_fd()`; notifier armed lazily on first `commitFrame()`; flush on `aboutToBlock`; `prepare_read`/`read_events`/`dispatch_pending` sequence. | Matches stock qtwayland; no threads means ring handling stays on the main thread — no locking. Lazy arming avoids the pre-exec-loop Qt notifier bug discovered at Milestone B. |
+| D7-pace | `wl_surface.frame`-callback throttled commits + `wl_buffer.release` ring back-pressure. | Distinct jobs: frame callback = *when* (vsync, coalescing static UI); release = *whether a buffer is free*. Low-power behaviour for a bursty, mostly-static kiosk UI. |
+| D7-zpos | MA35D1 planes are **format-equivalent** (RGB+YUV both). Target: **UI on higher-zpos plane (overlay) over video on lower-zpos (primary)**. Rely on Weston's natural stacking-to-plane mapping; pin only if wrong. | Format equivalence removes the plane-count-vs-format fight. Validated at Milestone C: 220/220 frames PLANES_ONLY, correct zpos. |
+| D7-struct | Dedicated `QEtnaviv2dWaylandTransport` class owns all libwayland state; `BackingStore::flush()` delegates in wayland mode; KMS `Screen` path untouched; blitter/`EtnaBlittable` untouched. | Makes D11 literal — "adapted, not replaced; only transport switches". |
+| D7-scanner | Generate protocol bindings at **build time** via `wayland-scanner`, XML from the sysroot `wayland-protocols` datadir. | Guarantees generated code matches the installed protocol version; keeps the QPA self-contained. |
+| D7-weston-patches | Three `.patch` files in `package/weston/`. Fix 1 (0002): GBM+linux-dmabuf with pixman renderer. Fix 2 (0003): PLANES_ONLY no-buffer skip + dual-client overlay guard. | All fixes are in the DRM backend, below the shell layer — apply equally under kiosk-shell and ivi-shell. |
