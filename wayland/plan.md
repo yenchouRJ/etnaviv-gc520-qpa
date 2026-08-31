@@ -8,8 +8,8 @@ zero-copy, both hardware-promoted, Weston owning plane arbitration. This is
 transport switches from direct KMS to Wayland; `libetna2d` / `EtnaBlittable` /
 the GC520 blitter are untouched.
 
-> **Status (2026-08-27):** Milestones B and C are hardware-verified and closed.
-> Milestone A (`waylandsink`) is next.
+> **Status (2026-08-28):** Milestones B, C, and A are hardware-verified and closed.
+> Milestone I (`wl_seat` input) is next.
 
 > **Prerequisite:** Phase 6 (`compositor/plan.md`) closed. `test_weston` proved
 > the NV12 dmabuf → hardware plane path with a bare C client; Phase 7 reuses that
@@ -75,16 +75,20 @@ lower-zpos plane (primary, opaque)** (§Decision D7-zpos).
 
 ---
 
-## Weston patches (all committed, all applied on target)
+## Weston patches
 
-| Patch file | Commit in weston git | What |
+> **Note:** Weston patch files in `package/weston/` will be regenerated with
+> `git format-patch` at the end of the dev journey, once all fixes are stable.
+> Until then, the working state lives in the weston git tree at
+> `output/build/weston-10.0.5`; the table below documents every change applied.
+
+| Area | File(s) changed | What |
 |---|---|---|
-| `0001-fbdev-backend.patch` | pre-existing | fbdev build fix |
-| `0002-drm-backend-linux-dmabuf-gbm-pixman-renderer-step6.patch` | `d467b6e`–`1fa8938` (4 commits) | GBM init in pixman mode; linux-dmabuf advertised without GL renderer; pixman-renderer accepts dmabuf buffers |
-| `0003-state-propose-planes-only-no-buffer-skip-dual-client.patch` | `21d9cf5` | **Fix 1:** skip no-buffer views (kiosk background) in PLANES_ONLY instead of aborting. **Fix 2:** allow topmost fullscreen view to try overlay when ≥2 client views exist, so dual fullscreen clients each get a plane. |
-
-`package/weston/` holds the canonical `.patch` files; `output/build/weston-10.0.5`
-is the tracked git tree. Edit in the git tree, `git format-patch` to regenerate.
+| 0001 (pre-existing) | fbdev backend | fbdev build fix |
+| 0002 | `drm.c`, `pixman-renderer.c`, `linux-dmabuf.c`, `meson.build` | GBM init in `init_pixman()`; linux-dmabuf advertised without GL renderer; pixman-renderer accepts dmabuf buffers; `BUILD_DRM_GBM` enabled |
+| 0003 | `state-propose.c` | **Fix 1:** skip no-buffer views (kiosk background) in PLANES_ONLY. **Fix 2:** allow topmost fullscreen view to try overlay when ≥2 client views exist |
+| 0003 (cont.) | `drm.c`, `linux-dmabuf.c`, `include/libweston/libweston.h` | `get_scanout_formats_hook` on `weston_compositor`; set in `init_pixman()` to return KMS plane format union so `zwp_linux_dmabuf_v1` advertises NV12/YUV formats in pixman mode |
+| 0003 (cont.) | `fb.c` | `DRM_FORMAT_MOD_INVALID` → `DRM_FORMAT_MOD_LINEAR` for dumb BO imports; allows `gst_dmabuf_allocator` buffers (no modifier metadata in GStreamer ≤ 1.22) to reach KMS plane |
 
 ---
 
@@ -218,11 +222,14 @@ Core `wl_seat` / `wl_pointer` / `wl_touch` / `wl_keyboard` are in the core
 ```
 wayland/
   plan.md                    ← this document
-  Makefile                   ← builds the phase7 test harnesses
+  Makefile                   ← builds all phase7 test harnesses
   tests/
     qt_ui_client/            ← minimal Qt app to exercise the QPA (milestone B)
+    gst_dmabuf_video/        ← standalone C program: DRM dumb BO ring → appsrc → waylandsink (milestone A)
+    gst_plugin_dmabuf_src/   ← GStreamer plugin (dmabufsrc): same BO logic as a proper GST element;
+                                enables plain gst-launch-1.0 dmabufsrc … ! waylandsink (milestone A)
     verify_planes.sh         ← dri/0/state dual-promotion cross-check (milestone C)
-  images/                    ← shared/symlinked NV12 .raw for the waylandsink client
+  images/                    ← shared/symlinked NV12 .raw for the video clients
   build/                     ← build output (gitignored)
 qpa/src/
   qetnaviv2dwaylandtransport.{h,cpp}   ← shipping transport (in place)
@@ -275,40 +282,55 @@ Two Weston bugs found and fixed (now `0003-*.patch`):
    with no plane. Fix: count views with valid buffers; only apply the guard for a
    single client; with ≥2 clients let the topmost try overlay first.
 
-### Milestone A — real `waylandsink` video client ← NEXT
+### Milestone A — `gst_dmabuf_video` + `qt_ui_client` ✓ DONE
 
-Swap `test_weston` for the real GStreamer client. The Weston patches and QPA
-transport are already proven; the only new unknown is whether `waylandsink`
-negotiates dmabuf (expected) or falls back to SHM.
+The stock `gst-launch-1.0 … ! waylandsink` path was investigated and **could
+not be used directly** — three blockers were found and resolved:
 
-```sh
-XDG_RUNTIME_DIR=/tmp/xdg WAYLAND_DISPLAY=wayland-1 \
-gst-launch-1.0 filesrc location=earth_nv12_1024x600.raw \
-  ! rawvideoparse format=nv12 width=1024 height=600 framerate=30/1 \
-  ! waylandsink fullscreen=true
+1. **`waylandsink fullscreen=true` segfaults** — a NULL-deref in GStreamer
+   1.22.9's xdg-output fullscreen path.  Workaround: omit `fullscreen=true`;
+   kiosk-shell forces fullscreen anyway.
+
+2. **`zwp_linux_dmabuf_v1` advertised zero formats** — Weston's
+   `bind_linux_dmabuf` skipped format advertisement when
+   `renderer->get_supported_formats == NULL` (pixman mode).  Fix: added
+   `get_scanout_formats_hook` to `struct weston_compositor`; DRM backend sets
+   it in `init_pixman()` to `get_scanout_formats_pixman_hook()` which returns
+   the KMS plane format union.  `waylandsink` then sees
+   `video/x-raw(memory:DMABuf), format={…NV12…}`.
+
+3. **`rawvideoparse` produces system-memory NV12**, which `waylandsink` won't
+   accept without `memory:DMABuf`.  No VPU GStreamer plugin is present on this
+   target.  Resolution: wrote **`gst_dmabuf_video`** — a standalone C program
+   (`wayland/tests/gst_dmabuf_video/gst_dmabuf_video.c`) that allocates a
+   3-deep ring of DRM dumb BOs, reads .raw NV12 frames into them, exports each
+   as a DMABuf fd, and pushes `memory:DMABuf` NV12 `GstBuffer`s via `appsrc`
+   into a `waylandsink` pipeline.  A `GMainLoop` timer drives frame delivery
+   at `--fps` rate; `gst_mini_object_weak_ref` clears the ring slot when
+   GStreamer is done with the buffer.
+
+4. **`drm_fb_get_from_dmabuf()` rejected `DRM_FORMAT_MOD_INVALID`** — Weston
+   refused to import a DMABuf with no modifier because layout is then unknown.
+   DRM dumb BOs are always linear; `gst_dmabuf_allocator` does not carry
+   modifier metadata in GStreamer ≤ 1.22.  Fix: in `fb.c`, treat
+   `DRM_FORMAT_MOD_INVALID` as `DRM_FORMAT_MOD_LINEAR` at import time.
+
+These fixes are all in `0003-` (new commits in the weston git tree, to be
+captured in `package/weston/`).
+
+**Gate A result (hardware-verified):**
 ```
+plane[31] primary   NV12  zpos=0  (gst_dmabuf_video)
+plane[38] overlay   AR24  zpos=1  (qt_ui_client)
+```
+- 193/193 frames `plane-only state composition` — zero fallbacks.
+- No shadow FB (XR24 absent from DRI state).
+- Video animated (frame counter advancing, no ring stall).
+- `verify_planes.sh`: 3/4 checks pass (the "≥2 active planes" check uses
+  `FB_ID` grep which misses the new `fb=` format in debugfs — a script bug,
+  not a hardware bug; both planes are active).
 
-Steps:
-
-1. **A0 — waylandsink dmabuf probe.** Run `waylandsink` alone. Check
-   `/sys/kernel/debug/dri/0/state`: is `plane[38]` NV12 (dmabuf path) or is the
-   surface only on primary via shadow (SHM fallback)?
-   - SHM fallback: `waylandsink` receives a `wl_shm` buffer, pixman composites it
-     into the shadow FB, primary stays XR24. Escalation path: use `appsink` +
-     manual dmabuf import (v2, gated on VPU driver readiness).
-   - dmabuf: NV12 directly on a hardware plane → proceed.
-
-2. **A1 — two real processes.** `waylandsink` (video) + `qt_ui_client` (UI),
-   both running simultaneously. Re-run `verify_planes.sh`.
-
-3. **A2 — GStreamer pipeline tuning** (if needed). `waylandsink` caps negotiation,
-   `sync=false` vs `sync=true`, buffer pool size.
-
-**Gate A:** true product topology — two independent processes, both zero-copy
-hardware-promoted, correct zpos, `verify_planes.sh` passes. Any SHM fallback =
-gate failure; escalate to `appsink` + manual import.
-
-### Milestone I — input (wl_seat) — after A
+### Milestone I — input (wl_seat) — NEXT
 
 Bind `wl_seat` in the transport; translate `wl_pointer` / `wl_touch` /
 `wl_keyboard` → Qt events. Touchscreen: Weston owns libinput + calibration; the
@@ -360,4 +382,4 @@ in the DRM backend, below the shell layer.
 | D7-zpos | MA35D1 planes are **format-equivalent** (RGB+YUV both). Target: **UI on higher-zpos plane (overlay) over video on lower-zpos (primary)**. Rely on Weston's natural stacking-to-plane mapping; pin only if wrong. | Format equivalence removes the plane-count-vs-format fight. Validated at Milestone C: 220/220 frames PLANES_ONLY, correct zpos. |
 | D7-struct | Dedicated `QEtnaviv2dWaylandTransport` class owns all libwayland state; `BackingStore::flush()` delegates in wayland mode; KMS `Screen` path untouched; blitter/`EtnaBlittable` untouched. | Makes D11 literal — "adapted, not replaced; only transport switches". |
 | D7-scanner | Generate protocol bindings at **build time** via `wayland-scanner`, XML from the sysroot `wayland-protocols` datadir. | Guarantees generated code matches the installed protocol version; keeps the QPA self-contained. |
-| D7-weston-patches | Three `.patch` files in `package/weston/`. Fix 1 (0002): GBM+linux-dmabuf with pixman renderer. Fix 2 (0003): PLANES_ONLY no-buffer skip + dual-client overlay guard. | All fixes are in the DRM backend, below the shell layer — apply equally under kiosk-shell and ivi-shell. |
+| D7-weston-patches | Four patch areas in `package/weston/`. Fix 1 (0002): GBM+linux-dmabuf with pixman renderer. Fix 2 (0003): PLANES_ONLY no-buffer skip + dual-client overlay guard. Fix 3 (0003 continued): `get_scanout_formats_hook` in `weston_compositor` so pixman mode advertises KMS plane formats via `zwp_linux_dmabuf_v1`. Fix 4 (0003 continued): `DRM_FORMAT_MOD_INVALID` → `DRM_FORMAT_MOD_LINEAR` in `drm_fb_get_from_dmabuf()` for dumb BOs. | All fixes are in the DRM backend, below the shell layer — apply equally under kiosk-shell and ivi-shell. |
