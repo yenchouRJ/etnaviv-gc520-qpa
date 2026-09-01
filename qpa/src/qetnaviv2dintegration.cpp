@@ -279,6 +279,11 @@ QPlatformBackingStore *QEtnaviv2dIntegration::createPlatformBackingStore(
 QPlatformWindow *QEtnaviv2dIntegration::createPlatformWindow(
         QWindow *window) const
 {
+    /* Milestone I: hand the first top-level window to the transport so it
+     * can target QWindowSystemInterface input events at it. */
+    if (m_waylandTransport && !m_waylandTransport->window())
+        m_waylandTransport->setWindow(window);
+
     return new QFbWindow(window); /* QFbScreen manages window stack */
 }
 

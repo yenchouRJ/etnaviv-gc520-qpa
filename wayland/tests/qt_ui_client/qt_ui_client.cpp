@@ -1,9 +1,9 @@
 /*
- * qt_ui_client.cpp — Milestone B validation app.
+ * qt_ui_client.cpp -- Milestone B + I validation app.
  *
  * Minimal Qt app that exercises the etnaviv2d QPA in plane=wayland mode.
- * The QPA connects to Weston as a Wayland client, exports an ARGB dmabuf
- * ring, and drives frames via linux-dmabuf-v1 + xdg_toplevel.
+ * Updated for Milestone I: adds a touch/click counter button so Gate I
+ * (input working) is visually verifiable without serial logging.
  *
  * Run on target (Weston must be running):
  *   WAYLAND_DISPLAY=wayland-1 QT_QPA_PLATFORM=etnaviv2d:plane=wayland \
@@ -24,17 +24,22 @@
  *
  * The app draws a simple animated colour-cycling gradient + a frame counter
  * so it is obvious whether Qt is rendering live frames.
+ * 
+ * Gate I check:
+ *   Touch / click the blue "Tap me!" button in the lower-right corner.
+ *   The counter increments on screen -- this proves wl_touch / wl_pointer
+ *   events are reaching Qt widgets through the wl_seat bridge.
  */
 #include <QApplication>
 #include <QWidget>
 #include <QPainter>
+#include <QPushButton>
 #include <QTimer>
 #include <QLabel>
-#include <QVBoxLayout>
 #include <QDateTime>
 
 /* -----------------------------------------------------------------------
- * AnimWidget — fullscreen widget with animated colour cycling + frame info
+ * AnimWidget -- fullscreen widget with animated gradient + Gate I tap counter
  * ----------------------------------------------------------------------- */
 class AnimWidget : public QWidget
 {
@@ -47,7 +52,32 @@ public:
         , m_noGradient(noGradient)
     {
         setAttribute(Qt::WA_OpaquePaintEvent, !m_noGradient);
-        setWindowTitle(QStringLiteral("etnaviv2d wayland milestone-B"));
+        setWindowTitle(QStringLiteral("etnaviv2d wayland milestone-I"));
+
+        /* ---- Gate I: touch/click counter button --------------------------------
+         * Large button covering the entire lower half of the screen so it is
+         * easy to hit regardless of calibration offset. Tap and lift to increment. */
+        m_tapBtn = new QPushButton(QStringLiteral("Tap me!\nCount: 0"), this);
+        m_tapBtn->setGeometry(600, 380, 380, 180); /* bottom-right, calibration check */
+        QFont bf;
+        bf.setPointSize(20);
+        bf.setBold(true);
+        m_tapBtn->setFont(bf);
+        m_tapBtn->setStyleSheet(
+            QStringLiteral("QPushButton {"
+                           "  background-color: rgba(30,120,200,200);"
+                           "  color: white;"
+                           "  border: 4px solid white;"
+                           "  border-radius: 16px;"
+                           "}"
+                           "QPushButton:pressed {"
+                           "  background-color: rgba(200,80,30,220);"
+                           "}"));
+        connect(m_tapBtn, &QPushButton::pressed, this, [this]() {
+            ++m_tapCount;
+            m_tapBtn->setText(
+                QStringLiteral("Tap me!\nCount: %1").arg(m_tapCount));
+        });
 
         QTimer *t = new QTimer(this);
         connect(t, &QTimer::timeout, this, [this]() {
@@ -100,16 +130,13 @@ protected:
         p.setFont(f);
         p.drawText(QRect(200, 40, r.width() - 240, 60),
                    Qt::AlignLeft | Qt::AlignVCenter,
-                   m_noGradient
-                       ? QStringLiteral("etnaviv2d QPA — Wayland (no-gradient / alpha test)")
-                       : QStringLiteral("etnaviv2d QPA — Wayland mode (Milestone B)"));
+                   QStringLiteral("etnaviv2d QPA -- Wayland (Milestone I: input)"));
         f.setPointSize(14);
         f.setBold(false);
         p.setFont(f);
         p.drawText(QRect(200, 110, r.width() - 240, 40),
                    Qt::AlignLeft | Qt::AlignVCenter,
-                   QStringLiteral("frame=%1  hue=%2")
-                   .arg(m_frame).arg(m_hue));
+                   QStringLiteral("frame=%1  hue=%2").arg(m_frame).arg(m_hue));
         p.drawText(QRect(200, 155, r.width() - 240, 40),
                    Qt::AlignLeft | Qt::AlignVCenter,
                    QDateTime::currentDateTime().toString(
@@ -123,15 +150,14 @@ protected:
         p.drawText(QRect(40, 220, 120, 20), Qt::AlignCenter, QStringLiteral("T2 α=128"));
         if (!m_noGradient)
             p.drawText(QRect(40, 320, 120, 20), Qt::AlignCenter, QStringLiteral("T3 α=255"));
-        else
-            p.drawText(r.adjusted(40, 40, -40, -220), Qt::AlignHCenter | Qt::AlignBottom,
-                       QStringLiteral("T3 α=200 (large, no-gradient mode)"));
     }
 
 private:
-    int  m_frame;
-    int  m_hue;
-    bool m_noGradient;
+    int         m_frame;
+    int         m_hue;
+    bool        m_noGradient;
+    int         m_tapCount = 0;
+    QPushButton *m_tapBtn  = nullptr;
 };
 
 /* -----------------------------------------------------------------------

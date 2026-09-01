@@ -1,18 +1,7 @@
 /*
  * qetnaviv2dwaylandtransport.cpp — Wayland client transport for the etnaviv2d QPA.
  *
- * Milestone B implementation.  See header for design notes.
- *
- * Protocol sequence mirrors test_weston.c (Step 6):
- *   connect → registry bind → xdg_wm_base ping/pong → xdg_toplevel set_fullscreen
- *   → configure round-trip → ARGB ring alloc → frame-callback-driven commits.
- *
- * Key differences from test_weston (bare-C loop) vs here (Qt GUI thread):
- *   - No blocking while() loop.  The Wayland fd is watched by a QSocketNotifier;
- *     dispatch is via the safe prepare_read/read_events/dispatch_pending sequence.
- *   - connect() pumps the display synchronously only until the initial configure
- *     round-trip completes (needed so outputGeometry() is valid on return).
- *   - All subsequent pumping is event-driven (QSocketNotifier + aboutToBlock).
+ * Milestone B + I implementation.  See header for design notes.
  */
 
 #include "qetnaviv2dwaylandtransport.h"
@@ -23,6 +12,9 @@
 
 // libwayland-client
 #include <wayland-client.h>
+
+// linux input keycodes for the keyboard translation table
+#include <linux/input-event-codes.h>
 
 // libdrm (etnaviv BO dmabuf export)
 #include <libdrm/etnaviv_drmif.h>
@@ -37,6 +29,7 @@
 #include <QAbstractEventDispatcher>
 #include <QCoreApplication>
 #include <QDebug>
+#include <QtGui/5.15.18/QtGui/qpa/qwindowsysteminterface.h>
 
 #include <cerrno>
 #include <cstring>
@@ -409,6 +402,11 @@ void QEtnaviv2dWaylandTransport::disconnect()
     if (m_surface)     { wl_surface_destroy(m_surface);        m_surface     = nullptr; }
     if (m_dmabuf)      { zwp_linux_dmabuf_v1_destroy(m_dmabuf); m_dmabuf     = nullptr; }
     if (m_xdgWmBase)   { xdg_wm_base_destroy(m_xdgWmBase);    m_xdgWmBase   = nullptr; }
+    /* Milestone I: input objects */
+    if (m_keyboard)    { wl_keyboard_destroy(m_keyboard);      m_keyboard    = nullptr; }
+    if (m_touch)       { wl_touch_destroy(m_touch);            m_touch       = nullptr; }
+    if (m_pointer)     { wl_pointer_destroy(m_pointer);        m_pointer     = nullptr; }
+    if (m_seat)        { wl_seat_destroy(m_seat);              m_seat        = nullptr; }
     if (m_compositor)  { wl_compositor_destroy(m_compositor);  m_compositor  = nullptr; }
     if (m_registry)    { wl_registry_destroy(m_registry);      m_registry    = nullptr; }
     if (m_display)     { wl_display_disconnect(m_display);     m_display     = nullptr; }
@@ -467,6 +465,15 @@ void QEtnaviv2dWaylandTransport::registryGlobal(void *data,
             dmabufFormat, dmabufModifier
         };
         zwp_linux_dmabuf_v1_add_listener(self->m_dmabuf, &dmabuf_listener, self);
+    } else if (strcmp(iface, wl_seat_interface.name) == 0) {
+        /* Milestone I: bind wl_seat (version 7 for axis_discrete; cap at avail) */
+        self->m_seat = static_cast<wl_seat *>(
+            wl_registry_bind(reg, name, &wl_seat_interface, qMin(version, 7u)));
+        static const wl_seat_listener seat_listener = {
+            seatCapabilities,
+            seatName
+        };
+        wl_seat_add_listener(self->m_seat, &seat_listener, self);
     }
 }
 
@@ -585,6 +592,481 @@ void QEtnaviv2dWaylandTransport::frameCallback(void *data,
         wl_surface_commit(self->m_surface);
         wl_display_flush(self->m_display);
     }
+}
+
+/* =======================================================================
+ * Milestone I — wl_seat / wl_pointer / wl_touch / wl_keyboard
+ * ======================================================================= */
+
+/* -----------------------------------------------------------------------
+ * wl_seat listeners
+ * ----------------------------------------------------------------------- */
+void QEtnaviv2dWaylandTransport::seatCapabilities(void *data,
+                                                   wl_seat *seat,
+                                                   uint32_t caps)
+{
+    auto *self = static_cast<QEtnaviv2dWaylandTransport *>(data);
+
+    /* wl_pointer */
+    const bool hasPointer = caps & WL_SEAT_CAPABILITY_POINTER;
+    if (hasPointer && !self->m_pointer) {
+        self->m_pointer = wl_seat_get_pointer(seat);
+        static const wl_pointer_listener ptr_listener = {
+            pointerEnter, pointerLeave, pointerMotion,
+            pointerButton, pointerAxis,
+            pointerFrame, pointerAxisSource, pointerAxisStop, pointerAxisDiscrete,
+            nullptr, /* axis_value120 (wl_pointer v8) — not used */
+            nullptr, /* axis_relative_direction (wl_pointer v9) — not used */
+        };
+        wl_pointer_add_listener(self->m_pointer, &ptr_listener, self);
+        WL_INFO << "wl_pointer bound";
+    } else if (!hasPointer && self->m_pointer) {
+        wl_pointer_destroy(self->m_pointer);
+        self->m_pointer = nullptr;
+    }
+
+    /* wl_touch */
+    const bool hasTouch = caps & WL_SEAT_CAPABILITY_TOUCH;
+    if (hasTouch && !self->m_touch) {
+        self->m_touch = wl_seat_get_touch(seat);
+        static const wl_touch_listener touch_listener = {
+            touchDown, touchUp, touchMotion, touchFrame, touchCancel,
+            nullptr, /* shape (wl_touch v6) — not used */
+            nullptr, /* orientation (wl_touch v6) — not used */
+        };
+        wl_touch_add_listener(self->m_touch, &touch_listener, self);
+        WL_INFO << "wl_touch bound";
+    } else if (!hasTouch && self->m_touch) {
+        wl_touch_destroy(self->m_touch);
+        self->m_touch = nullptr;
+    }
+
+    /* wl_keyboard */
+    const bool hasKeyboard = caps & WL_SEAT_CAPABILITY_KEYBOARD;
+    if (hasKeyboard && !self->m_keyboard) {
+        self->m_keyboard = wl_seat_get_keyboard(seat);
+        static const wl_keyboard_listener kb_listener = {
+            keyboardKeymap, keyboardEnter, keyboardLeave,
+            keyboardKey, keyboardModifiers, keyboardRepeatInfo
+        };
+        wl_keyboard_add_listener(self->m_keyboard, &kb_listener, self);
+        WL_INFO << "wl_keyboard bound";
+    } else if (!hasKeyboard && self->m_keyboard) {
+        wl_keyboard_destroy(self->m_keyboard);
+        self->m_keyboard = nullptr;
+    }
+}
+
+void QEtnaviv2dWaylandTransport::seatName(void * /*data*/, wl_seat * /*seat*/,
+                                           const char *name)
+{
+    WL_DBG << "wl_seat name:" << name;
+}
+
+/* -----------------------------------------------------------------------
+ * wl_pointer listeners
+ *
+ * Weston delivers surface-local fixed-point coordinates.  We convert with
+ * wl_fixed_to_double() and accumulate state until pointerButton/pointerAxis
+ * where we fire QWindowSystemInterface events.
+ * ----------------------------------------------------------------------- */
+void QEtnaviv2dWaylandTransport::pointerEnter(void *data, wl_pointer * /*p*/,
+                                               uint32_t /*serial*/,
+                                               wl_surface * /*surf*/,
+                                               int32_t sx, int32_t sy)
+{
+    auto *self = static_cast<QEtnaviv2dWaylandTransport *>(data);
+    self->m_pointerPos = QPointF(wl_fixed_to_double(sx), wl_fixed_to_double(sy));
+    WL_DBG << "pointer enter" << self->m_pointerPos;
+}
+
+void QEtnaviv2dWaylandTransport::pointerLeave(void * /*data*/, wl_pointer * /*p*/,
+                                               uint32_t /*serial*/,
+                                               wl_surface * /*surf*/)
+{
+    WL_DBG << "pointer leave";
+}
+
+void QEtnaviv2dWaylandTransport::pointerMotion(void *data, wl_pointer * /*p*/,
+                                                uint32_t /*time*/,
+                                                int32_t sx, int32_t sy)
+{
+    auto *self = static_cast<QEtnaviv2dWaylandTransport *>(data);
+    self->m_pointerPos = QPointF(wl_fixed_to_double(sx), wl_fixed_to_double(sy));
+
+    if (!self->m_window) return;
+    QWindowSystemInterface::handleMouseEvent(
+        self->m_window,
+        self->m_pointerPos,
+        self->m_pointerPos,        /* global = local for fullscreen */
+        self->m_pointerButtons,
+        Qt::NoButton,
+        QEvent::MouseMove);
+}
+
+void QEtnaviv2dWaylandTransport::pointerButton(void *data, wl_pointer * /*p*/,
+                                                uint32_t /*serial*/,
+                                                uint32_t /*time*/,
+                                                uint32_t button,
+                                                uint32_t state)
+{
+    auto *self = static_cast<QEtnaviv2dWaylandTransport *>(data);
+    if (!self->m_window) return;
+
+    /* Map linux BTN_* to Qt::MouseButton */
+    Qt::MouseButton qtBtn = Qt::NoButton;
+    switch (button) {
+    case BTN_LEFT:   qtBtn = Qt::LeftButton;   break;
+    case BTN_RIGHT:  qtBtn = Qt::RightButton;  break;
+    case BTN_MIDDLE: qtBtn = Qt::MiddleButton; break;
+    default: break;
+    }
+    if (qtBtn == Qt::NoButton) return;
+
+    const bool pressed = (state == WL_POINTER_BUTTON_STATE_PRESSED);
+    if (pressed)
+        self->m_pointerButtons |= qtBtn;
+    else
+        self->m_pointerButtons &= ~qtBtn;
+
+    const QEvent::Type evType = pressed ? QEvent::MouseButtonPress
+                                        : QEvent::MouseButtonRelease;
+    QWindowSystemInterface::handleMouseEvent(
+        self->m_window,
+        self->m_pointerPos,
+        self->m_pointerPos,
+        self->m_pointerButtons,
+        qtBtn,
+        evType);
+
+    WL_DBG << "pointer button" << button << (pressed ? "pressed" : "released")
+           << "pos" << self->m_pointerPos;
+}
+
+void QEtnaviv2dWaylandTransport::pointerAxis(void *data, wl_pointer * /*p*/,
+                                              uint32_t /*time*/,
+                                              uint32_t axis, int32_t value)
+{
+    auto *self = static_cast<QEtnaviv2dWaylandTransport *>(data);
+    if (!self->m_window) return;
+
+    /* axis 0 = vertical scroll, axis 1 = horizontal scroll.
+     * wl_fixed value is in surface units × 256; map to pixels / 10 for Qt. */
+    const int delta = -wl_fixed_to_int(value); /* invert: Wayland down = positive */
+    const QPoint angleDelta = (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+                               ? QPoint(0, delta * 12)
+                               : QPoint(delta * 12, 0);
+
+    QWindowSystemInterface::handleWheelEvent(
+        self->m_window,
+        self->m_pointerPos,
+        self->m_pointerPos,
+        QPoint(),       /* pixelDelta — not used */
+        angleDelta,
+        Qt::NoModifier);
+}
+
+/* wl_pointer v5+ frame/axis_source/axis_stop/axis_discrete: not needed but
+ * the listener struct must be complete. */
+void QEtnaviv2dWaylandTransport::pointerFrame(void * /*d*/, wl_pointer * /*p*/) {}
+void QEtnaviv2dWaylandTransport::pointerAxisSource(void * /*d*/, wl_pointer * /*p*/, uint32_t /*s*/) {}
+void QEtnaviv2dWaylandTransport::pointerAxisStop(void * /*d*/, wl_pointer * /*p*/, uint32_t /*t*/, uint32_t /*a*/) {}
+void QEtnaviv2dWaylandTransport::pointerAxisDiscrete(void * /*d*/, wl_pointer * /*p*/, uint32_t /*a*/, int32_t /*v*/) {}
+
+/* -----------------------------------------------------------------------
+ * wl_touch listeners
+ *
+ * Weston sends pre-calibrated surface-local wl_fixed_t coordinates — the
+ * libinput calibration matrix from /etc/udev/rules.d/libinput.rules has
+ * already been applied.  No further transform needed.
+ *
+ * We accumulate touch points per-frame and flush them together on touchFrame()
+ * so Qt's gesture recognisers see a coherent multi-touch snapshot.
+ * ----------------------------------------------------------------------- */
+void QEtnaviv2dWaylandTransport::touchDown(void *data, wl_touch * /*t*/,
+                                            uint32_t /*serial*/, uint32_t /*time*/,
+                                            wl_surface * /*surf*/,
+                                            int32_t id, int32_t x, int32_t y)
+{
+    auto *self = static_cast<QEtnaviv2dWaylandTransport *>(data);
+    TouchPoint tp;
+    tp.id    = id;
+    tp.pos   = QPointF(wl_fixed_to_double(x), wl_fixed_to_double(y));
+    tp.state = Qt::TouchPointPressed;
+
+    /* If a point with this id already exists (driver re-uses id without sending
+     * up — common on single-touch ABS devices), synthesize a release for it
+     * first so Qt sees a clean press/release cycle. */
+    for (int i = 0; i < self->m_touchPoints.size(); ++i) {
+        if (self->m_touchPoints[i].id == id) {
+            self->m_touchPoints[i].state = Qt::TouchPointReleased;
+            /* flush the synthetic release immediately */
+            touchFrame(data, nullptr);
+            break;
+        }
+    }
+
+    self->m_touchPoints.append(tp);
+    WL_DBG << "touch down id=" << id << tp.pos;
+}
+
+void QEtnaviv2dWaylandTransport::touchUp(void *data, wl_touch * /*t*/,
+                                          uint32_t /*serial*/, uint32_t /*time*/,
+                                          int32_t id)
+{
+    auto *self = static_cast<QEtnaviv2dWaylandTransport *>(data);
+    for (auto &tp : self->m_touchPoints) {
+        if (tp.id == id) { tp.state = Qt::TouchPointReleased; return; }
+    }
+    WL_DBG << "touch up id=" << id;
+}
+
+void QEtnaviv2dWaylandTransport::touchMotion(void *data, wl_touch * /*t*/,
+                                              uint32_t /*time*/,
+                                              int32_t id, int32_t x, int32_t y)
+{
+    auto *self = static_cast<QEtnaviv2dWaylandTransport *>(data);
+    const QPointF pos(wl_fixed_to_double(x), wl_fixed_to_double(y));
+    for (auto &tp : self->m_touchPoints) {
+        if (tp.id == id) { tp.pos = pos; tp.state = Qt::TouchPointMoved; return; }
+    }
+    WL_DBG << "touch motion id=" << id << pos;
+}
+
+void QEtnaviv2dWaylandTransport::touchFrame(void *data, wl_touch * /*t*/)
+{
+    auto *self = static_cast<QEtnaviv2dWaylandTransport *>(data);
+    if (!self->m_window || self->m_touchPoints.isEmpty()) return;
+
+    /* Build QWindowSystemInterface touch point list */
+    QList<QWindowSystemInterface::TouchPoint> qtPoints;
+    for (const auto &tp : self->m_touchPoints) {
+        QWindowSystemInterface::TouchPoint qtp;
+        qtp.id       = tp.id;
+        qtp.state    = tp.state;
+        qtp.area     = QRectF(tp.pos, QSizeF(1, 1));
+        qtp.pressure = (tp.state == Qt::TouchPointReleased) ? 0.0 : 1.0;
+        /* normalizedPos removed in Qt 5.15; area in screen pixels is sufficient */
+        qtPoints.append(qtp);
+    }
+
+    /* Use a static QTouchDevice pointer — created once */
+    static QTouchDevice *s_touchDevice = []() {
+        auto *dev = new QTouchDevice;
+        dev->setName(QStringLiteral("wl_touch"));
+        dev->setType(QTouchDevice::TouchScreen);
+        dev->setCapabilities(QTouchDevice::Position | QTouchDevice::Pressure);
+        QWindowSystemInterface::registerTouchDevice(dev);
+        return dev;
+    }();
+
+    QWindowSystemInterface::handleTouchEvent(
+        self->m_window, s_touchDevice, qtPoints);
+
+    WL_DBG << "touch frame:" << qtPoints.size() << "points";
+
+    /* Remove released points from the accumulator */
+    self->m_touchPoints.erase(
+        std::remove_if(self->m_touchPoints.begin(), self->m_touchPoints.end(),
+                       [](const TouchPoint &tp) {
+                           return tp.state == Qt::TouchPointReleased;
+                       }),
+        self->m_touchPoints.end());
+}
+
+void QEtnaviv2dWaylandTransport::touchCancel(void *data, wl_touch * /*t*/)
+{
+    auto *self = static_cast<QEtnaviv2dWaylandTransport *>(data);
+
+    /* Mark all tracked points as released and flush them through Qt so widgets
+     * get a proper release event — critical on single-touch ABS drivers that
+     * send cancel instead of up on lift. */
+    for (auto &tp : self->m_touchPoints)
+        tp.state = Qt::TouchPointReleased;
+
+    if (!self->m_touchPoints.isEmpty())
+        touchFrame(data, nullptr); /* reuse frame flush */
+
+    self->m_touchPoints.clear();
+    WL_DBG << "touch cancel";
+}
+
+/* -----------------------------------------------------------------------
+ * wl_keyboard listeners
+ *
+ * We use a compact linux→Qt keycode lookup table instead of xkbcommon to
+ * avoid the xkbcommon dependency on an embedded kiosk target.  The table
+ * covers the keys that are realistic for a kiosk UI (navigation, digits,
+ * function keys, common symbols).
+ * ----------------------------------------------------------------------- */
+void QEtnaviv2dWaylandTransport::keyboardKeymap(void * /*data*/,
+                                                 wl_keyboard * /*kb*/,
+                                                 uint32_t /*format*/,
+                                                 int32_t fd, uint32_t /*size*/)
+{
+    /* We ignore the keymap fd and use the static linux→Qt table below.
+     * Close the fd to avoid leaking it. */
+    close(fd);
+}
+
+void QEtnaviv2dWaylandTransport::keyboardEnter(void * /*data*/,
+                                                wl_keyboard * /*kb*/,
+                                                uint32_t /*serial*/,
+                                                wl_surface * /*surf*/,
+                                                struct wl_array * /*keys*/)
+{
+    WL_DBG << "keyboard enter";
+}
+
+void QEtnaviv2dWaylandTransport::keyboardLeave(void * /*data*/,
+                                                wl_keyboard * /*kb*/,
+                                                uint32_t /*serial*/,
+                                                wl_surface * /*surf*/)
+{
+    WL_DBG << "keyboard leave";
+}
+
+void QEtnaviv2dWaylandTransport::keyboardKey(void *data,
+                                              wl_keyboard * /*kb*/,
+                                              uint32_t /*serial*/,
+                                              uint32_t /*time*/,
+                                              uint32_t key,
+                                              uint32_t state)
+{
+    auto *self = static_cast<QEtnaviv2dWaylandTransport *>(data);
+    if (!self->m_window) return;
+
+    const Qt::Key qtKey = linuxKeyToQt(key);
+    if (qtKey == Qt::Key_unknown) return;
+
+    /* Build modifier flags from accumulated wl_keyboard.modifiers state */
+    Qt::KeyboardModifiers mods = Qt::NoModifier;
+    /* Bit positions: SHIFT=0, CAPS=1, CTRL=2, ALT=3 (standard Linux evdev) */
+    const uint32_t m = self->m_keyModsDepressed | self->m_keyModsLatched
+                       | self->m_keyModsLocked;
+    if (m & (1u << 0)) mods |= Qt::ShiftModifier;
+    if (m & (1u << 2)) mods |= Qt::ControlModifier;
+    if (m & (1u << 3)) mods |= Qt::AltModifier;
+
+    const bool pressed = (state == WL_KEYBOARD_KEY_STATE_PRESSED);
+    QWindowSystemInterface::handleKeyEvent(
+        self->m_window,
+        pressed ? QEvent::KeyPress : QEvent::KeyRelease,
+        qtKey,
+        mods,
+        QString() /* text — not decoded without xkbcommon */);
+
+    WL_DBG << "key" << key << (pressed ? "pressed" : "released") << "→ Qt::Key" << qtKey;
+}
+
+void QEtnaviv2dWaylandTransport::keyboardModifiers(void *data,
+                                                    wl_keyboard * /*kb*/,
+                                                    uint32_t /*serial*/,
+                                                    uint32_t mods_depressed,
+                                                    uint32_t mods_latched,
+                                                    uint32_t mods_locked,
+                                                    uint32_t /*group*/)
+{
+    auto *self = static_cast<QEtnaviv2dWaylandTransport *>(data);
+    self->m_keyModsDepressed = mods_depressed;
+    self->m_keyModsLatched   = mods_latched;
+    self->m_keyModsLocked    = mods_locked;
+}
+
+void QEtnaviv2dWaylandTransport::keyboardRepeatInfo(void * /*data*/,
+                                                     wl_keyboard * /*kb*/,
+                                                     int32_t /*rate*/,
+                                                     int32_t /*delay*/)
+{
+    /* Key repeat is handled by Qt internally — ignore Weston's advertised rate. */
+}
+
+/* -----------------------------------------------------------------------
+ * linuxKeyToQt() — compact linux evdev → Qt::Key lookup table
+ * Covers navigation, digits, function keys, common symbols used in kiosk UIs.
+ * ----------------------------------------------------------------------- */
+Qt::Key QEtnaviv2dWaylandTransport::linuxKeyToQt(uint32_t k)
+{
+    /* clang-format off */
+    switch (k) {
+    /* Navigation */
+    case KEY_UP:        return Qt::Key_Up;
+    case KEY_DOWN:      return Qt::Key_Down;
+    case KEY_LEFT:      return Qt::Key_Left;
+    case KEY_RIGHT:     return Qt::Key_Right;
+    case KEY_HOME:      return Qt::Key_Home;
+    case KEY_END:       return Qt::Key_End;
+    case KEY_PAGEUP:    return Qt::Key_PageUp;
+    case KEY_PAGEDOWN:  return Qt::Key_PageDown;
+    /* Control */
+    case KEY_ENTER:
+    case KEY_KPENTER:   return Qt::Key_Return;
+    case KEY_ESC:       return Qt::Key_Escape;
+    case KEY_BACKSPACE: return Qt::Key_Backspace;
+    case KEY_DELETE:    return Qt::Key_Delete;
+    case KEY_TAB:       return Qt::Key_Tab;
+    case KEY_SPACE:     return Qt::Key_Space;
+    /* Digits */
+    case KEY_0:         return Qt::Key_0;
+    case KEY_1:         return Qt::Key_1;
+    case KEY_2:         return Qt::Key_2;
+    case KEY_3:         return Qt::Key_3;
+    case KEY_4:         return Qt::Key_4;
+    case KEY_5:         return Qt::Key_5;
+    case KEY_6:         return Qt::Key_6;
+    case KEY_7:         return Qt::Key_7;
+    case KEY_8:         return Qt::Key_8;
+    case KEY_9:         return Qt::Key_9;
+    /* Letters (uppercase Qt::Key_ values) */
+    case KEY_A:         return Qt::Key_A;
+    case KEY_B:         return Qt::Key_B;
+    case KEY_C:         return Qt::Key_C;
+    case KEY_D:         return Qt::Key_D;
+    case KEY_E:         return Qt::Key_E;
+    case KEY_F:         return Qt::Key_F;
+    case KEY_G:         return Qt::Key_G;
+    case KEY_H:         return Qt::Key_H;
+    case KEY_I:         return Qt::Key_I;
+    case KEY_J:         return Qt::Key_J;
+    case KEY_K:         return Qt::Key_K;
+    case KEY_L:         return Qt::Key_L;
+    case KEY_M:         return Qt::Key_M;
+    case KEY_N:         return Qt::Key_N;
+    case KEY_O:         return Qt::Key_O;
+    case KEY_P:         return Qt::Key_P;
+    case KEY_Q:         return Qt::Key_Q;
+    case KEY_R:         return Qt::Key_R;
+    case KEY_S:         return Qt::Key_S;
+    case KEY_T:         return Qt::Key_T;
+    case KEY_U:         return Qt::Key_U;
+    case KEY_V:         return Qt::Key_V;
+    case KEY_W:         return Qt::Key_W;
+    case KEY_X:         return Qt::Key_X;
+    case KEY_Y:         return Qt::Key_Y;
+    case KEY_Z:         return Qt::Key_Z;
+    /* Function keys */
+    case KEY_F1:        return Qt::Key_F1;
+    case KEY_F2:        return Qt::Key_F2;
+    case KEY_F3:        return Qt::Key_F3;
+    case KEY_F4:        return Qt::Key_F4;
+    case KEY_F5:        return Qt::Key_F5;
+    case KEY_F6:        return Qt::Key_F6;
+    case KEY_F7:        return Qt::Key_F7;
+    case KEY_F8:        return Qt::Key_F8;
+    case KEY_F9:        return Qt::Key_F9;
+    case KEY_F10:       return Qt::Key_F10;
+    case KEY_F11:       return Qt::Key_F11;
+    case KEY_F12:       return Qt::Key_F12;
+    /* Modifiers */
+    case KEY_LEFTSHIFT:
+    case KEY_RIGHTSHIFT: return Qt::Key_Shift;
+    case KEY_LEFTCTRL:
+    case KEY_RIGHTCTRL:  return Qt::Key_Control;
+    case KEY_LEFTALT:
+    case KEY_RIGHTALT:   return Qt::Key_Alt;
+    default:             return Qt::Key_unknown;
+    }
+    /* clang-format on */
 }
 
 QT_END_NAMESPACE

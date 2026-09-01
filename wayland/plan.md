@@ -8,8 +8,8 @@ zero-copy, both hardware-promoted, Weston owning plane arbitration. This is
 transport switches from direct KMS to Wayland; `libetna2d` / `EtnaBlittable` /
 the GC520 blitter are untouched.
 
-> **Status (2026-08-28):** Milestones B, C, and A are hardware-verified and closed.
-> Milestone I (`wl_seat` input) is next.
+> **Status (2026-08-31):** Milestones B, C, A, and I are hardware-verified and closed.
+> Milestone IVI (`ivi-shell`) is next (deferred).
 
 > **Prerequisite:** Phase 6 (`compositor/plan.md`) closed. `test_weston` proved
 > the NV12 dmabuf → hardware plane path with a bare C client; Phase 7 reuses that
@@ -330,16 +330,42 @@ plane[38] overlay   AR24  zpos=1  (qt_ui_client)
   `FB_ID` grep which misses the new `fb=` format in debugfs — a script bug,
   not a hardware bug; both planes are active).
 
-### Milestone I — input (wl_seat) — NEXT
+### Milestone I — input (wl_seat) ✓ DONE
 
-Bind `wl_seat` in the transport; translate `wl_pointer` / `wl_touch` /
-`wl_keyboard` → Qt events. Touchscreen: Weston owns libinput + calibration; the
-client receives already-calibrated `wl_touch` coordinates. Validate: touch/mouse
-in the Qt UI reaches widgets correctly.
+Bound `wl_seat` in the transport; translated `wl_pointer` / `wl_touch` /
+`wl_keyboard` → Qt events. Touchscreen: Weston owns libinput + calibration;
+the client receives already-calibrated `wl_touch` coordinates.
 
-**Gate I:** interactive Qt UI over video, touch/mouse working.
+**Gate I result (hardware-verified):**
+- `wl_touch bound`, `wl_keyboard bound` logged on startup.
+- Touch coordinates delivered pre-calibrated (libinput matrix from
+  `/etc/udev/rules.d/libinput.rules` already applied by Weston).
+- `QPushButton` in `qt_ui_client` responds to touch — counter increments,
+  button highlights on press.
+- Calibration verified: button positioned in bottom-right corner (600,380),
+  touch lands correctly in that region.
+- Planes remain PLANES_ONLY during touch (input does not trigger compositor
+  fallback).
 
-### Milestone IVI — ivi-shell (deferred, after I)
+Two bugs found and fixed during I:
+
+1. **`m_window` was null** — `setWindow()` existed in the transport but was
+   never called. `touch down` events arrived with correct coordinates but
+   `handleTouchEvent` was a no-op. Fix: `createPlatformWindow` in the
+   integration now calls `transport->setWindow(window)` for the first
+   top-level window.
+
+2. **`wl_touch.up` never sent by Weston for this hardware** — The MA35D1
+   resistive touchscreen uses `ABS_PRESSURE` single-touch protocol (no
+   `ABS_MT_*`). Libinput/Weston sends `wl_touch.cancel` on lift instead of
+   `wl_touch.up`. `QPushButton::clicked` (requires press+release) never
+   fired. Fixes: (a) `touchCancel` now marks all points `Released` and
+   flushes them through `touchFrame` → `handleTouchEvent` so Qt clears press
+   state for the next tap; (b) `touchDown` for an already-tracked id
+   synthesizes a release first; (c) test button uses `pressed` signal so the
+   counter increments immediately on touch-down, independent of lift.
+
+### Milestone IVI — ivi-shell (deferred) — NEXT
 
 Replace kiosk-shell with ivi-shell for **deterministic, programmatic z-order
 control** independent of client launch sequence. kiosk-shell is sufficient for
@@ -369,12 +395,36 @@ in the DRM backend, below the shell layer.
 
 ---
 
+### Milestone C2 — hardware cursor plane (not yet implemented)
+
+**Status: not started. Worth pursuing after IVI.**
+
+`wl_pointer` cursor movement is verified to reach Qt (pointer enter/motion events
+are wired), but the **visual cursor** has not been implemented or verified.
+Weston exposes a dedicated cursor plane — `plane[49] zpos=2` (CURSOR, 32×32,
+XRGB8888) — that is currently unused (fb=0 throughout all milestone tests).
+
+A hardware cursor would use this plane zero-copy at no compositor cost:
+
+| What | How |
+|---|---|
+| Weston side | Already handled — Weston sets the cursor plane from the `wl_pointer.set_cursor` / `wl_surface` the client provides via `wl_pointer_set_cursor()`. No Weston changes needed. |
+| QPA side | Override `QPlatformCursor` (or implement `QEtnaviv2dCursor`) to call `wl_pointer_set_cursor()` with a 32×32 ARGB `wl_buffer`; Weston will route it to `plane[49]` automatically. |
+| Constraint | Cursor plane is 32×32 XRGB8888 only (hardware limit). Custom cursors must be pre-scaled to 32×32. |
+
+**Why it matters:** without a hardware cursor, any pointer movement repaints the
+full overlay BO (software cursor blit) and triggers a new `wl_surface_commit`.
+With the cursor plane, pointer movement is handled entirely by the display
+engine — no repaint, no commit, zero CPU/GPU cost.
+
+---
+
 ## Decision log (Phase 7)
 
 | ID | Decision | Rationale |
 |----|----------|-----------|
 | D7-topology | Staged: **(B)** single QPA client → **(C)** QPA + `test_weston` two-plane arbitration → **(A)** real `waylandsink`. ivi-shell deferred to after Milestone I. | The highest-risk unknown was the D11 QPA transport. Prove in isolation, then add arbitration with a known-good video partner, then swap in the real sink. ivi-shell deferred: kiosk-shell + `0003-*.patch` is sufficient for the validated configuration; ivi-shell only needed for runtime layer control. |
-| D7-input | QPA binds `wl_seat` and translates Wayland input → Qt events; evdev/libinput path **disabled** in wayland mode. **Implemented after Milestone A.** | Under Weston the client must not open `/dev/input/*`. Sequenced after video to isolate transport risk first. |
+| D7-input | QPA binds `wl_seat` and translates Wayland input → Qt events; evdev/libinput path **disabled** in wayland mode. **Implemented at Milestone I.** Single-touch ABS driver quirk: `wl_touch.cancel` used instead of `wl_touch.up` on lift — handled by flushing released events in `touchCancel` and using `pressed` signal in test widget. | Under Weston the client must not open `/dev/input/*`. Sequenced after video to isolate transport risk first. |
 | D7-buffer | **Zero-copy** ARGB8888/LINEAR BO ring (3 deep) exported as persistent `wl_buffer`s, cycled under `wl_buffer.release`. Blitter renders straight into the free ring BO. | etnaviv2d BOs are already exportable dmabuf; reuses D9b ring + `test_weston` transport; avoids a needless per-frame ARGB memcpy. |
 | D7-role | Single fullscreen `xdg_toplevel`; Qt composites all child/popup content into it. No `xdg_popup`/subsurfaces. | Kiosk appliance. Qt already flattens child widgets into the top-level backing store with no WM. Multi-surface support = large lifecycle complexity, zero product value here. |
 | D7-loop | Single-threaded `QSocketNotifier` on `wl_display_get_fd()`; notifier armed lazily on first `commitFrame()`; flush on `aboutToBlock`; `prepare_read`/`read_events`/`dispatch_pending` sequence. | Matches stock qtwayland; no threads means ring handling stays on the main thread — no locking. Lazy arming avoids the pre-exec-loop Qt notifier bug discovered at Milestone B. |

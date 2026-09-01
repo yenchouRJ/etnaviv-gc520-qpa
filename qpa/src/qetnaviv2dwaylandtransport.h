@@ -1,7 +1,7 @@
 /*
  * qetnaviv2dwaylandtransport.h — Wayland client transport for the etnaviv2d QPA.
  *
- * Milestone B: fills the plane=wayland stub (isStub() seam in QEtnaviv2dScreen).
+ * Milestone B + I: fills the plane=wayland stub (isStub() seam in QEtnaviv2dScreen).
  *
  * Design (D11 / wayland/plan.md):
  *  - Owns all libwayland-client state: display, registry, compositor,
@@ -22,8 +22,18 @@
  *  - wl_buffer.release drives the ring back-pressure (pickFree() discipline
  *    from test_weston / D9b).
  *
- * NOT in this file (deferred to Milestone I):
- *  - wl_seat / wl_pointer / wl_touch / wl_keyboard input bridge.
+ * Milestone I — wl_seat input bridge:
+ *  - Binds wl_seat from the registry.
+ *  - On wl_seat.capabilities: creates wl_pointer, wl_touch, wl_keyboard as
+ *    advertised.
+ *  - Translates Wayland input events → QWindowSystemInterface calls on the
+ *    single fullscreen QWindow (m_window, set by setWindow()).
+ *  - wl_pointer: motion/enter/leave → handleMouseEvent; button → handleMouseEvent;
+ *    axis → handleWheelEvent.
+ *  - wl_touch: down/up/motion/frame/cancel → handleTouchEvent.  Weston delivers
+ *    pre-calibrated surface-local coordinates (libinput matrix already applied).
+ *  - wl_keyboard: key → handleKeyEvent via a compact linux→Qt keycode table.
+ *    No xkbcommon dependency (embedded kiosk; raw keycodes suffice).
  *
  * Thread safety: all methods must be called from the Qt GUI thread.
  */
@@ -32,6 +42,9 @@
 #include <QObject>
 #include <QRect>
 #include <QSocketNotifier>
+#include <QWindow>
+#include <QPointF>
+#include <QVector>
 #include <functional>
 #include <atomic>
 
@@ -43,6 +56,10 @@ struct wl_compositor;
 struct wl_surface;
 struct wl_buffer;
 struct wl_callback;
+struct wl_seat;
+struct wl_pointer;
+struct wl_touch;
+struct wl_keyboard;
 struct xdg_wm_base;
 struct xdg_surface;
 struct xdg_toplevel;
@@ -115,6 +132,13 @@ public:
     /* Is the transport connected and operational? */
     bool isConnected() const { return m_connected; }
 
+    /* Milestone I — register the Qt window that receives translated input events.
+     * Must be called after the QWindow has been created (typically from
+     * QEtnaviv2dIntegration::createWindow) so the transport can target
+     * QWindowSystemInterface calls at it. */
+    void setWindow(QWindow *w) { m_window = w; }
+    QWindow *window() const   { return m_window; }
+
 private slots:
     void onWaylandReadable();
     void onAboutToBlock();
@@ -160,6 +184,59 @@ private:
     /* wl_surface frame callback */
     static void frameCallback(void *data, wl_callback *cb, uint32_t time);
 
+    /* ---- Milestone I: wl_seat / wl_pointer / wl_touch / wl_keyboard ---- */
+
+    /* wl_seat */
+    static void seatCapabilities(void *data, wl_seat *seat, uint32_t caps);
+    static void seatName(void *data, wl_seat *seat, const char *name);
+
+    /* wl_pointer */
+    static void pointerEnter(void *data, wl_pointer *p, uint32_t serial,
+                             wl_surface *surf, int32_t sx, int32_t sy);
+    static void pointerLeave(void *data, wl_pointer *p, uint32_t serial,
+                             wl_surface *surf);
+    static void pointerMotion(void *data, wl_pointer *p, uint32_t time,
+                              int32_t sx, int32_t sy);
+    static void pointerButton(void *data, wl_pointer *p, uint32_t serial,
+                              uint32_t time, uint32_t button, uint32_t state);
+    static void pointerAxis(void *data, wl_pointer *p, uint32_t time,
+                            uint32_t axis, int32_t value);
+    static void pointerFrame(void *data, wl_pointer *p);
+    static void pointerAxisSource(void *data, wl_pointer *p, uint32_t source);
+    static void pointerAxisStop(void *data, wl_pointer *p, uint32_t time,
+                                uint32_t axis);
+    static void pointerAxisDiscrete(void *data, wl_pointer *p, uint32_t axis,
+                                    int32_t discrete);
+
+    /* wl_touch */
+    static void touchDown(void *data, wl_touch *t, uint32_t serial,
+                          uint32_t time, wl_surface *surf,
+                          int32_t id, int32_t x, int32_t y);
+    static void touchUp(void *data, wl_touch *t, uint32_t serial,
+                        uint32_t time, int32_t id);
+    static void touchMotion(void *data, wl_touch *t, uint32_t time,
+                            int32_t id, int32_t x, int32_t y);
+    static void touchFrame(void *data, wl_touch *t);
+    static void touchCancel(void *data, wl_touch *t);
+
+    /* wl_keyboard */
+    static void keyboardKeymap(void *data, wl_keyboard *kb, uint32_t format,
+                               int32_t fd, uint32_t size);
+    static void keyboardEnter(void *data, wl_keyboard *kb, uint32_t serial,
+                              wl_surface *surf, struct wl_array *keys);
+    static void keyboardLeave(void *data, wl_keyboard *kb, uint32_t serial,
+                              wl_surface *surf);
+    static void keyboardKey(void *data, wl_keyboard *kb, uint32_t serial,
+                            uint32_t time, uint32_t key, uint32_t state);
+    static void keyboardModifiers(void *data, wl_keyboard *kb, uint32_t serial,
+                                  uint32_t mods_depressed, uint32_t mods_latched,
+                                  uint32_t mods_locked, uint32_t group);
+    static void keyboardRepeatInfo(void *data, wl_keyboard *kb,
+                                   int32_t rate, int32_t delay);
+
+    /* Key translation helper: linux evdev keycode → Qt::Key */
+    static Qt::Key linuxKeyToQt(uint32_t linux_key);
+
     /* Helpers */
     void armNotifier();           // create QSocketNotifier lazily on first commitFrame()
     void doCommit(int slot);      // attach buf[slot], damage, commit, arm next frame cb
@@ -176,6 +253,32 @@ private:
     xdg_toplevel        *m_xdgToplevel = nullptr;
     zwp_linux_dmabuf_v1 *m_dmabuf     = nullptr;
     wl_callback         *m_frameCallback = nullptr;
+
+    /* ---- Milestone I: input objects ---- */
+    wl_seat             *m_seat       = nullptr;
+    wl_pointer          *m_pointer    = nullptr;
+    wl_touch            *m_touch      = nullptr;
+    wl_keyboard         *m_keyboard   = nullptr;
+
+    /* Target Qt window for input event delivery (set by setWindow()) */
+    QWindow             *m_window     = nullptr;
+
+    /* Pointer state accumulated between wl_pointer events */
+    QPointF              m_pointerPos;
+    Qt::MouseButtons     m_pointerButtons { Qt::NoButton };
+
+    /* Touch point accumulator: flushed to Qt on touchFrame() */
+    struct TouchPoint {
+        int     id;
+        QPointF pos;
+        Qt::TouchPointState state;
+    };
+    QVector<TouchPoint>  m_touchPoints;
+
+    /* Keyboard modifier state (raw bitmask from wl_keyboard.modifiers) */
+    uint32_t             m_keyModsDepressed = 0;
+    uint32_t             m_keyModsLatched   = 0;
+    uint32_t             m_keyModsLocked    = 0;
 
     /* ---- BO ring ---- */
     ArgbBo   m_ring[WL_RING_SIZE];
