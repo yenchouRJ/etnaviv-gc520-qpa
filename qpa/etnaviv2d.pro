@@ -119,6 +119,23 @@ dmabuf_hdr.commands = $$WL_SCANNER client-header ${QMAKE_FILE_IN} ${QMAKE_FILE_O
 dmabuf_hdr.variable_out = HEADERS
 QMAKE_EXTRA_COMPILERS += dmabuf_hdr
 
+# ivi-application (Milestone IVI) — XML lives in the Weston build tree
+IVI_APP_XML = /home/joeylu/Documents/workspace/ma35d1/ma35d1_br24_qt5/output/build/weston-10.0.5/protocol/ivi-application.xml
+
+ivi_app_src.name   = ivi-application-protocol.c
+ivi_app_src.input  = IVI_APP_XML
+ivi_app_src.output = ivi-application-protocol.c
+ivi_app_src.commands = $$WL_SCANNER private-code ${QMAKE_FILE_IN} ${QMAKE_FILE_OUT}
+ivi_app_src.variable_out = SOURCES
+QMAKE_EXTRA_COMPILERS += ivi_app_src
+
+ivi_app_hdr.name   = ivi-application-client-protocol.h
+ivi_app_hdr.input  = IVI_APP_XML
+ivi_app_hdr.output = ivi-application-client-protocol.h
+ivi_app_hdr.commands = $$WL_SCANNER client-header ${QMAKE_FILE_IN} ${QMAKE_FILE_OUT}
+ivi_app_hdr.variable_out = HEADERS
+QMAKE_EXTRA_COMPILERS += ivi_app_hdr
+
 # Generated headers are in OUT_PWD — add to include path
 INCLUDEPATH += $$OUT_PWD
 

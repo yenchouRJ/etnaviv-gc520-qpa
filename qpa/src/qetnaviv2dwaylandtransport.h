@@ -35,6 +35,14 @@
  *  - wl_keyboard: key → handleKeyEvent via a compact linux→Qt keycode table.
  *    No xkbcommon dependency (embedded kiosk; raw keycodes suffice).
  *
+ * Milestone IVI — ivi-shell auto-detection:
+ *  - In registryGlobal, binds ivi_application when advertised (ivi-shell).
+ *  - In connect(), detects shell at runtime:
+ *      ivi-shell  → ivi_application_surface_create(IVI_ID_QT, wl_surface)
+ *      kiosk-shell → xdg_wm_base + xdg_toplevel (existing path)
+ *  - IVI surface ID defaults to 2000; override with QT_IVI_SURFACE_ID env var.
+ *  - No rebuild required to switch shells — only weston.ini changes.
+ *
  * Thread safety: all methods must be called from the Qt GUI thread.
  */
 #pragma once
@@ -63,6 +71,8 @@ struct wl_keyboard;
 struct xdg_wm_base;
 struct xdg_surface;
 struct xdg_toplevel;
+struct ivi_application;
+struct ivi_surface;
 struct zwp_linux_dmabuf_v1;
 struct zwp_linux_buffer_params_v1;
 
@@ -100,8 +110,10 @@ public:
                                         QObject       *parent = nullptr);
     ~QEtnaviv2dWaylandTransport() override;
 
-    /* Phase 1 initialisation: connect, bind globals, create xdg_toplevel.
-     * Pumps the display until the xdg_surface configure round-trip completes
+    /* Phase 1 initialisation: connect, bind globals, create surface role.
+     * Auto-detects shell: if ivi_application is advertised uses IVI role,
+     * otherwise falls back to xdg_toplevel (kiosk-shell).
+     * Pumps the display until the configure round-trip completes
      * so the caller can read outputGeometry() immediately after. */
     bool connect();
 
@@ -163,6 +175,10 @@ private:
                                      int32_t w, int32_t h,
                                      struct wl_array *states);
     static void xdgToplevelClose(void *data, xdg_toplevel *tl);
+
+    /* ivi_surface configure (Milestone IVI) */
+    static void iviSurfaceConfigure(void *data, ivi_surface *surf,
+                                    int32_t width, int32_t height);
 
     /* zwp_linux_dmabuf_v1 format/modifier (ignored — we use LINEAR) */
     static void dmabufFormat(void *data, zwp_linux_dmabuf_v1 *dmabuf,
@@ -248,9 +264,14 @@ private:
     wl_registry         *m_registry   = nullptr;
     wl_compositor       *m_compositor = nullptr;
     wl_surface          *m_surface    = nullptr;
+    /* xdg-shell role (kiosk-shell) */
     xdg_wm_base         *m_xdgWmBase  = nullptr;
     xdg_surface         *m_xdgSurface = nullptr;
     xdg_toplevel        *m_xdgToplevel = nullptr;
+    /* ivi-shell role (Milestone IVI) */
+    ivi_application     *m_iviApp     = nullptr;
+    ivi_surface         *m_iviSurface = nullptr;
+
     zwp_linux_dmabuf_v1 *m_dmabuf     = nullptr;
     wl_callback         *m_frameCallback = nullptr;
 
