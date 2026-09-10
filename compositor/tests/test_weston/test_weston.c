@@ -19,15 +19,13 @@
  *     (DRM_FORMAT_MOD_INVALID is rejected by Weston's fb.c:247 — must be LINEAR.)
  *   - Presents NV12 frames read from a .raw file at --video-fps rate.
  *
- * Surface role: wl_surface + xdg_toplevel (xdg-shell, fullscreen)
- *   A bare wl_surface has no shell role and is never "mapped" by kiosk-shell:
- *   - Weston's kiosk-shell only maps surfaces that have been given a shell role.
- *   - An unmapped surface has no output association → schedule_repaint finds
- *     no outputs → repaint loop goes idle → drm_output_assign_planes is never
- *     called again after the first frame → no hardware plane assignment.
- *   Using xdg_wm_base / xdg_surface / xdg_toplevel (fullscreen) gives the
- *   surface a proper role.  Kiosk-shell maps it, Weston repaints it every
- *   frame, and drm_output_assign_planes promotes it to a hardware overlay plane.
+ * Surface role: auto-detected at runtime
+ *   ivi-shell  → ivi_application_surface_create(--ivi-id, wl_surface)
+ *               IVI surface ID selects the nu-hmi-controller layer (default 1000).
+ *   kiosk-shell → wl_surface + xdg_toplevel (existing path, unchanged).
+ *
+ *   Detection: if ivi_application global is advertised → ivi path; otherwise
+ *   falls back to xdg_toplevel.  No rebuild needed to switch shells.
  *
  *   wl_surface is still the underlying primitive for all pixel transport:
  *     wl_surface_attach(buffer) → wl_surface_damage_buffer() → wl_surface_commit()
@@ -75,6 +73,7 @@
 #include <wayland-client.h>
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
+#include "ivi-application-client-protocol.h"   /* Milestone IVI */
 
 /* -------------------------------------------------------------------------
  * Constants
@@ -108,10 +107,17 @@ typedef struct {
     struct wl_registry   *registry;
     struct wl_compositor *compositor;
     struct wl_surface    *surface;
+    /* xdg-shell role (kiosk-shell) */
     struct xdg_wm_base   *xdg_wm_base;
     struct xdg_surface   *xdg_surface;
     struct xdg_toplevel  *xdg_toplevel;
     bool                  xdg_configured;
+    /* ivi-shell role (Milestone IVI) */
+    struct ivi_application *ivi_app;
+    struct ivi_surface     *ivi_surface;
+    bool                   ivi_configured;
+    uint32_t               ivi_id;           /* set from --ivi-id=N, default 1000 */
+
     struct zwp_linux_dmabuf_v1 *dmabuf;
 
     int                   drm_fd;       /* /dev/dri/card0, not DRM master */
@@ -249,6 +255,16 @@ static const struct xdg_toplevel_listener xdg_toplevel_listener = {
     .close     = xdg_toplevel_close,
 };
 
+/* ivi_surface configure — fires after first commit (always 0×0 in Weston 10).
+ * Mark configured so main() knows the surface role is set up. */
+static void ivi_surface_configure(void *data, struct ivi_surface *surf,
+                                   int32_t width, int32_t height)
+{
+    State *s = (State *)data;
+    (void)surf; (void)width; (void)height;
+    s->ivi_configured = true;
+}
+
 /* -------------------------------------------------------------------------
  * Registry listeners — discover compositor and linux-dmabuf
  * ------------------------------------------------------------------------- */
@@ -273,6 +289,11 @@ static void registry_global(void *data,
                                      &zwp_linux_dmabuf_v1_interface,
                                      (version < 3) ? version : 3);
         s->dmabuf_supported = true;
+    } else if (strcmp(interface, ivi_application_interface.name) == 0) {
+        /* ivi-shell: bind ivi_application for explicit surface ID assignment */
+        s->ivi_app = wl_registry_bind(registry, name,
+                                      &ivi_application_interface, 1);
+        fprintf(stderr, "[weston] ivi_application found — ivi-shell mode\n");
     }
 }
 
@@ -449,6 +470,7 @@ int main(int argc, char **argv)
     int         video_fps  = 30;
     int         max_frames = 0;
     bool        verbose    = false;
+    uint32_t    ivi_id     = 1000; /* default: video on layer 1000 */
 
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--raw-video=", 12) == 0)
@@ -459,24 +481,27 @@ int main(int argc, char **argv)
             video_fps = atoi(argv[i] + 12);
         else if (strncmp(argv[i], "--frames=", 9) == 0)
             max_frames = atoi(argv[i] + 9);
+        else if (strncmp(argv[i], "--ivi-id=", 9) == 0)
+            ivi_id = (uint32_t)atoi(argv[i] + 9);
         else if (strcmp(argv[i], "--verbose") == 0)
             verbose = true;
         else if (strcmp(argv[i], "--help") == 0) {
             fprintf(stderr,
                 "Usage: test_weston --raw-video=FILE --video-size=WxH\n"
-                "                   [--video-fps=N] [--frames=N] [--verbose]\n"
+                "                   [--video-fps=N] [--frames=N]\n"
+                "                   [--ivi-id=N] [--verbose]\n"
                 "\n"
                 "  --raw-video=FILE    pre-decoded NV12 raw file (mandatory)\n"
                 "  --video-size=WxH    frame dimensions (default 1024x600)\n"
                 "  --video-fps=N       playback rate (default 30)\n"
                 "  --frames=N          stop after N frames (default: loop forever)\n"
+                "  --ivi-id=N          IVI surface ID for ivi-shell (default 1000)\n"
+                "                      Maps to nu-hmi-controller layer with same ID.\n"
                 "  --verbose           verbose logging\n"
                 "\n"
-                "Weston must be running with kiosk-shell + drm-backend.\n"
-                "For plane-promotion evidence run weston with:\n"
-                "  --logger-scopes=drm-backend\n"
-                "Kernel cross-check:\n"
-                "  cat /sys/kernel/debug/dri/0/state\n");
+                "Shell auto-detected at runtime:\n"
+                "  ivi-shell  → ivi_application_surface_create(ivi-id, wl_surface)\n"
+                "  kiosk-shell → xdg_toplevel fullscreen (unchanged)\n");
             return 0;
         } else {
             fprintf(stderr, "[weston] unknown arg: %s\n", argv[i]);
@@ -496,6 +521,7 @@ int main(int argc, char **argv)
     g_state.height  = vid_h;
     g_state.verbose = verbose;
     g_state.running = true;
+    g_state.ivi_id  = ivi_id;
     for (int i = 0; i < NV12_RING_SIZE; i++)
         g_state.bufs[i].dmabuf_fd = -1;
 
@@ -530,32 +556,51 @@ int main(int argc, char **argv)
     /* Allow dumb BO creation without being DRM master */
     drmSetClientCap(g_state.drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
 
-    /* ---- Create wl_surface + xdg_toplevel role ---- */
+    /* ---- Create wl_surface + shell role (auto-detected) ---- */
     g_state.surface = wl_compositor_create_surface(g_state.compositor);
     if (!g_state.surface) {
         fprintf(stderr, "[weston] wl_compositor_create_surface failed\n");
         return 1;
     }
 
-    if (!g_state.xdg_wm_base) {
-        fprintf(stderr, "[weston] xdg_wm_base not available\n");
-        return 1;
+    if (g_state.ivi_app) {
+        /* ── ivi-shell path ─────────────────────────────────────────────── */
+        static const struct ivi_surface_listener ivi_surf_listener = {
+            .configure = ivi_surface_configure,
+        };
+        g_state.ivi_surface = ivi_application_surface_create(
+            g_state.ivi_app, g_state.ivi_id, g_state.surface);
+        ivi_surface_add_listener(g_state.ivi_surface, &ivi_surf_listener, &g_state);
+
+        /* ivi-shell configure arrives after first buffer commit (0×0).
+         * Set configured immediately so we don't stall. */
+        g_state.ivi_configured = true;
+        wl_surface_commit(g_state.surface);
+        wl_display_roundtrip(g_state.display);
+
+        fprintf(stderr, "[weston] ivi-shell mode: ivi_surface id=%u\n",
+                g_state.ivi_id);
+    } else {
+        /* ── kiosk-shell / xdg_toplevel path (unchanged) ───────────────── */
+        if (!g_state.xdg_wm_base) {
+            fprintf(stderr, "[weston] xdg_wm_base not available\n");
+            return 1;
+        }
+        g_state.xdg_surface = xdg_wm_base_get_xdg_surface(g_state.xdg_wm_base,
+                                                            g_state.surface);
+        xdg_surface_add_listener(g_state.xdg_surface, &xdg_surface_listener, &g_state);
+        g_state.xdg_toplevel = xdg_surface_get_toplevel(g_state.xdg_surface);
+        xdg_toplevel_add_listener(g_state.xdg_toplevel, &xdg_toplevel_listener, &g_state);
+        xdg_toplevel_set_title(g_state.xdg_toplevel, "test_weston_nv12");
+        xdg_toplevel_set_fullscreen(g_state.xdg_toplevel, NULL);
+        wl_surface_commit(g_state.surface);
+        wl_display_roundtrip(g_state.display);
+        if (!g_state.xdg_configured) {
+            fprintf(stderr, "[weston] xdg_surface configure never arrived\n");
+            return 1;
+        }
+        fprintf(stderr, "[weston] kiosk-shell mode: xdg_toplevel configured\n");
     }
-    g_state.xdg_surface = xdg_wm_base_get_xdg_surface(g_state.xdg_wm_base,
-                                                        g_state.surface);
-    xdg_surface_add_listener(g_state.xdg_surface, &xdg_surface_listener, &g_state);
-    g_state.xdg_toplevel = xdg_surface_get_toplevel(g_state.xdg_surface);
-    xdg_toplevel_add_listener(g_state.xdg_toplevel, &xdg_toplevel_listener, &g_state);
-    xdg_toplevel_set_title(g_state.xdg_toplevel, "test_weston_nv12");
-    xdg_toplevel_set_fullscreen(g_state.xdg_toplevel, NULL);
-    /* Commit to trigger initial configure from compositor */
-    wl_surface_commit(g_state.surface);
-    wl_display_roundtrip(g_state.display);   /* wait for configure event */
-    if (!g_state.xdg_configured) {
-        fprintf(stderr, "[weston] xdg_surface configure never arrived\n");
-        return 1;
-    }
-    fprintf(stderr, "[weston] xdg_toplevel configured\n");
 
     /* ---- Allocate 3-buffer NV12 ring ---- */
     fprintf(stderr, "[weston] allocating %d NV12 buffers (%dx%d)\n",
@@ -672,12 +717,16 @@ int main(int argc, char **argv)
     for (int i = 0; i < NV12_RING_SIZE; i++)
         free_buf(&g_state, &g_state.bufs[i]);
 
-    if (g_state.surface)  wl_surface_destroy(g_state.surface);
-    if (g_state.dmabuf)   zwp_linux_dmabuf_v1_destroy(g_state.dmabuf);
-    if (g_state.compositor) wl_compositor_destroy(g_state.compositor);
-    if (g_state.registry) wl_registry_destroy(g_state.registry);
-    if (g_state.display)  wl_display_disconnect(g_state.display);
-    if (g_state.drm_fd >= 0) close(g_state.drm_fd);
+    if (g_state.xdg_toplevel) xdg_toplevel_destroy(g_state.xdg_toplevel);
+    if (g_state.xdg_surface)  xdg_surface_destroy(g_state.xdg_surface);
+    if (g_state.ivi_surface)  ivi_surface_destroy(g_state.ivi_surface);
+    if (g_state.surface)      wl_surface_destroy(g_state.surface);
+    if (g_state.ivi_app)      ivi_application_destroy(g_state.ivi_app);
+    if (g_state.dmabuf)       zwp_linux_dmabuf_v1_destroy(g_state.dmabuf);
+    if (g_state.compositor)   wl_compositor_destroy(g_state.compositor);
+    if (g_state.registry)     wl_registry_destroy(g_state.registry);
+    if (g_state.display)      wl_display_disconnect(g_state.display);
+    if (g_state.drm_fd >= 0)  close(g_state.drm_fd);
 
     return 0;
 }

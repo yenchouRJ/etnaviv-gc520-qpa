@@ -7,6 +7,18 @@
  * hardware KMS plane via Weston's linux-dmabuf-v1 + PLANES_ONLY path — the
  * same zero-copy path a real VPU decoder would use.
  *
+ * Milestone IVI: waylandsink does not expose its wl_surface for ivi_application
+ * binding.  Instead we set the GST_WAYLAND_DISPLAY_HANDLE context to pass our
+ * own wl_display (which already has ivi_application bound) to waylandsink so
+ * it reuses the same connection.  waylandsink then uses xdg_wm_base internally
+ * and goes to the overflow layer in nu-hmi-controller.  For correct layer assignment
+ * the video client uses the IVI_SURFACE_ID environment variable (default 1000)
+ * and waylandsink's surface is managed by nu-hmi-controller as a desktop_surface.
+ *
+ * NOTE: For a production video client that needs explicit IVI surface control,
+ * use the standalone Wayland + dmabuf path (without waylandsink) and call
+ * ivi_application_surface_create on the wl_surface directly.
+ *
  * Usage:
  *   gst_dmabuf_video --video=<file.raw> --width=1024 --height=600 [--fps=30]
  *

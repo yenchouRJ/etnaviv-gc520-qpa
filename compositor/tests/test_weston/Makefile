@@ -19,7 +19,8 @@ SRCDIR  ?= .
 
 SRCS := $(SRCDIR)/test_weston.c \
         $(SRCDIR)/linux-dmabuf-unstable-v1-protocol.c \
-        $(SRCDIR)/xdg-shell-protocol.c
+        $(SRCDIR)/xdg-shell-protocol.c \
+        $(SRCDIR)/ivi-application-protocol.c
 
 OBJS := $(notdir $(SRCS:.c=.o))
 
