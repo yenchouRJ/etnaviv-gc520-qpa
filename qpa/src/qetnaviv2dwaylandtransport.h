@@ -55,6 +55,7 @@
 #include <QVector>
 #include <functional>
 #include <atomic>
+#include <cstddef>
 
 // Forward-declare libwayland types to avoid pulling C headers into every TU
 // that includes this header.
@@ -68,6 +69,8 @@ struct wl_seat;
 struct wl_pointer;
 struct wl_touch;
 struct wl_keyboard;
+struct wl_shm;
+struct wl_shm_pool;
 struct xdg_wm_base;
 struct xdg_surface;
 struct xdg_toplevel;
@@ -253,6 +256,14 @@ private:
     /* Key translation helper: linux evdev keycode → Qt::Key */
     static Qt::Key linuxKeyToQt(uint32_t linux_key);
 
+    /* wl_shm format (informational only) */
+    static void shmFormat(void *data, wl_shm *shm, uint32_t format);
+
+    /* Hardware cursor: build a 32x32 ARGB8888 wl_shm cursor surface lazily,
+     * on first pointer enter.  Returns false on any allocation failure
+     * (memfd/mmap/wl_shm_pool) — cursor is then simply not shown, no crash. */
+    bool createCursorBuffer();
+
     /* Helpers */
     void armNotifier();           // create QSocketNotifier lazily on first commitFrame()
     void doCommit(int slot);      // attach buf[slot], damage, commit, arm next frame cb
@@ -280,6 +291,15 @@ private:
     wl_pointer          *m_pointer    = nullptr;
     wl_touch            *m_touch      = nullptr;
     wl_keyboard         *m_keyboard   = nullptr;
+
+    /* ---- Hardware cursor (wl_shm + dedicated cursor wl_surface) ---- */
+    wl_shm              *m_shm             = nullptr;
+    wl_surface          *m_cursorSurface   = nullptr;
+    wl_buffer           *m_cursorBuffer    = nullptr;
+    void                *m_cursorShmData   = nullptr; // mmap'd memfd, size m_cursorShmSize
+    int                  m_cursorShmFd     = -1;
+    size_t               m_cursorShmSize   = 0;
+    bool                 m_cursorBufferReady = false; // createCursorBuffer() succeeded
 
     /* Target Qt window for input event delivery (set by setWindow()) */
     QWindow             *m_window     = nullptr;
