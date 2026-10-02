@@ -34,7 +34,7 @@
 #include <QAbstractEventDispatcher>
 #include <QCoreApplication>
 #include <QDebug>
-#include <QtGui/5.15.18/QtGui/qpa/qwindowsysteminterface.h>
+#include <qpa/qwindowsysteminterface.h>
 
 #include <cerrno>
 #include <cstring>

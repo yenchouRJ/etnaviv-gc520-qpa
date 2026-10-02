@@ -37,10 +37,74 @@
 #include <QDebug>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <linux/fb.h>
+
+/* -----------------------------------------------------------------------
+ * CPU utilisation helpers — reads /proc/stat for aggregate + per-core.
+ * ----------------------------------------------------------------------- */
+struct CpuStat { unsigned long long idle, total; };
+
+/* Parse one "cpu..." line already positioned in the FILE. */
+static CpuStat parseCpuLine(FILE *f)
+{
+    CpuStat s{0, 0};
+    unsigned long long user, nice, system, idle, iowait, irq, softirq, steal;
+    if (fscanf(f, " %llu %llu %llu %llu %llu %llu %llu %llu",
+               &user, &nice, &system, &idle,
+               &iowait, &irq, &softirq, &steal) == 8) {
+        s.idle  = idle + iowait;
+        s.total = user + nice + system + idle + iowait + irq + softirq + steal;
+    }
+    /* consume remainder of line */
+    int c; while ((c = fgetc(f)) != '\n' && c != EOF) {}
+    return s;
+}
+
+/* Snapshot: aggregate + per-core (up to MAX_CORES). */
+static constexpr int MAX_CORES = 8;
+struct AllCpuStat {
+    CpuStat total;
+    CpuStat core[MAX_CORES];
+    int     ncores = 0;
+};
+
+static AllCpuStat readAllCpuStat()
+{
+    AllCpuStat r{};
+    FILE *f = fopen("/proc/stat", "r");
+    if (!f) return r;
+    char tag[16];
+    while (fscanf(f, "%15s", tag) == 1) {
+        if (strcmp(tag, "cpu") == 0) {
+            r.total = parseCpuLine(f);
+        } else if (strncmp(tag, "cpu", 3) == 0 && tag[3] >= '0' && tag[3] <= '9') {
+            int idx = atoi(tag + 3);
+            CpuStat cs = parseCpuLine(f);
+            if (idx < MAX_CORES) {
+                r.core[idx] = cs;
+                if (idx + 1 > r.ncores) r.ncores = idx + 1;
+            }
+        } else {
+            /* skip rest of line */
+            int c; while ((c = fgetc(f)) != '\n' && c != EOF) {}
+        }
+    }
+    fclose(f);
+    return r;
+}
+
+/* Returns CPU busy percentage in [0,100] between two CpuStat snapshots. */
+static double cpuUtil(const CpuStat &a, const CpuStat &b)
+{
+    unsigned long long dTotal = b.total - a.total;
+    unsigned long long dIdle  = b.idle  - a.idle;
+    if (dTotal == 0) return 0.0;
+    return 100.0 * (1.0 - double(dIdle) / double(dTotal));
+}
 
 /* -----------------------------------------------------------------------
  * Benchmark widget
@@ -97,13 +161,15 @@ public:
     void startBenchmark()
     {
         m_frame = 0;
+        m_cpuStatStart = readAllCpuStat();
         m_elapsed.start();
         QTimer::singleShot(0, this, &BenchWidget::nextFrame);
     }
 
-    int    totalFrames() const { return m_totalFrames; }
-    qint64 elapsedMs()   const { return m_elapsed.elapsed(); }
-    bool   isOpaque()    const { return m_opaque; }
+    int             totalFrames()    const { return m_totalFrames; }
+    qint64          elapsedMs()      const { return m_elapsed.elapsed(); }
+    bool            isOpaque()       const { return m_opaque; }
+    AllCpuStat      cpuStatStart()   const { return m_cpuStatStart; }
 
 protected:
     void paintEvent(QPaintEvent *) override
@@ -159,6 +225,7 @@ private:
     QPixmap         m_sprite;
     QVector<QPoint> m_positions;
     QElapsedTimer   m_elapsed;
+    AllCpuStat      m_cpuStatStart{};
 };
 
 /* -----------------------------------------------------------------------
@@ -190,8 +257,24 @@ int main(int argc, char **argv)
     double fps  = (ms > 0) ? (w.totalFrames() * 1000.0 / ms) : 0.0;
     double mspf = (w.totalFrames() > 0) ? double(ms) / w.totalFrames() : 0.0;
 
-    printf("frames=%d  sprites=%d  elapsed=%.3fs  fps=%.1f  ms/frame=%.2f\n",
-           w.totalFrames(), nsprites, ms / 1000.0, fps, mspf);
+    AllCpuStat cpuEnd   = readAllCpuStat();
+    AllCpuStat cpuStart = w.cpuStatStart();
+    double cpuTotal = cpuUtil(cpuStart.total, cpuEnd.total);
+
+    /* Build per-core string: "cpu0=XX.X%  cpu1=XX.X%" */
+    char coreBuf[128] = {};
+    int  pos = 0;
+    int  nc  = cpuEnd.ncores;
+    for (int i = 0; i < nc && pos < (int)sizeof(coreBuf) - 20; ++i) {
+        double u = cpuUtil(cpuStart.core[i], cpuEnd.core[i]);
+        pos += snprintf(coreBuf + pos, sizeof(coreBuf) - pos,
+                        "  cpu%d=%.1f%%", i, u);
+    }
+
+    printf("frames=%d  sprites=%d  elapsed=%.3fs  fps=%.1f  ms/frame=%.2f"
+           "  cpu_total=%.1f%%%s\n",
+           w.totalFrames(), nsprites, ms / 1000.0, fps, mspf,
+           cpuTotal, coreBuf);
 
     return rc;
 }
