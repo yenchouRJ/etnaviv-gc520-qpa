@@ -7,17 +7,18 @@
  * hardware KMS plane via Weston's linux-dmabuf-v1 + PLANES_ONLY path — the
  * same zero-copy path a real VPU decoder would use.
  *
- * Milestone IVI: waylandsink does not expose its wl_surface for ivi_application
- * binding.  Instead we set the GST_WAYLAND_DISPLAY_HANDLE context to pass our
- * own wl_display (which already has ivi_application bound) to waylandsink so
- * it reuses the same connection.  waylandsink then uses xdg_wm_base internally
- * and goes to the overflow layer in nu-hmi-controller.  For correct layer assignment
- * the video client uses the IVI_SURFACE_ID environment variable (default 1000)
- * and waylandsink's surface is managed by nu-hmi-controller as a desktop_surface.
+ * ivi-shell support: waylandsink (gst1-plugins-bad, patched — see
+ * ivi/plan.md) creates a real ivi_surface with id GST_WAYLANDSINK_IVI_SURFACE_ID
+ * (default 1000) when ivi_application is bound (ivi-shell), or falls back to
+ * a plain xdg_toplevel unchanged under kiosk-shell. No special handling is
+ * needed in this client — the env var and the sink's own Wayland connection
+ * are all that's required.
  *
- * NOTE: For a production video client that needs explicit IVI surface control,
- * use the standalone Wayland + dmabuf path (without waylandsink) and call
- * ivi_application_surface_create on the wl_surface directly.
+ * Runtime plane swap: NOT handled by this client at all -- send SIGUSR1 to
+ * the *weston* process (nu-hmi-controller.so) instead, which swaps which
+ * surface occupies which layer compositor-side, with no client-side
+ * involvement or protocol risk. See ivi/plan.md "Runtime plane swap" and
+ * ivi/nu-hmi-controller/nu-hmi-controller.c's on_swap_signal().
  *
  * Usage:
  *   gst_dmabuf_video --video=<file.raw> --width=1024 --height=600 [--fps=30]

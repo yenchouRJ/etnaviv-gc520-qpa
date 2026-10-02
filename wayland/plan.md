@@ -1,4 +1,4 @@
-# Phase 7 — Two-client Wayland composition (Qt UI + video) under Weston
+# Phase 7 — Two-client Wayland composition (Qt UI + video) under Weston ✓ FINISHED (kiosk deliverable)
 
 **Goal:** Run the etnaviv2d QPA as a **Weston Wayland client** that presents the
 Qt UI to a hardware plane via `linux-dmabuf-v1`, alongside a **second client**
@@ -8,8 +8,18 @@ zero-copy, both hardware-promoted, Weston owning plane arbitration. This is
 transport switches from direct KMS to Wayland; `libetna2d` / `EtnaBlittable` /
 the GC520 blitter are untouched.
 
-> **Status (2026-08-31):** Milestones B, C, A, and I are hardware-verified and closed.
-> Milestone IVI (`ivi-shell`) is next (deferred).
+> **Status (2026-09-11): DONE — kiosk-shell configuration is a shipped
+> deliverable.** Milestones B, C, A, and I (touch + hardware cursor) are all
+> hardware-verified and closed; no open items remain in this plan. Two-plane
+> arbitration (UI + video), input (touch, mouse, keyboard), and the hardware
+> cursor plane all work end-to-end under kiosk-shell.
+>
+> IVI-shell — a **separate, additional** capability (runtime per-surface
+> z-order control via `ivi_application_surface_create`) — was implemented and
+> hardware-verified during this phase but is **not required for the kiosk
+> deliverable above**, and is deferred as its own product feature pending a
+> `waylandsink` patch or VPU-ready custom sink. It has **moved out to its own
+> plan**: see `ivi/plan.md`.
 
 > **Prerequisite:** Phase 6 (`compositor/plan.md`) closed. `test_weston` proved
 > the NV12 dmabuf → hardware plane path with a bare C client; Phase 7 reuses that
@@ -66,7 +76,7 @@ capability. The only immutable hardware constraint is **fixed z-order (zpos)**:
 |---------|------|---------|-----------------|
 | PRIMARY [31] | 0 (bottom) | RGB + YUV | video (NV12) |
 | OVERLAY [38] | 1 (middle) | RGB + YUV | Qt UI (AR24) |
-| CURSOR  [49] | 2 (top)    | XRGB8888 32×32 | unused |
+| CURSOR  [49] | 2 (top)    | AR24/XR24, 32×32 | hardware cursor — ✓ DONE, hardware-verified; see Milestone I §Hardware cursor |
 
 Because the two planes are format-equivalent, the **key validation point is
 correct zpos-based plane allocation, not plane format capability**. The visual
@@ -330,7 +340,7 @@ plane[38] overlay   AR24  zpos=1  (qt_ui_client)
   `FB_ID` grep which misses the new `fb=` format in debugfs — a script bug,
   not a hardware bug; both planes are active).
 
-### Milestone I — input (wl_seat) ✓ DONE
+### Milestone I — input (wl_seat) ✓ DONE (touch + hardware cursor)
 
 Bound `wl_seat` in the transport; translated `wl_pointer` / `wl_touch` /
 `wl_keyboard` → Qt events. Touchscreen: Weston owns libinput + calibration;
@@ -365,57 +375,73 @@ Two bugs found and fixed during I:
    synthesizes a release first; (c) test button uses `pressed` signal so the
    counter increments immediately on touch-down, independent of lift.
 
-### Milestone IVI — ivi-shell (deferred) — NEXT
+#### Hardware cursor (formerly Milestone C2) ✓ DONE — hardware-verified
 
-Replace kiosk-shell with ivi-shell for **deterministic, programmatic z-order
-control** independent of client launch sequence. kiosk-shell is sufficient for
-the current validated configuration (video first → primary, Qt second → overlay);
-ivi-shell is required when layer assignment must be driven at runtime (e.g. swap
-video/UI layers on a button press, or guarantee a fixed layout regardless of
-startup order).
+**Root cause 1 (kernel driver):** `ma35_drm.c` set `.driver_features =
+DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC | DRIVER_CURSOR_HOTSPOT`.
+`DRIVER_CURSOR_HOTSPOT` is a real DRM-core flag, but in this kernel tree its
+only other users are `virtio`/`qxl`/`vboxvideo`/`vmwgfx` — virtualized GPU
+drivers. Its sole effect in `drm_plane.c:drm_mode_getplane_res()` is: for any
+**atomic** client (`file_priv->atomic`, always true for Weston) that hasn't
+set `file_priv->supports_virtualized_cursor_plane` (a cap this kernel branch
+has no ioctl path to ever set), the cursor plane is silently dropped from
+`drmModeGetPlaneResources()`. `modetest` doesn't use atomic mode by default,
+so it always saw all 3 planes, masking the bug — Weston only ever saw 2
+(primary, overlay), and plane 49 (cursor) never became a placement candidate.
+Our cursor's hotspot handling is fully custom (`ma35_cursor_of_parse()` via
+devicetree + regmap) and never depended on this flag. **Fix:** removed
+`DRIVER_CURSOR_HOTSPOT` from `.driver_features` in
+`drivers/gpu/drm/nuvoton/ma35_drm.c` (kept an explanatory comment). Kernel
+rebuilt/reflashed; confirmed via `modetest -M ma35-drm -p` and Weston debug
+log that plane 49 is now enumerated to atomic clients.
 
-**What changes with ivi-shell:**
+**Root cause 2 (Weston):** `drm_output_init_cursor_egl()`
+(`libweston/backend-drm/drm-gbm.c`) — the only place that allocates the two
+`output->gbm_cursor_fb[]` scratch GBM buffer objects used to back the
+hardware cursor plane — was called only from the EGL/GBM output-init path,
+never from `drm_output_init_pixman()`. Our stack runs the pixman renderer
+(no GL), so `gbm_cursor_fb[]` stayed `NULL` and the first
+`wl_pointer.set_cursor()` would hit a NULL-`fb` dereference in the cursor
+plane placement path. **Fix:** made `drm_output_init_cursor_egl()` /
+`drm_output_fini_cursor_egl()` non-static and called them from
+`drm_output_init_pixman()` / `drm_output_fini_pixman()`
+(`libweston/backend-drm/drm.c`, `drm-internal.h`) — they only need `b->gbm`
+(already created by the pixman path for dmabuf import), not an EGL context,
+despite the function name.
 
-| Layer | Change | Owner |
-|---|---|---|
-| `weston.ini` | `shell=ivi-shell.so`; add `[ivi-shell]` section; configure `hmi-controller` surface-to-layer mapping | build system / config |
-| `test_weston.c` / `waylandsink` wrapper | Bind `ivi_application` protocol; call `ivi_application_surface_create(iva, IVI_ID_VIDEO, wl_surface)` at startup | us (compositor test / gst wrapper) |
-| QPA transport (`qetnaviv2dwaylandtransport.cpp`) | Bind `ivi_application`; call `ivi_application_surface_create(iva, IVI_ID_QT, wl_surface)` in `connect()` | us (QPA) |
-| `hmi-controller.so` config | Map IVI surface IDs to IVI layers; set layer zpos in `weston.ini` or via `ivi_hmi_controller` protocol at runtime | us (config) or separate HMI process |
+**QPA transport change:** added `wl_shm` binding, a 32×32 ARGB8888 cursor
+`wl_surface`/buffer (simple arrow bitmap, hotspot 0,0), and a
+`wl_pointer.enter` handler calling `wl_pointer_set_cursor()`
+(`qpa/src/qetnaviv2dwaylandtransport.{h,cpp}`).
 
-**Layer control responsibility:** the `hmi-controller` Weston plugin (loaded
-in-process) owns `ivi_layout` — it calls `ivi_layout_layer_create()`,
-`ivi_layout_surface_add_to_layer()`, `ivi_layout_layer_set_render_order()`. An
-external HMI process can drive runtime layout changes via the `ivi_hmi_controller`
-protocol. Without a controller, all surfaces share a default layer and z-order is
-undefined.
+**Gate I result (hardware-verified):**
+- `/sys/kernel/debug/dri/0/state` shows `plane[49]` with a real committed
+  `crtc=crtc-0`, `fb=<non-zero>`, format `AR24`, size 32×32 while the pointer
+  is on-screen and moving.
+- Weston stays in `PLANES_ONLY` composition: cursor view → plane 49, Qt UI
+  view → its own plane (primary/overlay) — no renderer-only fallback.
+- Live on-target test with a real USB mouse: the Qt UI and a visible arrow
+  cursor are both shown simultaneously, cursor tracks the mouse continuously,
+  no crashes, no UI regression, no board hang.
+- Touch vs. mouse button-press visual behavior differs by design (touch:
+  press → red, release elsewhere → blue; mouse: button-down → red,
+  button-up → blue) — expected, not a bug; both are consistent with a
+  press/release-driven UI, just triggered by different input event pairs.
 
-The `0003-*.patch` plane-promotion fixes remain valid under ivi-shell — they are
-in the DRM backend, below the shell layer.
+Both fixes are real, harmless, and kept in-tree (Weston fix not yet turned
+into a `package/weston/000N-*.patch` — do that as part of upstreaming
+cleanup). No debug instrumentation remains in either the kernel driver or
+the Weston tree.
 
 ---
 
-### Milestone C2 — hardware cursor plane (not yet implemented)
+### Milestone IVI — moved out to `ivi/plan.md`
 
-**Status: not started. Worth pursuing after IVI.**
-
-`wl_pointer` cursor movement is verified to reach Qt (pointer enter/motion events
-are wired), but the **visual cursor** has not been implemented or verified.
-Weston exposes a dedicated cursor plane — `plane[49] zpos=2` (CURSOR, 32×32,
-XRGB8888) — that is currently unused (fb=0 throughout all milestone tests).
-
-A hardware cursor would use this plane zero-copy at no compositor cost:
-
-| What | How |
-|---|---|
-| Weston side | Already handled — Weston sets the cursor plane from the `wl_pointer.set_cursor` / `wl_surface` the client provides via `wl_pointer_set_cursor()`. No Weston changes needed. |
-| QPA side | Override `QPlatformCursor` (or implement `QEtnaviv2dCursor`) to call `wl_pointer_set_cursor()` with a 32×32 ARGB `wl_buffer`; Weston will route it to `plane[49]` automatically. |
-| Constraint | Cursor plane is 32×32 XRGB8888 only (hardware limit). Custom cursors must be pre-scaled to 32×32. |
-
-**Why it matters:** without a hardware cursor, any pointer movement repaints the
-full overlay BO (software cursor blit) and triggers a new `wl_surface_commit`.
-With the cursor plane, pointer movement is handled entirely by the display
-engine — no repaint, no commit, zero CPU/GPU cost.
+ivi-shell + custom HMI controller work (runtime per-surface z-order control,
+`ivi_application_surface_create`) was implemented and hardware-verified during
+this phase, but is a separate capability from the kiosk-shell deliverable
+above and is not needed for it. Full writeup, status, and next steps now live
+in `ivi/plan.md`.
 
 ---
 
@@ -423,7 +449,7 @@ engine — no repaint, no commit, zero CPU/GPU cost.
 
 | ID | Decision | Rationale |
 |----|----------|-----------|
-| D7-topology | Staged: **(B)** single QPA client → **(C)** QPA + `test_weston` two-plane arbitration → **(A)** real `waylandsink`. ivi-shell deferred to after Milestone I. | The highest-risk unknown was the D11 QPA transport. Prove in isolation, then add arbitration with a known-good video partner, then swap in the real sink. ivi-shell deferred: kiosk-shell + `0003-*.patch` is sufficient for the validated configuration; ivi-shell only needed for runtime layer control. |
+| D7-topology | Staged: **(B)** single QPA client → **(C)** QPA + `test_weston` two-plane arbitration → **(A)** real `waylandsink`. ivi-shell moved out to `ivi/` after implementation/verification. | The highest-risk unknown was the D11 QPA transport. Prove in isolation, then add arbitration with a known-good video partner, then swap in the real sink. ivi-shell moved out once proven: kiosk-shell + `0003-*.patch` is sufficient for this plan's validated configuration; ivi-shell's runtime layer control is a separate concern now owned by `ivi/plan.md`. |
 | D7-input | QPA binds `wl_seat` and translates Wayland input → Qt events; evdev/libinput path **disabled** in wayland mode. **Implemented at Milestone I.** Single-touch ABS driver quirk: `wl_touch.cancel` used instead of `wl_touch.up` on lift — handled by flushing released events in `touchCancel` and using `pressed` signal in test widget. | Under Weston the client must not open `/dev/input/*`. Sequenced after video to isolate transport risk first. |
 | D7-buffer | **Zero-copy** ARGB8888/LINEAR BO ring (3 deep) exported as persistent `wl_buffer`s, cycled under `wl_buffer.release`. Blitter renders straight into the free ring BO. | etnaviv2d BOs are already exportable dmabuf; reuses D9b ring + `test_weston` transport; avoids a needless per-frame ARGB memcpy. |
 | D7-role | Single fullscreen `xdg_toplevel`; Qt composites all child/popup content into it. No `xdg_popup`/subsurfaces. | Kiosk appliance. Qt already flattens child widgets into the top-level backing store with no WM. Multi-surface support = large lifecycle complexity, zero product value here. |

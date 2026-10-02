@@ -1,12 +1,15 @@
 /*
- * nu-hmi-controller.c — minimal ivi-shell HMI controller for MA35D1 kiosk
+ * nu-hmi-controller.c - minimal ivi-shell HMI controller for MA35D1 kiosk
  *
  * Replaces the stock hmi-controller.so with a purpose-built controller that:
  *   - Creates N layers from weston.ini [nuvoton-layer] sections at startup.
  *   - Routes each ivi_surface to the layer whose id matches the surface's IVI ID.
  *   - Surfaces with no matching layer go to a catch-all overflow layer (id=9999).
  *   - Desktop surfaces (xdg_toplevel clients on ivi-shell) go to overflow.
- *   - Supports arbitrary layers — customers add [nuvoton-layer] sections.
+ *   - Supports arbitrary layers - customers add [nuvoton-layer] sections.
+ *   - SIGUSR1: swaps which surface occupies the two lowest-render_order
+ *     layers (runtime plane swap, no client involvement/restart needed -
+ *     see on_swap_signal() below and ivi/plan.md "Runtime plane swap").
  *
  * weston.ini example:
  *   [core]
@@ -36,6 +39,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <assert.h>
+#include <signal.h>
 
 #include <wayland-server-core.h>
 #include <libweston/libweston.h>
@@ -44,7 +48,7 @@
 #include <weston/weston.h>
 
 /* -----------------------------------------------------------------------
- * Layer table — built from weston.ini at startup
+ * Layer table - built from weston.ini at startup
  * ----------------------------------------------------------------------- */
 #define MAX_LAYERS 16
 
@@ -52,6 +56,13 @@ struct nuvoton_layer {
     uint32_t                  id;
     int32_t                   render_order;
     struct ivi_layout_layer  *layout_layer;
+
+    /* The single surface currently occupying this layer, or NULL. This
+     * kiosk controller assigns exactly one surface per configured layer
+     * (see on_surface_configured()'s "skip if already on a layer" check),
+     * so tracking it here is enough to support on_swap_signal()'s
+     * plane-swap without any client-side involvement. */
+    struct ivi_layout_surface *current_surface;
 };
 
 struct nu_hmi_controller {
@@ -66,6 +77,7 @@ struct nu_hmi_controller {
     struct wl_listener    surface_configured;
     struct wl_listener    desktop_surface_configured;
     struct wl_listener    destroy_listener;
+    struct wl_event_source *swap_signal_source;
 };
 
 /* -----------------------------------------------------------------------
@@ -82,22 +94,18 @@ find_layer_by_id(struct nu_hmi_controller *hmi, uint32_t id)
 }
 
 static void
-assign_surface_to_layer(struct nu_hmi_controller *hmi,
-                        struct ivi_layout_surface *ivisurf,
-                        struct nuvoton_layer *layer)
+set_surface_geometry_fullscreen(struct nu_hmi_controller *hmi,
+                                struct ivi_layout_surface *ivisurf)
 {
     struct weston_surface *wsurface;
     int32_t w, h;
 
-    hmi->ivi->layer_add_surface(layer->layout_layer, ivisurf);
-
-    /* Set src + dst to full output size so the surface fills the layer. */
     wsurface = hmi->ivi->surface_get_weston_surface(ivisurf);
     if (wsurface && wsurface->width > 0 && wsurface->height > 0) {
         w = wsurface->width;
         h = wsurface->height;
     } else {
-        /* Buffer not yet committed — use the first output's mode size.
+        /* Buffer not yet committed - use the first output's mode size.
          * ivi_surface configure (client-side) will trigger a recheck. */
         struct weston_output *output;
         output = wl_container_of(hmi->compositor->output_list.next,
@@ -109,6 +117,16 @@ assign_surface_to_layer(struct nu_hmi_controller *hmi,
     hmi->ivi->surface_set_source_rectangle(ivisurf, 0, 0, w, h);
     hmi->ivi->surface_set_destination_rectangle(ivisurf, 0, 0, w, h);
     hmi->ivi->surface_set_visibility(ivisurf, true);
+}
+
+static void
+assign_surface_to_layer(struct nu_hmi_controller *hmi,
+                        struct ivi_layout_surface *ivisurf,
+                        struct nuvoton_layer *layer)
+{
+    hmi->ivi->layer_add_surface(layer->layout_layer, ivisurf);
+    set_surface_geometry_fullscreen(hmi, ivisurf);
+    layer->current_surface = ivisurf;
 }
 
 /* -----------------------------------------------------------------------
@@ -186,7 +204,77 @@ on_compositor_destroy(struct wl_listener *listener, void *data)
     struct nu_hmi_controller *hmi =
         wl_container_of(listener, hmi, destroy_listener);
     (void)data;
+    if (hmi->swap_signal_source)
+        wl_event_source_remove(hmi->swap_signal_source);
     free(hmi);
+}
+
+/* -----------------------------------------------------------------------
+ * Runtime plane swap (SIGUSR1) -- compositor-mediated, no client involvement.
+ *
+ * Swaps the surfaces currently occupying the two lowest-render_order
+ * configured layers (index 0 and 1 of hmi->layers[], i.e. the video/primary
+ * and Qt UI/overlay layers in this product's [nuvoton-layer] config: id=1000
+ * render-order=0, id=2000 render-order=1).
+ *
+ * This deliberately does NOT touch either client's ivi_surface id or
+ * wl_surface -- clients are completely unaware a swap happened. This
+ * avoids the fatal wl_resource_post_error("surface_id is already assigned")
+ * that a client-side "destroy + recreate ivi_surface with the other
+ * client's id" approach hits under any trigger timing where one client
+ * tries to claim an id the other hasn't released yet (measured on
+ * hardware; a posted protocol error is fatal to the whole client
+ * connection, not just that one request -- there is no way to retry
+ * around it client-side). Mutating layer_add_surface()/layer_remove_surface()
+ * here instead is a single compositor-side operation with no cross-process
+ * race window at all.
+ *
+ * See ivi/plan.md "Runtime plane swap" for the full design discussion and
+ * the client-side approach this replaces.
+ */
+static int
+on_swap_signal(int signal_number, void *data)
+{
+    struct nu_hmi_controller *hmi = data;
+    struct nuvoton_layer *layer_a, *layer_b;
+    struct ivi_layout_surface *surf_a, *surf_b;
+    (void) signal_number;
+
+    if (hmi->n_layers < 2) {
+        weston_log("[nu-hmi-controller] swap signal: need at least 2 "
+                   "[nuvoton-layer] entries, have %d -- ignoring\n",
+                   hmi->n_layers);
+        return 0;
+    }
+
+    layer_a = &hmi->layers[0];
+    layer_b = &hmi->layers[1];
+    surf_a = layer_a->current_surface;
+    surf_b = layer_b->current_surface;
+
+    if (!surf_a || !surf_b) {
+        weston_log("[nu-hmi-controller] swap signal: layer %u or %u has no "
+                   "surface yet -- ignoring\n", layer_a->id, layer_b->id);
+        return 0;
+    }
+
+    weston_log("[nu-hmi-controller] swap signal: swapping surfaces between "
+               "layer %u and layer %u\n", layer_a->id, layer_b->id);
+
+    hmi->ivi->layer_remove_surface(layer_a->layout_layer, surf_a);
+    hmi->ivi->layer_remove_surface(layer_b->layout_layer, surf_b);
+
+    hmi->ivi->layer_add_surface(layer_a->layout_layer, surf_b);
+    set_surface_geometry_fullscreen(hmi, surf_b);
+    hmi->ivi->layer_add_surface(layer_b->layout_layer, surf_a);
+    set_surface_geometry_fullscreen(hmi, surf_a);
+
+    layer_a->current_surface = surf_b;
+    layer_b->current_surface = surf_a;
+
+    hmi->ivi->commit_changes();
+
+    return 0;
 }
 
 /* -----------------------------------------------------------------------
@@ -266,7 +354,7 @@ read_layer_config(struct nu_hmi_controller *hmi, struct weston_compositor *ec)
 }
 
 /* -----------------------------------------------------------------------
- * wet_module_init — entry point called by Weston when the module is loaded
+ * wet_module_init - entry point called by Weston when the module is loaded
  * ----------------------------------------------------------------------- */
 WL_EXPORT int
 wet_module_init(struct weston_compositor *ec, int *argc, char *argv[])
@@ -279,7 +367,7 @@ wet_module_init(struct weston_compositor *ec, int *argc, char *argv[])
     hmi->compositor = ec;
     hmi->ivi = ivi_layout_get_api(ec);
     if (!hmi->ivi) {
-        weston_log("[nu-hmi-controller] ivi_layout API not available — "
+        weston_log("[nu-hmi-controller] ivi_layout API not available - "
                    "is ivi-shell.so loaded?\n");
         free(hmi);
         return -1;
@@ -299,7 +387,7 @@ wet_module_init(struct weston_compositor *ec, int *argc, char *argv[])
         }
     }
 
-    /* Create overflow layer FIRST — screen_add_layer prepends to the pending
+    /* Create overflow layer FIRST - screen_add_layer prepends to the pending
      * list, so the first call ends up deepest (lowest z) after commit.
      * Overflow must be at the bottom so unregistered/desktop surfaces don't
      * occlude explicitly-configured layers. */
@@ -338,6 +426,19 @@ wet_module_init(struct weston_compositor *ec, int *argc, char *argv[])
 
     hmi->destroy_listener.notify = on_compositor_destroy;
     wl_signal_add(&ec->destroy_signal, &hmi->destroy_listener);
+
+    /* Runtime plane swap trigger -- see on_swap_signal() for the mechanism
+     * and why it's compositor-mediated instead of client-triggered.
+     * wl_event_loop_add_signal() is libweston's own event-loop-integrated
+     * signal handling (built on a signalfd internally) -- safe to call
+     * weston/ivi-layout API from the callback, unlike a raw sigaction
+     * handler. */
+    hmi->swap_signal_source = wl_event_loop_add_signal (
+        wl_display_get_event_loop (ec->wl_display),
+        SIGUSR1, on_swap_signal, hmi);
+    if (!hmi->swap_signal_source)
+        weston_log("[nu-hmi-controller] failed to install SIGUSR1 swap "
+                   "handler -- runtime plane swap unavailable\n");
 
     weston_log("[nu-hmi-controller] loaded: %d layers configured\n", hmi->n_layers);
     return 0;
