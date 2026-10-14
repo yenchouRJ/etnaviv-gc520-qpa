@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config DRM_VC8K
+	tristate "DRM render node for Nuvoton MA35 VC8000NanoD video decoder"
+	depends on DRM
+	depends on OF && (ARCH_MA35D1 || ARCH_MA35D0 || ARCH_MA35H0 || COMPILE_TEST)
+	depends on !VIDEO_NUVOTON_VC8K
+	select DRM_SCHED
+	select DRM_GEM_DMA_HELPER
+	help
+	  Kernel half of the VC8000NanoD (H.264/JPEG decoder + post-processor)
+	  stack: contiguous GEM/dma-buf memory, register-job submission, IRQ
+	  handling and fences.  Codec logic runs in userspace (libvc8k).
+	  Mutually exclusive with the V4L2 driver, which binds the same
+	  compatible string.
