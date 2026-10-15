@@ -66,7 +66,7 @@ static struct drm_driver ma35_drm_driver = {
 	.major				= DRIVER_MAJOR,
 	.minor				= DRIVER_MINOR,
 
-	DRM_GEM_DMA_DRIVER_OPS_VMAP_WITH_DUMB_CREATE(ma35_drm_gem_dma_dumb_create),
+	DRM_GEM_DMA_DRIVER_OPS_WITH_DUMB_CREATE(ma35_drm_gem_dma_dumb_create),
 };
 
 static struct regmap_config ma35_drm_regmap_config = {
