@@ -14,7 +14,7 @@ route (`../vc8k`). Nothing here replaces `../vc8k`; the DT compatible string sel
 | D3 Pass | Per-frame checksum of decoded NV12 == ffmpeg software decode. Display check last |
 | D4 Streams | Generated with host ffmpeg/libx264 into `vpu/videos/`, one H.264 feature per step |
 | D5 Switching | Same DT node; `compatible = "nuvoton,ma35d1-vpu"` -> Hantro, `"nuvoton,ma35d1-vc8k"` -> DRM |
-| D6 Memory | Keep `memory-region = <&vc8k_buf>` (32 MiB). Enlarging it is acceptable if needed |
+| D6 Memory | `memory-region = <&vc8k_buf>` (32 MiB) is declared, but mainline Hantro never uses it (see Memory finding); buffers come from the shared 48 MiB CMA |
 | D7 Clock | Hantro convention: `clock-names = "vpu"`, variant `clk_names = { "vpu" }` |
 | D8 Layout | Full mirror of `verisilicon/` in `vpu/v4l2/kernel/`; `sync.sh` copies it into `linux-custom` |
 | D9 Variant | New `ma35d1_vpu_hw.c`, modelled on `sama5d4_vdec_hw.c` |
@@ -102,7 +102,7 @@ S6 (real 1080p) PASS, see V3 result.
 - Result (S1..S6): all PASS bit-exact (10/10, 30/30, 30/30, 30/30, 60/60, 120/120 frames), no
   timeouts or kernel warnings. S5 (720p, B-frames) decodes 60 frames in about 1.06 s to `fakesink`
   (~55-60 fps including start-up, unsynced). S6 (real 1080p, Constrained Baseline) decodes 120
-  frames in 4.28 s (~28 fps, unsynced). The 32 MiB pool was enough.
+  frames in 4.28 s (~28 fps, unsynced). The buffers came from CMA, not from the 32 MiB `vc8k_buf` (see Memory finding).
 - S6 is compared as tight I420 (1080 lines decode as 1088 + crop, so the NV12 buffer is padded).
   The software conversion reads write-combined buffers and takes 66-75 s, hence `TMO=240`.
 - Frame-size limit: the variant first used mainline's `FMT_HD_*` (max 1280x720), so 1080p failed
@@ -126,19 +126,78 @@ Result: S7 (150 frames) runs for exactly 5.0 s (30 fps), no GStreamer or kernel 
   frame must be exactly 1024x600. Other sizes give `drmModeSetPlane: Invalid argument`.
 - **Overlay plane (38, kmssink default):** imports and is active in
   `/sys/kernel/debug/dri/0/state`, but nothing is visible without an enabled primary plane.
-- Not done: other sizes without Weston (needs a primary background, or scaling or positioning on
-  the primary plane; display-driver policy).
+- **1080p (S6, 24 fps clip) on kmssink:**
+  - Direct (`... v4l2slh264dec ! kmssink plane-id=31` or `38`) fails with `failed to activate
+    buffer pool`. Cause (found with `drm.debug`): the decoder buffers are 1088 lines but
+    `ma35_drm.c` had `max_height = 1080`, so `ADDFB2` failed (`bad framebuffer height 1088`).
+    Fixed: `max_height = 1088`. A 1080p frame is still not displayable (too large, no scaler).
+  - With a CPU scale it plays in real time (user confirmed: clear, no tearing or flicker):
+    `... v4l2slh264dec ! videoscale method=0 n-threads=2 ! video/x-raw,width=1024,height=600,pixel-aspect-ratio=1/1 ! kmssink driver-name=ma35-drm plane-id=31`
+    gives 120 frames in 5.00 s (120/24), no QoS drops seen, no kernel warnings. Unclocked about
+    20 fps, so little margin for 30 fps sources. Aspect is stretched 16:9 to 1024x600 (no `videobox`).
+- **No display scaling:** the display controller has no working scaler (register writes are
+  accepted but have no effect; tried on the primary plane, RGB and NV12 alike), so the frame
+  must already have the panel size. Sources of other sizes need the CPU (`videoscale`) for now.
+  `kmssink` keeps the aspect ratio, so a 640x480 source is placed as 800x600+112+0 and rejected
+  on the primary plane (`Plane must cover entire CRTC`).
+- Hardware scaling of 1080p (and other sizes) is deferred: it needs the Hantro post-processor
+  (see Later).
 
-**Weston path (CPU conversion, fallback).** Weston uses pixman, which rejects NV12 in
-`waylandsink`:
+**Weston path.** Weston (kiosk shell, pixman, our patches 0002-0005) advertises NV12 through
+`zwp_linux_dmabuf_v1`, but stock `waylandsink` (1.22.9) rejects the decoder output: it only offers
+dmabuf formats under `video/x-raw(memory:DMABuf)`, and `v4l2slh264dec` outputs plain `video/x-raw`
+(the buffers are dmabuf-backed anyway). Without the patch the only way was
+`videoconvert ! videoscale ! waylandsink`, about 1 fps (CPU).
+
+Patch `patches/gst1-plugins-bad/0003-waylandsink-accept-dmabuf-formats-on-system-memory-caps.patch`
+(also in the Buildroot package dir): advertise and accept the dmabuf formats on the system-memory
+caps. `show_frame()` already checks the memory of each buffer, so nothing else changes.
 ```cmd
 export XDG_RUNTIME_DIR=/tmp/xdg WAYLAND_DISPLAY=wayland-1
-gst-launch-1.0 filesrc location=S.h264 ! h264parse ! v4l2slh264dec ! videoconvert ! videoscale ! video/x-raw,width=1024,height=576,pixel-aspect-ratio=1/1 ! waylandsink
+gst-launch-1.0 filesrc location=S.h264 ! h264parse ! v4l2slh264dec ! waylandsink
 ```
-The picture is visible, but frames are dropped (CPU-bound), and the kiosk shell kills clients
-whose surface exceeds the screen.
+Board result: S7 (1024x600) plays 5.0 s zero-copy; during playback `plane[38]` holds an NV12
+framebuffer (primary holds the shell background XR24). Larger sources (S5 720p, S6 1080p) end up
+with no plane (Weston cannot scale a plane), fall back to the pixman renderer, which cannot use
+NV12, and the client is disconnected (`libwayland: error in client communication`). Same root
+cause as above: needs a panel-sized frame (post-processor scaling, deferred). 
+Real video with the Qt UI (S9 = the S6 clip scaled to 1024x600 on the host, letterboxed, Baseline,
+720 frames = 6 loops, 30 s; `tests/mon_weston_qt.sh`, `tests/mon_waylandsink_mem.sh`):
+- `waylandsink` + `qt_ui_client` (`QT_QPA_PLATFORM=etnaviv2d:plane=wayland`) together:
+  `plane[31]` NV12 1024x600 (video), `plane[38]` AR24 1024x600 (Qt UI), both zero-copy.
+- Memory of `waylandsink` over 27 s (board has 164 MB): RSS 8.5 MB, PSS 7.3 MB, flat (no leak);
+  Weston RSS 15.9 MB, flat; `MemAvailable` flat at about 107 MB; `CmaFree` flat at 30 MB. 11
+  dmabuf fds held by the gst process. `MemFree` falls only because the page cache fills while the
+  file is read (use `MemAvailable`); with Qt started the CMA free dropped from 21 to 4 MB
+  (Qt client buffers + page cache in CMA), so CMA is tight with both clients.
+
+### Memory finding (vc8k_buf is not used by the V4L2 stack)
+- `vc8k_buf` (0x8a800000, 32 MiB, `shared-dma-pool`, no-map) is assigned to the vc8k node, but only
+  `vc8k_drv.c` (DRM route) and `ma35_drm.c` call `of_reserved_mem_device_init()`; mainline Hantro
+  does not, so its vb2 dma-contig buffers come from the default CMA (`CmaTotal` 48 MiB,
+  0x87800000-0x8a7fffff). Evidence: capture buffer addresses seen at import
+  (0x87d80000, 0x87f00000, 0x88200000) are inside the CMA range, not in 0x8a800000+.
+- On the SOM-256m DTS `display_buf` is commented out, so display dumb buffers, Qt BOs and the
+  decoder buffers all share the same CMA. The 32 MiB `vc8k_buf` stays idle under V4L2.
+- Option: call `of_reserved_mem_device_init(&vpu->dev)` in the ma35d1 variant probe (small patch)
+  to move decoder buffers into `vc8k_buf`; not done yet.
+
+### Decoder memory on real video (CMA 64 MiB, drone clip, High, 584 frames, 30 fps)
+`tests/mon_decoder_cma.sh`; streams `s10_hp_1080p_drone.h264` (copy of the mp4 video, 1920x1080) and
+`s11_hp_1024x600_drone.h264` (scaled and letterboxed to the panel, High, ref=4, B-frames).
+| Case | CMA used by the pipeline | Notes |
+|---|---|---|
+| 1080p, `fakesink` | about 44.8 MB (CmaFree 51.1 to 6.3 MB), flat for the whole run | `bufinfo`: 12 capture buffers of 3,657,728 B (1920x1088 NV12 + MV) + 2 bitstream buffers of 3,133,440 B = 47.8 MiB; 14 dmabuf fds; gst RSS 14 MB |
+| 1024x600 fit video, `waylandsink` | about 16 MB (CmaFree 53.9 to 37.9 MB) | 13 dmabuf fds, gst RSS 8.7 MB; plane 31 shows the video; user: smooth |
+| same + `qt_ui_client` | video 12 MB more (CmaFree 35.8 to 23.5 MB min) | Weston + Qt alone already took about 18 MB of CMA (53.9 to 35.8 MB), 3 of it the ARGB ring |
+- No leak and no kernel warnings. A 1080p decode alone leaves only about 6 MB of 64 MiB CMA free
+  (with Weston idle), so 1080p plus the Qt UI would not fit; the panel-size video fits with margin.
+- The decoder asks for 12 capture buffers at 1080p (DPB 4 + queue depth); a smaller count would
+  need a GStreamer-side limit.
 
 ### Later (not in minimal)
+- Hardware downscale to the panel size (1080p to 1024x600) with the Hantro post-processor;
+  mainline `hantro_postproc.c` does no scaling, the vendor library does.
 - ARGB/XRGB via PP RGB output (extend `hantro_postproc.c` for G1 RGB channel setup).
 - MPEG-2 / VP8 codec ops (mainline already has them).
 - Runtime PM tuning, reserved-memory size for 1080p with many refs.
@@ -150,7 +209,7 @@ whose surface exceeds the screen.
 | R1 | Register layout differs from G1 in fields mainline writes | CLOSED: S1..S6 bit-exact |
 | R2 | swreg101 soft-reset undocumented on NanoD | Not written by default; error-recovery path not yet exercised |
 | R3 | NanoD needs per-ref chroma bases (swreg102-118) | CLOSED: not needed, S2..S6 pass |
-| R4 | 32 MiB pool too small at 720p/1080p with DPB + MVs | CLOSED for Baseline 1080p (S6 passes); recheck with High-profile 1080p and many refs |
+| R4 | Decoder buffers (DPB + MVs at 1080p) compete for the shared 48 MiB CMA | OPEN: S6 passes, but CMA is also used by display dumb BOs and Qt; either call `of_reserved_mem_device_init()` in the variant so Hantro uses `vc8k_buf`, or enlarge CMA |
 | R5 | `v4l2slh264dec` requires features G1 lacks (e.g. interlaced) | Streams are progressive |
 | R6 | ID `0x6e645000` not a G1 ID | Mainline does not check IDs |
 
@@ -207,11 +266,16 @@ Save with `make linux-update-defconfig` (or your usual defconfig flow).
 
 ```
 vpu/v4l2/
-  plan.md                this file
-  sync.sh                kernel/ -> $K/drivers/media/platform/verisilicon/
-  kernel/                full mirror of verisilicon/ + ma35d1_vpu_hw.c
-  tests/gen_streams.sh   host: S1..S6 + reference md5 (writes ../videos)
-  tests/cmp_frames.sh    per-frame md5 compare
-  tests/run_v4.sh        target: decode S1..S6 and report pass/fail
-vpu/videos/              generated streams + references
+  plan.md                       this file
+  tests/
+    gen_streams.sh                host: build S1..S6 from ffmpeg + reference md5 and .nv12
+    cmp_frames.sh                 per-frame md5 compare of a decoded file against the reference
+    run_v4.sh                     target: decode S1..S6, compare, print PASS/FAIL (busybox-safe)
+    mon_waylandsink_mem.sh        target: waylandsink RSS/PSS, Weston RSS, MemAvailable, CmaFree
+    mon_weston_qt.sh              target: video + qt_ui_client together, sample memory, dump planes
+    mon_decoder_cma.sh            target: CMA used by the decoder (fakesink or waylandsink)
+
+Related changes outside this directory:
+  drivers/gpu/drm/nuvoton/ma35_drm.c       PRIME import without vmap; max_height 1088
+  patches/gst1-plugins-bad/0003-*.patch    waylandsink accepts dmabuf NV12 on plain caps
 ```
