@@ -125,7 +125,7 @@ static int ma35_mode_init(struct ma35_drm *priv)
 	mode_config->min_width = 32;
 	mode_config->max_width = 1920;
 	mode_config->min_height = 1;
-	mode_config->max_height = 1080;
+	mode_config->max_height = 1088;
 	mode_config->preferred_depth = 24;
 	mode_config->cursor_width = MA35_CURSOR_WIDTH;
 	mode_config->cursor_height = MA35_CURSOR_HEIGHT;
