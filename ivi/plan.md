@@ -262,6 +262,26 @@ generalize beyond two configured `[nuvoton-layer]` entries.
 
 ---
 
+## Positioned overlay video (centre region) ✓ DONE
+
+Goal: play a video in only the middle of the screen, Qt UI visible around it.
+
+- Display facts: no working scaler (video must already be panel-region sized); overlay
+  position works; primary plane is full-CRTC only and must be enabled.
+- `nu-hmi-controller.c`: new optional `[nuvoton-layer]` keys `center=1` or `x=`/`y=`.
+  `place_surface()` sets the destination rectangle (source and size stay the buffer size);
+  used on first assignment, on buffer-size change and on swap. Default 0,0 as before.
+- Layout used: Qt on layer 1000 (primary, `QT_IVI_SURFACE_ID=1000`), video on layer 2000
+  (overlay, `center=1`, `GST_WAYLANDSINK_IVI_SURFACE_ID=2000`).
+- Hardware check (192.168.0.102): plane 31 AR24 1024x600 (Qt), plane 38 NV12 `512x300+256+150`
+  (video), zero-copy, no Pixman fallback; user: good demo. Clip: `vpu/videos/s12_hp_512x300_drone.h264`.
+- Limits: position only, no scaling; video is opaque; primary can't be moved.
+- Documented in `patches/weston/weston-ivi.ini`. Board originals: `/mnt/vc8k/nu-hmi-controller.so.orig`,
+  `/mnt/vc8k/weston-ivi.ini.orig`.
+- Build note: with the `ma35d1_br24_qt5` env use `PATH=$R/host/bin:$PATH make CC=aarch64-linux-gcc`.
+
+---
+
 ## Next steps
 
 All items below are done; kept here as a record.
