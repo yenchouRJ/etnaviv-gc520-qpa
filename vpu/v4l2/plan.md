@@ -84,7 +84,11 @@ Generate in `vpu/videos/` with `gen_streams.sh` (ffmpeg + libx264, testsrc2 patt
 | S5 | `s5_hp_b_1280x720.h264` | S4 at 720p, 60 frames |
 | S6 | `s6_bp_1080p.h264` | Constrained Baseline 1080p, 120 frames, real clip (compared in tight I420: 1080 lines decode as 1088 + crop) |
 | S7 | `s7_hp_b_1024x600.h264` | High, B-frames, 150 frames at panel size (display test only, no reference) |
-| S6 (opt) | `bubles_1080p_base.264` copy | real 1080p clip |
+| S8 | `s8_hp_b_512x300.h264` | half panel size (display scaler test, scaler does not work) |
+| S9 | `s9_bp_1024x600_real.h264` | S6 clip fitted to the panel (letterboxed), 720 frames |
+| S10 | `s10_hp_1080p_drone.h264` | drone clip, High, 1920x1080, 584 frames (memory test) |
+| S11 | `s11_hp_1024x600_drone.h264` | S10 fitted to the panel, ref=4, B-frames |
+| S12 | `s12_hp_512x300_drone.h264` | S10 at 512x300, for the centred overlay (ivi) |
 
 For each: `ffmpeg -i X -f rawvideo -pix_fmt nv12 X.nv12` and per-frame md5 list `X.md5`
 (`dd` + md5sum). Widths and heights are multiples of 16, so no crop/stride ambiguity.
@@ -195,6 +199,30 @@ Real video with the Qt UI (S9 = the S6 clip scaled to 1024x600 on the host, lett
 - The decoder asks for 12 capture buffers at 1080p (DPB 4 + queue depth); a smaller count would
   need a GStreamer-side limit.
 
+### Experiment: fewer CAPTURE buffers (gst patch, archived, not applied)
+`gstv4l2codech264dec.c` `decide_allocation()` requests `dpb + downstream_min + 4` capture buffers
+(here 6 + 2 + 4 = 12). Experimental patch: cap to `GST_V4L2_CODEC_CAPTURE_BUFFERS` (default 8),
+never below `dpb + 2`. The drone clip has a DPB of 6 (level 4.0), so 8 is the floor.
+| Case | Buffers | CMA used (1080p, fakesink) | Result |
+|---|---|---|---|
+| unpatched | 12 | 44.8 MB | OK |
+| patched | 8 | 36.6 MB (CmaFree 53.3 to 16.6 MB) | OK, 27.6 s for 584 frames unclocked, same as 12 |
+- 1024x600 clip with `waylandsink` + `qt_ui_client`, 8 buffers: CMA used about 10 MB for the video
+  (min CmaFree 24.9 MB); user: clear and smooth. No kernel warnings.
+- Saves 4 buffers (about 14.6 MB at 1080p) with no visible cost. Reverted after the test (source restored,
+  plugin rebuilt and redeployed); the patch is archived as
+  `patches/gst1-plugins-bad/experimental-0004-v4l2codecs-h264dec-cap-capture-buffers.patch`
+  (not in the Buildroot package dir, so not applied by default).
+
+### Centred (positioned) video next to the Qt UI (ivi-shell, done in the ivi plan)
+Since the display has no scaler, a video smaller than the panel is shown with the overlay's
+position support: `nu-hmi-controller` got `center=1` / `x=` / `y=` layer keys (commit 2d833be,
+`ivi/plan.md`). Layout: Qt on layer 1000 (primary), video on layer 2000 (overlay, centred),
+`GST_WAYLANDSINK_IVI_SURFACE_ID=2000`. Board check: plane 31 AR24 1024x600 (Qt), plane 38 NV12
+`512x300+256+150` (S12), zero-copy, no Pixman fallback; user: good demo. Position only; the
+overlay is opaque and the primary cannot be moved. This is the current answer for non-panel sizes
+until post-processor scaling exists.
+
 ### Later (not in minimal)
 - Hardware downscale to the panel size (1080p to 1024x600) with the Hantro post-processor;
   mainline `hantro_postproc.c` does no scaling, the vendor library does.
@@ -209,7 +237,7 @@ Real video with the Qt UI (S9 = the S6 clip scaled to 1024x600 on the host, lett
 | R1 | Register layout differs from G1 in fields mainline writes | CLOSED: S1..S6 bit-exact |
 | R2 | swreg101 soft-reset undocumented on NanoD | Not written by default; error-recovery path not yet exercised |
 | R3 | NanoD needs per-ref chroma bases (swreg102-118) | CLOSED: not needed, S2..S6 pass |
-| R4 | Decoder buffers (DPB + MVs at 1080p) compete for the shared 48 MiB CMA | OPEN: S6 passes, but CMA is also used by display dumb BOs and Qt; either call `of_reserved_mem_device_init()` in the variant so Hantro uses `vc8k_buf`, or enlarge CMA |
+| R4 | Decoder buffers (DPB + MVs at 1080p) compete for the shared 48 MiB CMA | OPEN: CMA is now 64 MiB; 1080p alone takes about 45 MB (36.6 MB with 8 buffers), the panel-size clip about 16 MB, shared with Weston and Qt (about 18 MB). Either call `of_reserved_mem_device_init()` in the variant so Hantro uses `vc8k_buf`, or enlarge CMA |
 | R5 | `v4l2slh264dec` requires features G1 lacks (e.g. interlaced) | Streams are progressive |
 | R6 | ID `0x6e645000` not a G1 ID | Mainline does not check IDs |
 

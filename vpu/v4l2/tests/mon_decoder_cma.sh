@@ -5,7 +5,7 @@ F=$1; SINK=$2
 sync; echo 3 > /proc/sys/vm/drop_caches
 cma(){ awk '/^CmaFree/{printf "CmaFree=%s ",$2}/^MemAvailable/{printf "MemAvail=%s ",$2}' /proc/meminfo; }
 echo "baseline: $(cma)"
-gst-launch-1.0 -q filesrc location=videos/$F ! h264parse ! v4l2slh264dec ! $SINK >/tmp/gst.log 2>&1 &
+gst-launch-1.0 -q filesrc location=$F ! h264parse ! v4l2slh264dec ! $SINK >/tmp/gst.log 2>&1 &
 G=$!
 MIN=999999; PK=0
 t=0
