@@ -70,9 +70,26 @@ static int ma35d1_vpu_h264_run(struct hantro_ctx *ctx)
 	if (!id_logged) {
 		struct hantro_dev *vpu = ctx->dev;
 
+		u32 pp_fuse, pp_cfg;
+
 		id_logged = true;
 		dev_info(vpu->dev, "HW id 0x%08x swreg2 0x%08x\n",
 			 vdpu_read(vpu, 0), vdpu_read(vpu, G1_REG_CONFIG));
+
+		/* Synthesis/fuse registers (read only), see pp/plan.md T0. */
+		pp_fuse = vdpu_read(vpu, 0x18c);
+		pp_cfg = vdpu_read(vpu, 0x190);
+		dev_info(vpu->dev,
+			 "dec synth swreg50 0x%08x swreg54 0x%08x fuse swreg57 0x%08x\n",
+			 vdpu_read(vpu, 0xc8), vdpu_read(vpu, 0xd8),
+			 vdpu_read(vpu, 0xe4));
+		dev_info(vpu->dev,
+			 "pp fuse swreg99 0x%08x synth swreg100 0x%08x: scale_level %u pixac %u tiled %u deint %u blend %u maxw(4k %u 1920 %u 1280 %u)\n",
+			 pp_fuse, pp_cfg, (pp_cfg >> 26) & 3,
+			 (pp_cfg >> 30) & 1, (pp_cfg >> 29) & 1,
+			 (pp_cfg >> 25) & 1, (pp_cfg >> 24) & 1,
+			 (pp_fuse >> 16) & 1, (pp_fuse >> 15) & 1,
+			 (pp_fuse >> 14) & 1);
 	}
 
 	return hantro_g1_h264_dec_run(ctx);
