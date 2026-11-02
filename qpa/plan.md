@@ -85,10 +85,10 @@ Virtual method mapping (all 6 overrides):
 | `alphaFillRect(rect, color, cmode)` | opaque / Source: `etna2d_fill`; else `cpuFillRect()` | not reached in normal use (capability not declared); kept as a safe implementation. Never call the `QBlittable::alphaFillRect` base stub: it only warns and draws nothing |
 | `drawPixmap(dstR, pixmap, srcR)` *(pure)* | `etna2d_blit` if sizes equal, `etna2d_stretch` if not | must obtain source `etna2d_surface*` from pixmap's `EtnaBlittablePlatformPixmap`; `cpuDrawPixmap()` if the source is not an EtnaBlittable (e.g. a `QRasterPlatformPixmap`) |
 | `drawPixmapOpacity(dstR, pixmap, srcR, cmode, opacity)` | 1:1: `etna2d_blit` (SRC or SRC_OVER); stretch of the full source: `etna2d_stretch`, via the scratch surface + `SRC_OVER` blit when the source is not fully opaque | `OpacityPixmapCapability` is declared only so Qt passes the composition mode (`CompositionMode_Source`). Opacity < 1, sub-rect stretch and other composition modes go to `cpuDrawPixmap()` |
-| `doLock()` *(pure)* | `etna2d_surface_map(surf)` → `new QImage(ptr, w, h, stride, Format_ARGB32_Premultiplied)` | stride = `etna2d_surface_stride(surf)` — NOT `w*4`; format must match GC520 premult model |
+| `doLock()` *(pure)* | `etna2d_surface_map(surf)` → `new QImage(ptr, w, h, stride, fmt)`; `fmt` = `Format_ARGB32_Premultiplied` by default, else the QImage format of the surface (`RGB32`, `RGB16`, `ARGB4444_Premultiplied`, see Phase 6) | stride = `etna2d_surface_stride(surf)` — NOT `w*4`; format must match GC520 premult model |
 | `doUnlock()` *(pure)* | `etna2d_surface_cpu_fini(surf)` then `etna2d_finish(ctx)` | WC drain barrier + fence wait so the GPU sees CPU writes before the next op |
 
-**Critical:** `doLock()` wraps the mapped BO as `Format_ARGB32_Premultiplied`.
+**Critical:** by default `doLock()` wraps the mapped BO as `Format_ARGB32_Premultiplied` (other formats only with `QT_ETNA2D_FMT`, Phase 6).
 The GC520 PE blends premultiplied; the CPU raster fallback runs in the same
 format; Qt's backing-store composition is consistent. This was verified in
 Phase 2/3 and must NOT be changed to `Format_ARGB32` without matching GC520 fixes.
@@ -133,7 +133,9 @@ Single method:
 QBlittable *createBlittable(const QSize &size, bool alpha) const override
 {
     etna2d_surface *surf = nullptr;
-    etna2d_surface_create(g_dev, size.width(), size.height(), &surf);
+    // ARGB8888 unless QT_ETNA2D_FMT selects another format (alpha pixmaps keep an alpha format)
+    etna2d_surface_create_fmt(g_dev, size.width(), size.height(),
+                              etnaStorageFmt(alpha).etna, &surf);
     return new EtnaBlittable(g_ctx, surf);
 }
 ```
@@ -418,3 +420,47 @@ Bisected with extra matrix cases: `drawImage` + ellipse clip matches; ellipse cl
 ### 7. Procedure
 
 Build in the Buildroot tree (`make` in the plugin build dir), copy `libqetnaviv2d.so` to `/usr/lib/qt/plugins/platforms/` on the board, stop weston (it holds DRM master), run `qt2dbench --matrix` (and `--clip`, `--ops`) from a writable directory with `QT_QPA_PLATFORM=etnaviv2d:plane=primary`.
+
+---
+
+## Phase 6 — Pixel formats (backing store, pixmaps, Wayland ring)
+
+Everything was ARGB8888 (4 B/px). The GC520 DE and the display controller both support ARGB8888, XRGB8888, RGB565, ARGB1555, ARGB4444 (and X1R5G5B5 / X4R4G4B4, which Weston did not scan out, so they are not offered). The DE converts source format to destination format on blit, blend, stretch and fill.
+
+### 1. Environment (read by the plugin, `qetnaviv2dformat.h`)
+
+| Variable | Meaning |
+|---|---|
+| `QT_ETNA2D_FMT` | the setting to use: format of the backing store, opaque pixmaps and the Wayland ring. `argb8888` (default, unchanged), `xrgb8888`, `rgb565`, `argb4444` |
+| `QT_ETNA2D_RING_FMT` | debug / A-B only: overrides the ring format (adds `argb1555`). A ring different from the backing store costs a converting copy per frame |
+| `QT_IVI_GEOMETRY=WxH` | existing: size of the ivi surface (QPA default 1024x600); needed for a full-screen UI |
+
+Unknown values log a warning and use `argb8888`. `argb1555` has no QImage equivalent, so it is ring-only (storage falls back to `argb8888`). Pixmaps with an alpha channel stay ARGB8888 when the chosen format has no alpha, so translucent sprites keep their alpha; the backing store and opaque pixmaps use the chosen format.
+
+### 2. Changes
+
+- **libetna2d:** surfaces carry a format (`ETNA2D_FMT_*`); source and destination config, stride and import check follow it. New `etna2d_surface_create_fmt()`, `etna2d_surface_from_dmabuf_fmt()`, `etna2d_surface_format()`; the old API is unchanged. **The fill clear value must stay ARGB8888**: the DE converts it to the destination format. Packing it to RGB565 first gave a pink background.
+- **Ring (`allocateRing`):** dumb BO bpp, DRM format and etna format come from the format table.
+- **Blitter:** `createBlittable(size, alpha)` picks the format; `doLock()` uses the surface's QImage format; `isOpaque()` returns true at once for formats without alpha and scans 16-bit pixels for ARGB4444.
+
+### 3. Results (1024x600 ivi overlay, kernel 6.6, `qt2dbench --clip --sprites 16`)
+
+| Setting | fps unpaced | ms/frame |
+|---|---|---|
+| default (ARGB8888 everywhere) | 101 | 9.9 |
+| ring only RGB565 | 134 | 7.4 |
+| `QT_ETNA2D_FMT=rgb565` (backing store + pixmaps + ring) | 190 | 5.3 |
+
+Display underflow (sticky bit, 8 s, Qt alone): `argb8888` underflows on the **primary** plane (32/32 polls unpaced, 9/32 at 30 fps; overlay read 147 MB/s), which is the visible flicker; `rgb565` is clean (0/32, overlay read 74 MB/s). The 32 bpp overlay is enough to starve the 1080p primary scan-out; cause of the underflow not analysed.
+
+### 4. Still ARGB32 / not covered
+
+- `flush()` still copies the whole backing store into the ring every frame (the dirty region is ignored for correctness) and `doCommit()` damages the whole buffer; a 16 bpp backing store halves that copy, damage tracking would remove most of it (needs per-ring-slot damage history).
+- Pixmaps with alpha, the stretch scratch surface and the 32x32 `wl_shm` cursor are ARGB8888.
+- KMS-direct paths (`qetnaviv2dscreen.cpp`: dumb buffer `bpp = 32`, `DRM_FORMAT_ARGB8888` / `XRGB8888`, `mDepth = 32`) were not changed; only the Wayland ring follows the setting.
+- Fills and blends into ARGB4444 / ARGB1555 destinations are untested.
+
+### 5. Procedure
+
+Rebuild `libetna2d` (install `etna2d.h` and the `.so` into the sysroot, copy `libetna2d.so.1` to `/usr/lib` on the board), rebuild the plugin, copy `libqetnaviv2d.so`. With Weston (ivi) running and `QT_QPA_PLATFORM=etnaviv2d:plane=wayland QT_IVI_SURFACE_ID=2000`:
+`for cfg in X=1 QT_ETNA2D_RING_FMT=rgb565 QT_ETNA2D_FMT=rgb565; do env $cfg qt2dbench --clip --stage-secs 6 --sprites 16; done` and compare the `STAGE` fps. Underflow: clear `devmem 0x40261518` / `0x40261540`, poll and test bit 5 (primary) and bit 23 (overlay).
