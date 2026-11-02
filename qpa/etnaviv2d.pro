@@ -49,6 +49,7 @@ HEADERS = \
     qetnaviv2dintegration.h          \
     qetnaviv2dscreen.h               \
     qetnaviv2dblitter.h              \
+    qetnaviv2dformat.h               \
     qetnaviv2dbackingstore.h         \
     qetnaviv2dwaylandtransport.h
 
