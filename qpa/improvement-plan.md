@@ -80,6 +80,14 @@ Translucent fill is 5x faster and now within ~25-30% of a plain cached QImage; t
 - Pass: finish count <= 1 per frame in a mixed text + sprite scene; fps up vs step 1; no hazards
   (CPU draw on a surface with a pending GPU write must still be correct: add a matrix case that alternates GPU fill / CPU text / GPU blit on one surface).
 
+### Step 2 results (done, different shape than planned)
+What was measured instead of assumed (`qt2dbench --mixed`: 12 big alpha blits queued on pixmap A, then a CPU-only antialiased-ellipse job on an unrelated pixmap B, repeated):
+- The drain that hurts is not the unlock (`unlockfin` is 0 in every run) and not the lock of an unrelated surface: a CPU-only pixmap such as B stays locked across painters, so it never calls `doLock` again. The GPU work queued on A simply **sat unsubmitted in the command stream until A's own next lock**, which then waited the full 11 ms of GPU time (`A: ctor 11.2 ms`, whole loop 35.4 ms, the CPU idle while the GPU worked and the GPU idle while the CPU worked).
+- Fix: `EtnaPaintEngine::end()` submits (`etna2d_flush`, asynchronous, no wait, no-op when nothing is queued) when a painter ends, so the GPU runs while the CPU continues. `QT_ETNA2D_SUBMIT_ON_END=0` = old behaviour.
+- Result `--mixed`: 35.4 -> 29.3 ms per loop (-17%), A's painter 11.2 -> 0.2 ms; the CPU job gets slower (24 -> 29 ms) because GPU and CPU now share the DDR at the same time, the net is still a win. CPU busy 69 -> 100% of one core: the idle waiting is replaced by work.
+- The per-surface kernel-fence wait at lock time (`etna2d_surface_cpu_begin` on write-combine surfaces, no `finish` at unlock) was implemented and measured: no measurable difference (`--mixed`, `--clip`, `--damage` within +-3%), so it was removed again; the WC lock stays `etna2d_finish` (free when nothing is queued). The per-surface "GPU write pending" flag from the plan is therefore not needed. `isOpaque()` is already cached per content version (`opaquescan` = 0).
+- Regression check: `--matrix` 52 match / 2 known DIFF, `--damage` + `VERIFY_FLUSH` bad=0 (300 frames, full and partial flush), `--clip` unchanged (fps 89 / 31 same as before in the same session), `--ops` all within +-3% of step 5b.
+
 ## Step 3: Damage-aware flush (remove the whole-frame copy)
 - 3a: `flush()` blits only `region` rects. Per-ring-slot (or per-scanout-buffer) damage history:
   a slot must also repaint what changed since it was last used. Wayland: `wl_surface_damage_buffer` with the same region.
@@ -201,7 +209,7 @@ Honest limit: Qt's own per-run work (layout, glyph position and cache lookups, a
 |---|---|---|---|---|
 | 0 | done | baseline in results/ | counters added | see git log |
 | 1 | done | translucent fill full 35.3 ms | 7.0 ms (GPU-only paths -5..-18%, see Step 2) | see git log |
-| 2 | todo | | | |
+| 2 | done (submit on painter end) | mixed GPU+CPU loop 35.4 ms | 29.3 ms | see git log |
 | 3 | done (Wayland) | 1080p partial update 61 -> 269 loops/s | copy 245 -> 34 MB/s | see git log |
 | 4 | done (Wayland repaint-on-release; KMS deferred) | dropped frames lost | all presented, stale UI fixed | see git log |
 | 5 | done (policy measured, thresholds 0) | empty finish 118 us | 0 us | see git log |

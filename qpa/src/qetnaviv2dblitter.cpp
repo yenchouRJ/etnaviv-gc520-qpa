@@ -52,6 +52,7 @@ static bool noBatch()
 /* Step 5b switches (default on): QT_ETNA2D_GPU_TEXT=0 / QT_ETNA2D_GPU_OPACITY=0 restore the CPU paths for A/B. */
 static bool envOn(const char *name) { return qEnvironmentVariableIsEmpty(name) || qEnvironmentVariableIntValue(name) != 0; }
 static bool gpuText()    { static const bool v = envOn("QT_ETNA2D_GPU_TEXT");    return v; }
+static bool submitOnEnd() { static const bool v = envOn("QT_ETNA2D_SUBMIT_ON_END"); return v; }
 static bool gpuOpacity() { static const bool v = envOn("QT_ETNA2D_GPU_OPACITY"); return v; }
 
 #define ETNA_DBG if (debugEnabled()) qDebug() << "[etnaviv2d|blitter]"
@@ -729,6 +730,17 @@ QPaintEngine *EtnaBlittablePlatformPixmap::paintEngine() const
         that->m_engine.reset(new EtnaPaintEngine(that));
     }
     return m_engine.data();
+}
+
+bool EtnaPaintEngine::end()
+{
+    const bool ok = QBlitterPaintEngine::end();
+    /* Queued ops otherwise sit in the command stream until something needs them (next lock of a
+     * surface they touch, frame flush).  Submitting here is asynchronous (no wait) and lets the GPU
+     * work overlap the CPU work that follows.  A no-op when nothing is queued. */
+    if (submitOnEnd())
+        etna2d_flush(EtnaBlittablePlatformPixmap::context());
+    return ok;
 }
 
 bool EtnaPaintEngine::gpuGlyphs(int numGlyphs, const glyph_t *glyphs, const QFixedPoint *positions,

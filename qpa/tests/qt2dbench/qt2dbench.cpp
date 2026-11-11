@@ -23,6 +23,7 @@
 #include <QWidget>
 #include <QPaintEvent>
 #include <QPainter>
+#include <QThread>
 #include <QStaticText>
 #include <QPainterPath>
 #include <QLinearGradient>
@@ -525,6 +526,35 @@ static void runMatrix()
     }
 }
 
+/* ------------------------------------------------------------------ mixed mode (Step 2)
+ * GPU work queued on pixmap A (big alpha blits), then a CPU-only raster job (antialiased ellipses,
+ * a GPU fallback) on an UNRELATED pixmap B.  With a whole-context drain at lock time the CPU job
+ * waits for A's GPU work; with a per-surface wait the two overlap. */
+static void runMixed(double secs)
+{
+    const QString plat = QGuiApplication::platformName();
+    QPixmap A(1024, 600), B(256, 256);
+    { QPainter p(&A); p.fillRect(A.rect(), QColor(30, 30, 30)); }
+    { QPainter p(&B); p.fillRect(B.rect(), QColor(30, 60, 90)); }
+    QPixmap spr = OpSet::mkAlpha(256, 256, 200);
+    long loops = 0; CpuSnap c0 = cpuSnap(); QElapsedTimer t; t.start();
+    double tA = 0, tB = 0; QElapsedTimer q;
+    while (t.elapsed() < secs * 1000.0) {
+        q.start();
+        { QElapsedTimer z; z.start(); QPainter p(&A); double t1 = z.nsecsElapsed(); for (int i = 0; i < 12; ++i) p.drawPixmap((i * 70) % 700, (i * 37) % 340, spr); double t2 = z.nsecsElapsed(); p.end(); double t3 = z.nsecsElapsed();
+          if (qEnvironmentVariableIntValue("QT2D_MIXED_TRACE") && loops % 20 == 0) fprintf(stderr, "A: ctor %.2f draws %.2f end %.2f ms\n", t1 / 1e6, (t2 - t1) / 1e6, (t3 - t2) / 1e6); }
+        tA += q.nsecsElapsed(); if (qEnvironmentVariableIntValue("QT2D_MIXED_SLEEP")) QThread::msleep(qEnvironmentVariableIntValue("QT2D_MIXED_SLEEP")); q.start();
+        { QPainter p(&B); p.setRenderHint(QPainter::Antialiasing); p.setPen(Qt::NoPen);
+          for (int i = 0; i < 40; ++i) { p.setBrush(QColor(200 - i * 4, 60 + i * 3, 90, 200)); p.drawEllipse(10 + i * 4, 10 + i * 3, 90, 70); } }
+        tB += q.nsecsElapsed();
+        ++loops;
+    }
+    { QPainter p(&A); p.fillRect(0, 0, 1, 1, Qt::black); }     /* wait for the last GPU work */
+    double el = t.nsecsElapsed() / 1e9; CpuSnap c1 = cpuSnap(); double sys, app; cpuPct(c0, c1, sys, app);
+    printf("MIXED platform=%s secs=%.1f loops=%ld loops_s=%.1f ms_loop=%.2f partA_ms=%.2f partB_ms=%.2f cpu_sys=%.1f cpu_app=%.1f\n",
+           qPrintable(plat), el, loops, loops / el, 1000.0 * el / loops, tA / 1e6 / loops, tB / 1e6 / loops, sys, app);
+}
+
 /* ------------------------------------------------------------------ damage mode
  * Static, position-dependent background (stale pixels are visible and verifiable) with a few
  * small moving sprites; only the old/new sprite rects are update()d, so the flushed region is
@@ -597,7 +627,7 @@ private:
 /* ------------------------------------------------------------------ main */
 int main(int argc, char **argv)
 {
-    bool clip = false, ops = false, display = false, matrix = false, damage = false;
+    bool clip = false, ops = false, display = false, matrix = false, damage = false, mixed = false;
     double secs = 3.0, stageSecs = 5.0;
     QVector<int> counts = { 16, 32, 64, 128, 256 };
     for (int i = 1; i < argc; ++i) {
@@ -606,6 +636,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--display")) display = true;
         else if (!strcmp(argv[i], "--matrix")) matrix = true;
         else if (!strcmp(argv[i], "--damage")) damage = true;
+        else if (!strcmp(argv[i], "--mixed")) mixed = true;
         else if (!strcmp(argv[i], "--secs") && i + 1 < argc) secs = atof(argv[++i]);
         else if (!strcmp(argv[i], "--stage-secs") && i + 1 < argc) stageSecs = atof(argv[++i]);
         else if (!strcmp(argv[i], "--sprites") && i + 1 < argc) {
@@ -616,6 +647,7 @@ int main(int argc, char **argv)
                                  "       qt2dbench --damage [--sprites N] [--secs S]   (partial-update workload)\n       qt2dbench --matrix   (QPainter feature matrix: GPU or CPU, pixels vs raster)\n"); return 2; }
     }
     if (matrix) { QApplication app(argc, argv); runMatrix(); return 0; }
+    if (mixed) { QApplication app(argc, argv); runMixed(secs); return 0; }
     if (damage) { QApplication app(argc, argv); DamageWindow w(qMin(64, counts.first()), secs); w.begin(); return app.exec(); }
     if (clip == ops) { fprintf(stderr, "choose exactly one of --clip / --ops\n"); return 2; }
 
