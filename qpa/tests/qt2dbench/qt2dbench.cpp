@@ -89,7 +89,7 @@ static QVector<SizeSpec> sizeSpecs(int W, int H)
     QVector<SizeSpec> v;
     auto mk = [&](int s) { SizeSpec z; z.label = QString("%1x%1").arg(s); z.dw = z.dh = s;
                            z.k = qMax(1, int(std::lround(2.0 * W * H / (s * s)))); return z; };
-    v << mk(64) << mk(256);
+    v << mk(8) << mk(16) << mk(32) << mk(64) << mk(256);
     SizeSpec f; f.label = "full"; f.dw = W; f.dh = H; f.k = 2; v << f;
     return v;
 }

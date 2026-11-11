@@ -43,7 +43,7 @@ Findings that reorder the plan:
 4. 14% frames dropped at 1024x600 (ring full, `dropped=10-14` per s): back-pressure drop with no re-arm (Step 4). Not seen at 1080p argb (GPU-bound: Weston keeps up).
 5. Build note: `hal/libetna2d` and `qpa` Makefiles default to the `ma35d1_br24_qt5` sysroot; with the graphic tree use `make -C hal/libetna2d BR=<graphic>` and `make plugin QT_BUILD=<graphic qt5base> BR_ROOT=<graphic>` (linking against the qt5 sysroot fails on /lib64/libm).
 
-Proposed order after this: **Step 3 -> Step 2 -> Step 4 -> Step 1 -> 5 -> 6**.
+Proposed order after this: **Step 3 -> Step 2 -> Step 4 -> Step 1 -> 5 -> 6** (Step 5 data now makes Step 1 the next one).
 
 ## Step 1: CPU fallback memory type (WC -> cached)
 Hypothesis: raster fallback reads the destination from WC memory (uncached, slow).
@@ -130,6 +130,25 @@ Not done, with reasons:
 - Evaluate a glyph path (`test_glyph` exists): A8 glyph mask is not a GC520 primitive; only pursue if the DE can do mask blit/colour expand (check `drivers/ref/GC520L`). Otherwise record "text is CPU" as the ceiling.
 - Pass: no case slower than pure CPU raster by more than 5% in `--ops`.
 
+### Step 5 results (policy measured; thresholds stay at 0; one libetna2d fix found on the way)
+Tools: `QT_ETNA2D_MIN_FILL|BLIT|ALPHA|SCALE=<px>` / `QT_ETNA2D_MIN_ALL` (below this destination area the plugin draws with the CPU raster path, default 0 = always GPU); `tests/qt2dbench/run_ops_ab.sh` (GPU plugin vs the `offscreen` platform = CPU raster in ordinary cached memory, per op and size, offscreen, unpaced, us per op); `qt2dbench --ops` now also covers 8, 16, 32 px. Raw: `results/step5-*.txt`.
+
+us/op at 1024x600 (GPU = plugin default; CPU cached = what a cached BO would give; plugin CPU on WC = `QT_ETNA2D_MIN_ALL` forcing the plugin's own CPU path, after the drain fix below):
+
+| op | 8x8 gpu / cpu cached / plugin cpu(WC) | 64x64 | 256x256 | full |
+|---|---|---|---|---|
+| fill | 3.7 / 1.8 / 33 | 27 / 32 / 51 | 311 / 328 / 323 | 2723 / 1606 / 2677 |
+| blit (opaque) | 4.7 / 2.2 / 52 | 71 / 33 / 520 | 931 / 559 / 7528 | 8343 / 4231 / 65706 |
+| alpha (src-over) | 4.7 / 4.2 / 52 | 71 / 114 / 520 | 931 / 1387 / 7529 | 8589 / 9897 / 65720 |
+| scale 2x | 5.0 / 3.2 / 46 | 33 / 41 / 143 | 394 / 598 / 1576 | 3373 / 3772 / 14637 |
+| alphafill (always CPU today) | 6.2 / 4.1 / 6.3 | 294 / 93 / 294 | 4609 / 871 / 4610 | 35321 / 5409 / 35323 |
+
+Findings:
+1. **A size threshold does not pay today.** The plugin's CPU path (WC memory) is 8-90x slower than the GPU for every op except fill at 256x256+, so thresholds stay 0. Even with cached memory the CPU only wins for opaque blit (about 2x at all sizes: the DE moves ~100-190 Mpix/s), tiny fills and tiny ops (<= 8 px, where both are single-digit us); the GPU wins src-over (1.2-1.6x from 16 px up) and scale (1.2-1.5x from 32 px up). Revisit the knob after Step 1 (cached memory): the likely setting is opaque blit/fill to the CPU, alpha/scale on the GPU.
+2. **Step 1 is now the biggest measured win**: the only always-CPU op, translucent fill, runs 4609 us (256x256) / 35 ms (full) on WC against 871 us / 5.4 ms on cached memory: 5-6.5x.
+3. **Found and fixed in libetna2d: empty `etna2d_finish()` cost 118 us** (an empty submit plus fence wait) and every CPU fallback does two of them (`doLock` and `doUnlock`), about 240 us per fallback op (64x64 blit through the CPU path was 861 us, now 520; 8x8 fill 254 -> 33 us). `etna2d_finish()` now returns at once when nothing was queued since the last finish (`ctx->dirty`). Selftest passes, `--matrix` 40/2 unchanged, `--clip` unchanged (68 / 110 / 29 / 68 fps). `hal/libetna2d/emptyfinish.c` measures it (empty finish 118 -> 0 us; a real fill + finish stays 127 us, that is the submit round trip). This is the cheap part of Step 2; the per-surface fence part of Step 2 is still open. Deployed to `/usr/lib/libetna2d.so.1` (original saved as `/mnt/graphics_stack/gpu/libetna2d.so.1.orig`).
+4. **Glyphs / opacity on the DE: not proven, not disproven.** The DE register header has `DE_FORMAT_A8`, `DE_FORMAT_MONOCHROME`, `VIVS_DE_SRC_CONFIG_MONO_TRANSPARENCY`, global source/dest alpha modes (`VIVS_DE_ALPHA_MODES_GLOBAL_*`, `GLOBAL_SRC_COLOR`), and the vendor feature database lists `G2D_MASK_AND_COLORKEY` and `2D_A8_TARGET/A8_NO_ALPHA` enums for GC520L, but nothing here proves A8 as a blend source, a coloured mask blit or global opacity works on this core. A text/opacity path needs a register-level probe first (A8 source + GLOBAL_SRC_COLOR blend; global alpha blit), as its own step (5b) with a pixel check against the CPU. Until then text stays CPU and benefits only from Step 1.
+
 ## Step 6: Safety and hygiene
 - Context/device per thread or mutex (scratch surface, `g_ctx` globals). Test: `test_kms_thread` + a QPainter on a worker thread pixmap.
 - KMS-direct scanout format follows `QT_ETNA2D_FMT`; add ARGB4444 / ARGB1555 fill/blend matrix cases.
@@ -146,5 +165,5 @@ Not done, with reasons:
 | 2 | todo | | | |
 | 3 | done (Wayland) | 1080p partial update 61 -> 269 loops/s | copy 245 -> 34 MB/s | see git log |
 | 4 | done (Wayland repaint-on-release; KMS deferred) | dropped frames lost | all presented, stale UI fixed | see git log |
-| 5 | todo | | | |
+| 5 | done (policy measured, thresholds 0; glyph probe open) | empty finish 118 us | 0 us | see git log |
 | 6 | todo | | | |

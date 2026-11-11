@@ -47,6 +47,25 @@ static bool noBatch()
 #define ETNA_DBG if (debugEnabled()) qDebug() << "[etnaviv2d|blitter]"
 #define ETNA_WARN qWarning() << "[etnaviv2d|blitter]"
 
+/* Step 5: GPU-use policy.  Below a destination area (pixels) an op is drawn by the CPU raster
+ * engine instead of the GC520.  0 = always GPU.  Env: QT_ETNA2D_MIN_FILL / _BLIT / _ALPHA / _SCALE
+ * (alpha = source-over blit, scale = stretch) or QT_ETNA2D_MIN_ALL for all four. */
+struct GpuPolicy { qint64 fill, blit, alpha, scale; };
+static const GpuPolicy &policy()
+{
+    static const GpuPolicy p = []() {
+        auto get = [](const char *name) -> qint64 {
+            bool ok = false; qint64 v = qEnvironmentVariable(name).toLongLong(&ok);
+            if (ok) return v;
+            v = qEnvironmentVariable("QT_ETNA2D_MIN_ALL").toLongLong(&ok);
+            return ok ? v : 0;
+        };
+        return GpuPolicy{ get("QT_ETNA2D_MIN_FILL"), get("QT_ETNA2D_MIN_BLIT"),
+                          get("QT_ETNA2D_MIN_ALPHA"), get("QT_ETNA2D_MIN_SCALE") };
+    }();
+    return p;
+}
+
 /* -----------------------------------------------------------------------
  * EtnaBlittablePlatformPixmap — statics
  * ----------------------------------------------------------------------- */
@@ -236,6 +255,10 @@ void EtnaBlittable::fillRect(const QRectF &rect, const QColor &color)
                   | (uint32_t(color.red())   << 16)
                   | (uint32_t(color.green())  <<  8)
                   | uint32_t(color.blue());
+    if (color.alpha() == 255 && qint64(r.width()) * r.height() < policy().fill) {
+        cpuFillRect(rect, color, QPainter::CompositionMode_Source);
+        return;
+    }
     m_opaqueKnown = false;
     ETNA_DBG << "fillRect" << r << Qt::hex << argb;
     EtnaStats::add(EtnaStats::GpuFill);
@@ -361,6 +384,16 @@ void EtnaBlittable::drawPixmapOpacity(const QRectF &rect, const QPixmap &pixmap,
         ETNA_DBG << "drawPixmapOpacity: opacity < 1.0 — CPU draw";
         cpuDrawPixmap(rect, pixmap, subrect, cmode, opacity);
         return;
+    }
+
+    {
+        const qint64 area = qint64(dstR.width()) * dstR.height();
+        const qint64 minArea = isStretch ? policy().scale : (isOver ? policy().alpha : policy().blit);
+        if (area < minArea) {
+            ETNA_DBG << "drawPixmapOpacity: below GPU threshold — CPU draw";
+            cpuDrawPixmap(rect, pixmap, subrect, cmode, opacity);
+            return;
+        }
     }
 
     if (!isStretch) {
