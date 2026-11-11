@@ -107,6 +107,24 @@ Video is the primary workload on the shared memory bus, so the UI copy saved sho
 - Test: `test_kms_thread`, `test_screen`; `--clip` at 60 fps pacing: frame time variance and dropped frames; stale-UI test (stop updating while ring is full, UI must end up current).
 - Pass: no GUI-thread block on vblank (CPU time in `select` ~ 0); no stuck frame; no tearing.
 
+### Step 4 results (Wayland part done; KMS part deferred)
+Done: a frame dropped because all ring slots are held by Weston is no longer lost. The backing store already has the pixels and the dropped region was accumulated into every buffer's stale region (Step 3), so on the next `wl_buffer.release` the transport calls a hook that re-runs `flush()` with an empty region: the ring slot gets its stale region and the frame is committed. Before, nothing repainted until the app happened to draw again, so an idle UI could stay stale. (`QT_ETNA2D_NO_REPRESENT=1` restores the old behaviour for A/B.) Exit line `ETNAFINAL pending_drop=` must be 0.
+
+| Test | Result |
+|---|---|
+| `--damage` with idle tail, `QT_ETNA2D_TEST_DROP=2` | new: `pending_drop=0`; with `QT_ETNA2D_NO_REPRESENT=1`: `pending_drop=1` (the stale-UI bug, reproduced) |
+| same with `VERIFY_FLUSH`, drop 2 and 3 | 0 `VERIFY FAIL` |
+| `--damage` natural drops (1024x600) | 55 dropped/s, 49 presented from the release hook |
+| `--clip` 1024x600 rgb565 presented frames/s | 63 -> 95 (+50%); app paint fps 122 -> 104 (the app thread now also does the present work; unpaced stress case) |
+| `--clip` 1024x600 argb8888 / 1080p | 69.8 -> 64.9 / 28.8 -> 28.2 fps (paint rate, same trade-off) |
+| `--matrix` | 40 match / 2 DIFF (unchanged) |
+| cockpit 1080p (A/B) | video 25.3 / 27.8 fps (unchanged vs Step 3; 10 fps UI never drops) |
+
+Not done, with reasons:
+- Replacing `etna2d_finish()` by a fence: the backing store is the source of the blit, and Qt repaints into it right after `flush()` returns, so the GPU must be finished (it is only 2-3 ms per frame after Step 3). Overlapping would need a double-buffered backing store. Not pursued.
+- KMS non-blocking `pageFlip` + `QSocketNotifier`: not implemented, because the KMS path needs Weston stopped, has the composite/video modes and a mutex-held wait, and could not be A/B tested in this session. Do as its own change with a KMS harness (`test_kms_thread`, `test_screen`).
+- `--clip` paint fps (an unpaced stress loop) goes down by 7-14% because dropped frames are now shown; if the app should rather run ahead, pace it (`QT2D_FPS`).
+
 ## Step 5: GPU use policy and text
 - Size threshold: ops below N pixels (tune, expect ~16x16) stay on the CPU path. Measure per-op GPU cost (3 us) vs raster at several sizes with `--ops`.
 - Evaluate a glyph path (`test_glyph` exists): A8 glyph mask is not a GC520 primitive; only pursue if the DE can do mask blit/colour expand (check `drivers/ref/GC520L`). Otherwise record "text is CPU" as the ceiling.
@@ -127,6 +145,6 @@ Video is the primary workload on the shared memory bus, so the UI copy saved sho
 | 1 | todo | | | |
 | 2 | todo | | | |
 | 3 | done (Wayland) | 1080p partial update 61 -> 269 loops/s | copy 245 -> 34 MB/s | see git log |
-| 4 | todo | | | |
+| 4 | done (Wayland repaint-on-release; KMS deferred) | dropped frames lost | all presented, stale UI fixed | see git log |
 | 5 | todo | | | |
 | 6 | todo | | | |

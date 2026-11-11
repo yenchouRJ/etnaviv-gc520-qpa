@@ -22,6 +22,7 @@
 #include "qetnaviv2dstats.h"
 
 #include <QDebug>
+#include <QTimer>
 #include <string.h>
 #include <qpa/qwindowsysteminterface.h>
 
@@ -47,6 +48,9 @@ QEtnaviv2dBackingStore::QEtnaviv2dBackingStore(QWindow *window,
     , m_transport(transport)
 {
     m_fullFlush = qEnvironmentVariableIntValue("QT_ETNA2D_FULL_FLUSH") > 0;
+    if (m_transport) {
+        m_transport->setReleaseHook([this]() { presentPending(); });
+    }
     BS_DBG << "created for window" << window
            << (transport ? "(wayland mode)" : "(KMS mode)");
     /* Allocate initial backing surface sized to the window. */
@@ -55,6 +59,10 @@ QEtnaviv2dBackingStore::QEtnaviv2dBackingStore(QWindow *window,
 
 QEtnaviv2dBackingStore::~QEtnaviv2dBackingStore()
 {
+    if (m_transport)
+        m_transport->setReleaseHook(nullptr);
+    if (EtnaStats::enabled())
+        fprintf(stderr, "ETNAFINAL pending_drop=%d (must be 0: a dropped frame was never presented otherwise)\n", int(m_dropped));
     BS_DBG << "destroyed";
 }
 
@@ -207,6 +215,15 @@ void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
              * frame callback when a slot is released. */
             EtnaStats::add(EtnaStats::DroppedFrames);
             accumulateStale(region, QRect(0, 0, m_pmdata->width(), m_pmdata->height()));
+            /* Do not lose the frame: the backing store already holds it, only the ring
+             * slot is missing.  Present it when Weston releases a slot (wl_buffer.release);
+             * if no slot is held (only in the QT_ETNA2D_TEST_DROP test) retry from the
+             * event loop. */
+            m_dropped = true;
+            if (!m_transport->ringBusy() && !m_retryQueued) {
+                m_retryQueued = true;
+                QTimer::singleShot(0, [this]() { m_retryQueued = false; presentPending(); });
+            }
             BS_DBG << "flush: wayland ring full — dropping frame (back-pressure)";
             return;
         }
@@ -236,7 +253,8 @@ void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
         verifyTarget(backingSurf, ringBo, "wayland");
 
         /* 4. Hand off to transport — frame-callback will commit */
-        m_transport->commitFrame(ringBo, region & bounds);
+        m_dropped = false;
+        m_transport->commitFrame(ringBo, damage);
         return;
     }
 
@@ -280,6 +298,16 @@ void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
     EtnaStats::Scope _tp(EtnaStats::FlipWait);
     if (m_screen->pageFlip() != 0)
         BS_WARN << "flush(KMS): pageFlip failed";
+}
+
+void QEtnaviv2dBackingStore::presentPending()
+{
+    static const bool off = qEnvironmentVariableIntValue("QT_ETNA2D_NO_REPRESENT") > 0; /* A/B: old behaviour */
+    if (off || !m_dropped || !window())
+        return;
+    EtnaStats::add(EtnaStats::RelPresent);
+    BS_DBG << "presenting frame dropped earlier (ring slot available)";
+    flush(window(), QRegion(), QPoint());
 }
 
 /* -----------------------------------------------------------------------

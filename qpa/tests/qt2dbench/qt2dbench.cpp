@@ -554,7 +554,12 @@ private:
         if (now >= m_secs) {
             printf("DAMAGE platform=%s res=%dx%d sprites=%d secs=%.1f frames=%d fps=%.1f ms_frame=%.2f\n",
                    qPrintable(m_plat), width(), height(), m_n, now, m_frames, m_frames / now, 1000.0 * now / m_frames);
-            fflush(stdout); QApplication::quit(); return;
+            fflush(stdout);
+            /* stall: one last repaint, then stay idle. A frame dropped (ring full) at this point must still be
+             * shown from the buffer-release path (plugin prints ETNAFINAL pending_drop=0 on exit). */
+            update(0, 0, 200, 200);
+            QTimer::singleShot(1500, qApp, &QApplication::quit);
+            return;
         }
         for (int i = 0; i < m_n; ++i) {
             update(int(x[i]), int(y[i]), 48, 48);

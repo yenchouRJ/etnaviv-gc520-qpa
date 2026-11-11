@@ -60,6 +60,10 @@ private:
     void    blitRegion(etna2d_context *ctx, etna2d_surface *src, etna2d_surface *dst,
                        const QRegion &r);
 
+    void presentPending();                 /* Step 4: present a frame dropped for lack of a free ring slot */
+    bool m_dropped = false;                /* flush() was dropped; the stale regions are waiting */
+    bool m_retryQueued = false;
+
     QHash<etna2d_surface *, QRegion> m_stale;  /* per target buffer */
     bool                         m_fullFlush = false; /* QT_ETNA2D_FULL_FLUSH=1 (A/B) */
 

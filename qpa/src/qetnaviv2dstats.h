@@ -28,6 +28,7 @@ enum Id {
     BytesCopied,  /* flush copy bytes (count = bytes)                      */
     Frames,       /* flush() calls                                         */
     DroppedFrames,/* ring full, frame dropped                              */
+    RelPresent,   /* dropped frame presented from the release hook          */
     N
 };
 
@@ -54,10 +55,10 @@ inline void report()
         c[i]  = statSlots()[i].n.exchange(0);
     }
     fprintf(stderr,
-        "ETNASTATS dt=%.2f frames=%lld dropped=%lld | ms/s lockfin=%.1f(%lld) unlockfin=%.1f(%lld) "
+        "ETNASTATS dt=%.2f frames=%lld dropped=%lld relpresent=%lld | ms/s lockfin=%.1f(%lld) unlockfin=%.1f(%lld) "
         "cpufill=%.1f(%lld) cpupix=%.1f(%lld) flushfin=%.1f(%lld) flushblit=%.1f(%lld) copyMB=%.1f "
         "flipwait=%.1f(%lld) opaquescan=%.1f(%lld) | gpuops fill=%lld blit=%lld stretch=%lld\n",
-        (t - l) / 1e9, c[Frames], c[DroppedFrames],
+        (t - l) / 1e9, c[Frames], c[DroppedFrames], c[RelPresent],
         ms[LockFinish], c[LockFinish], ms[UnlockFinish], c[UnlockFinish],
         ms[CpuFill], c[CpuFill], ms[CpuPixmap], c[CpuPixmap],
         ms[FlushFinish], c[FlushFinish], ms[FlushBlit], c[FlushBlit], c[BytesCopied] / 1048576.0,

@@ -316,6 +316,7 @@ bool QEtnaviv2dWaylandTransport::allocateRing()
 
         /* Wire the release callback so the ring back-pressure works */
         static const wl_buffer_listener buf_listener = { bufferRelease };
+        slot.owner = this;
         wl_buffer_add_listener(slot.wl_buf, &buf_listener, &slot);
 
         slot.in_use.store(false);
@@ -390,7 +391,7 @@ void QEtnaviv2dWaylandTransport::commitFrame(etna2d_surface *bo, const QRegion &
     /* Frames that were blitted but never committed (a newer frame replaced them
      * before the frame callback) still count: damage is relative to the last
      * buffer the compositor actually received. */
-    m_commitDamage += damage.isEmpty() ? QRegion(QRect(QPoint(0, 0), m_outputGeometry.size())) : damage;
+    m_commitDamage += damage;
 
     if (!m_frameCallback) {
         /* No frame callback pending — first frame or compositor is idle.
@@ -445,6 +446,14 @@ void QEtnaviv2dWaylandTransport::armFrameCallback()
 /* -----------------------------------------------------------------------
  * pickFree() — return first non-in_use slot
  * ----------------------------------------------------------------------- */
+bool QEtnaviv2dWaylandTransport::ringBusy() const
+{
+    for (int i = 0; i < WL_RING_SIZE; ++i)
+        if (m_ring[i].in_use.load())
+            return true;
+    return false;
+}
+
 int QEtnaviv2dWaylandTransport::pickFree() const
 {
     /* Prefer the slot after the current one (round-robin) */
@@ -715,6 +724,8 @@ void QEtnaviv2dWaylandTransport::bufferRelease(void *data, wl_buffer * /*buf*/)
     auto *slot = static_cast<ArgbBo *>(data);
     slot->in_use.store(false);
     WL_DBG << "wl_buffer released — slot back in ring";
+    if (slot->owner && slot->owner->m_releaseHook)
+        slot->owner->m_releaseHook();
 }
 
 /* -----------------------------------------------------------------------
