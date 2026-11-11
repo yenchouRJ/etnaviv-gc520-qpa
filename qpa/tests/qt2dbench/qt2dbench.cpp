@@ -21,6 +21,7 @@
  */
 #include <QApplication>
 #include <QWidget>
+#include <QPaintEvent>
 #include <QPainter>
 #include <QPainterPath>
 #include <QLinearGradient>
@@ -505,10 +506,74 @@ static void runMatrix()
     }
 }
 
+/* ------------------------------------------------------------------ damage mode
+ * Static, position-dependent background (stale pixels are visible and verifiable) with a few
+ * small moving sprites; only the old/new sprite rects are update()d, so the flushed region is
+ * small. Exercises the plugin's damage-aware flush (improvement-plan Step 3).
+ * Run with QT_ETNA2D_VERIFY_FLUSH=1 to make the plugin compare each target buffer to the backing store. */
+class DamageWindow : public QWidget
+{
+public:
+    DamageWindow(int n, double secs) : m_n(n), m_secs(secs)
+    {
+        setAttribute(Qt::WA_OpaquePaintEvent);
+        setAttribute(Qt::WA_NoSystemBackground);
+        QImage im(48, 48, QImage::Format_ARGB32_Premultiplied);
+        QPainter p(&im); p.setCompositionMode(QPainter::CompositionMode_Source);
+        p.fillRect(0, 0, 48, 48, QColor(255, 200, 0, 220)); p.end();
+        m_spr = QPixmap::fromImage(im);
+        m_bg = QPixmap(256, 256);
+        { QPainter q(&m_bg); for (int y = 0; y < 256; y += 16) for (int x = 0; x < 256; x += 16)
+            q.fillRect(x, y, 16, 16, QColor(20 + x / 2, 20 + y / 2, 60 + ((x ^ y) & 64))); }
+        unsigned r = 777;
+        for (int i = 0; i < 64; ++i) { r = r * 1664525u + 1013904223u; x[i] = (r >> 8) % 900; r = r * 1664525u + 1013904223u; y[i] = (r >> 8) % 500;
+                                       vx[i] = 3 + i % 5; vy[i] = 2 + i % 3; if (i & 1) vx[i] = -vx[i]; }
+    }
+    void begin() { m_plat = QGuiApplication::platformName(); showFullScreen(); m_t.start(); m_secT = 0;
+                   QTimer::singleShot(0, this, &DamageWindow::tick); }
+protected:
+    void paintEvent(QPaintEvent *e) override
+    {
+        QPainter p(this);
+        for (const QRect &r : e->region()) {
+            p.setClipRect(r);
+            for (int ty = r.top() / 256; ty <= r.bottom() / 256; ++ty)
+                for (int tx = r.left() / 256; tx <= r.right() / 256; ++tx)
+                    p.drawPixmap(tx * 256, ty * 256, m_bg);
+        }
+        p.setClipping(false);
+        for (int i = 0; i < m_n; ++i) {
+            const QRect b(int(x[i]), int(y[i]), 48, 48);
+            if (e->region().intersects(b)) p.drawPixmap(b.topLeft(), m_spr);
+        }
+    }
+private:
+    void tick()
+    {
+        const double now = m_t.nsecsElapsed() / 1e9;
+        if (now >= m_secs) {
+            printf("DAMAGE platform=%s res=%dx%d sprites=%d secs=%.1f frames=%d fps=%.1f ms_frame=%.2f\n",
+                   qPrintable(m_plat), width(), height(), m_n, now, m_frames, m_frames / now, 1000.0 * now / m_frames);
+            fflush(stdout); QApplication::quit(); return;
+        }
+        for (int i = 0; i < m_n; ++i) {
+            update(int(x[i]), int(y[i]), 48, 48);
+            x[i] += vx[i]; y[i] += vy[i];
+            if (x[i] < 0 || x[i] > width() - 48) { vx[i] = -vx[i]; x[i] += vx[i]; }
+            if (y[i] < 0 || y[i] > height() - 48) { vy[i] = -vy[i]; y[i] += vy[i]; }
+            update(int(x[i]), int(y[i]), 48, 48);
+        }
+        ++m_frames;
+        QTimer::singleShot(0, this, &DamageWindow::tick);
+    }
+    int m_n; double m_secs; QPixmap m_spr, m_bg; QElapsedTimer m_t; QString m_plat;
+    double x[64], y[64], vx[64], vy[64]; int m_frames = 0; double m_secT;
+};
+
 /* ------------------------------------------------------------------ main */
 int main(int argc, char **argv)
 {
-    bool clip = false, ops = false, display = false, matrix = false;
+    bool clip = false, ops = false, display = false, matrix = false, damage = false;
     double secs = 3.0, stageSecs = 5.0;
     QVector<int> counts = { 16, 32, 64, 128, 256 };
     for (int i = 1; i < argc; ++i) {
@@ -516,6 +581,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--ops")) ops = true;
         else if (!strcmp(argv[i], "--display")) display = true;
         else if (!strcmp(argv[i], "--matrix")) matrix = true;
+        else if (!strcmp(argv[i], "--damage")) damage = true;
         else if (!strcmp(argv[i], "--secs") && i + 1 < argc) secs = atof(argv[++i]);
         else if (!strcmp(argv[i], "--stage-secs") && i + 1 < argc) stageSecs = atof(argv[++i]);
         else if (!strcmp(argv[i], "--sprites") && i + 1 < argc) {
@@ -523,9 +589,10 @@ int main(int argc, char **argv)
             for (const QString &s : QString(argv[++i]).split(',')) counts << qBound(1, s.toInt(), 1024);
         } else { fprintf(stderr, "usage: qt2dbench --clip [--stage-secs S] [--sprites 16,32,..]\n"
                                  "       qt2dbench --ops [--display] [--secs S]\n"
-                                 "       qt2dbench --matrix   (QPainter feature matrix: GPU or CPU, pixels vs raster)\n"); return 2; }
+                                 "       qt2dbench --damage [--sprites N] [--secs S]   (partial-update workload)\n       qt2dbench --matrix   (QPainter feature matrix: GPU or CPU, pixels vs raster)\n"); return 2; }
     }
     if (matrix) { QApplication app(argc, argv); runMatrix(); return 0; }
+    if (damage) { QApplication app(argc, argv); DamageWindow w(qMin(64, counts.first()), secs); w.begin(); return app.exec(); }
     if (clip == ops) { fprintf(stderr, "choose exactly one of --clip / --ops\n"); return 2; }
 
     QApplication app(argc, argv);

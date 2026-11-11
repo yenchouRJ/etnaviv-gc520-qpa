@@ -73,6 +73,23 @@ Hypothesis: raster fallback reads the destination from WC memory (uncached, slow
   screen readback (`toImage` of the ring) to the CPU reference after random partial updates over N frames (catches stale-slot ghosting).
 - Pass: bytes copied per frame ~ dirty area; the underflow poll on primary with overlay 32 bpp goes 32/32 -> 0/32 without needing rgb565; no ghosting.
 
+### Step 3 results (done; Wayland ivi path, KMS path implemented the same way but not run)
+Change: `QEtnaviv2dBackingStore` keeps a stale region per target buffer (`takeDamage`): each flush adds its region to every known buffer, the target buffer receives exactly its stale region (rects, or one bounding blit when the cost model says it is cheaper) and becomes current; a new buffer or a resize is fully stale; a dropped frame (ring full) still accumulates. The Wayland commit damages the union of the regions since the last attach (including blitted-but-never-committed frames). `QT_ETNA2D_FULL_FLUSH=1` restores the old whole-frame behaviour (A/B).
+Test tools: `qt2dbench --damage --sprites N` (static patterned background, N small moving sprites, only old/new rects `update()`d), `QT_ETNA2D_VERIFY_FLUSH=1` (after each blit the whole target buffer is compared with the backing store; `VERIFY FAIL` on mismatch), `QT_ETNA2D_TEST_DROP=N` (pretend the ring is full every Nth flush).
+
+| `--damage --sprites 4`, 6 s, unpaced | full flush | damage flush |
+|---|---|---|
+| 1024x600: update loops/s | 184 | 275 |
+| 1024x600: flushes/s, copy MB/s | 60, 141 | 85, 31 |
+| 1920x1080: update loops/s | 61 | 269 (4.4x) |
+| 1920x1080: flushes/s, copy MB/s | 31, 245 | 88, 34 |
+
+- Correctness: `VERIFY FAIL` count 0 with 1 and 8 sprites and with `QT_ETNA2D_TEST_DROP=2` and `=3` (12 s each, hundreds of flushes). The verifier itself was not exercised with a deliberately broken tracker (negative test not done).
+- Regression: `--matrix` 40 match / 2 DIFF (unchanged, known ellipse clip); `--ops` VERIFY lines ok; `--clip --sprites 16` unchanged (69.8 / 122 / 28.8 / 66 fps) because that app repaints the whole window every frame, so its damage is the whole frame. Gains need partial updates (typical widget UIs).
+- The remaining unmet pass item: the primary-plane underflow poll with the overlay at 32 bpp has not been measured yet (needs a partial-update workload on the board with the poll, do it together with Step 4).
+- New fact, `hal/libetna2d/opcost.c` (`results/opcost.txt`): a tiny blit costs 3.7-5 us per op once batched (as the plan assumed), 48x48 costs 31 us (copy) / 46 us (src-over), 256x256 0.63 / 0.96 ms, 1024x600 5.4 / 8.1 ms. The DE moves only ~100-190 Mpix/s, so bytes, not op count, set the cost: the bigger the copy the more damage tracking pays.
+- Observed after Step 3: ring-full drops are now 40% of flushes at 1024x600 with this workload (58 dropped/s): the app outruns Weston's release; Step 4 (repaint on release) is what turns these into shown frames.
+
 ## Step 4: Non-blocking presentation
 - KMS: `drmModePageFlip` without waiting in `flush()`; handle the flip event with a `QSocketNotifier` on the card fd; the next `flush()` while a flip is pending is deferred (single pending frame).
 - Wayland: on ring-full, mark dirty and request a repaint from the `wl_buffer.release` handler instead of dropping. Use dma-buf fence/implicit sync instead of `etna2d_finish()` where the compositor supports it (verify on Weston).
@@ -98,7 +115,7 @@ Hypothesis: raster fallback reads the destination from WC memory (uncached, slow
 | 0 | done | baseline in results/ | counters added | see git log |
 | 1 | todo | | | |
 | 2 | todo | | | |
-| 3 | todo | | | |
+| 3 | done (Wayland) | 1080p partial update 61 -> 269 loops/s | copy 245 -> 34 MB/s | see git log |
 | 4 | todo | | | |
 | 5 | todo | | | |
 | 6 | todo | | | |

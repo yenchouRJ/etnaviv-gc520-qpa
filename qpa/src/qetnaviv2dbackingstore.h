@@ -18,6 +18,8 @@
 
 #include "qetnaviv2dblitter.h"
 #include "qetnaviv2dscreen.h"
+#include <QHash>
+#include <QRegion>
 
 QT_BEGIN_NAMESPACE
 
@@ -47,6 +49,20 @@ public:
     bool scroll(const QRegion &area, int dx, int dy) override;
 
 private:
+    /* Damage tracking (improvement-plan Step 3).  The backing store is the
+     * truth; every target buffer (ring slot / scanout buffer) lags behind it
+     * by the regions flushed since that buffer was last written.  Returns the
+     * region of the backing store that must be copied into 'target' now and
+     * marks that buffer up to date.  A buffer seen for the first time (or
+     * after a resize) is fully stale. */
+    void    accumulateStale(const QRegion &flushed, const QRect &bounds);
+    QRegion takeDamage(etna2d_surface *target, const QRegion &flushed, const QRect &bounds);
+    void    blitRegion(etna2d_context *ctx, etna2d_surface *src, etna2d_surface *dst,
+                       const QRegion &r);
+
+    QHash<etna2d_surface *, QRegion> m_stale;  /* per target buffer */
+    bool                         m_fullFlush = false; /* QT_ETNA2D_FULL_FLUSH=1 (A/B) */
+
     QEtnaviv2dScreen            *m_screen;     /* borrowed */
     QEtnaviv2dWaylandTransport  *m_transport;  /* borrowed; non-null in wayland mode */
     QScopedPointer<QPixmap>      m_pixmap;     /* wraps the blittable */
