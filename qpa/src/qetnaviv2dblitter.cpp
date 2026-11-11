@@ -119,9 +119,8 @@ QBlittable *EtnaBlittablePlatformPixmap::createBlittable(const QSize &size,
         return nullptr;
     }
     etna2d_surface *surf = nullptr;
-    /* Surfaces the CPU rasterises into are cacheable (Step 1); QT_ETNA2D_CACHED=0 = old write-combine. */
-    static const bool cached = qEnvironmentVariableIsEmpty("QT_ETNA2D_CACHED")
-                               || qEnvironmentVariableIntValue("QT_ETNA2D_CACHED") != 0;
+    /* Surfaces the CPU rasterises into are cacheable (Step 1); QT_ETNA2D_CACHED=1 opts in (default write-combine). */
+    static const bool cached = qEnvironmentVariableIntValue("QT_ETNA2D_CACHED") != 0;
     int rc = etna2d_surface_create_ex(s_dev, size.width(), size.height(),
                                       etnaStorageFmt(alpha).etna,
                                       cached ? ETNA2D_SURF_CACHED : 0, &surf);

@@ -55,7 +55,8 @@ Hypothesis: raster fallback reads the destination from WC memory (uncached, slow
 - Pass: translucent fill >= linuxfb (31 Mpix/s at 1080p, was 13); no stale-pixel artifacts in a 10 min `test_slideshow` run.
 - Fallback if kernel lacks cached sync: keep the backing store in malloc memory and upload (see step 3b).
 
-### Step 1 results (done: cached BOs for CPU-rendered surfaces)
+### Step 1 results (done, but OPT-IN: `QT_ETNA2D_CACHED=1`; default stays write-combine)
+**Decision**: visual A/B on real apps showed more display flicker with cached BOs (memory bandwidth limited system), so write-combine remains the default. The numbers below are for the opt-in path.
 Change: `libetna2d` gets `etna2d_surface_create_ex(..., ETNA2D_SURF_CACHED)` (kernel `ETNA_BO_CACHED`: cacheable CPU map), `etna2d_surface_cpu_begin(ctx, s)` (submit queued ops, `etna_bo_cpu_prep(READ|WRITE)`: the kernel waits for the GPU fences of that surface only and invalidates the CPU cache) and `etna2d_surface_cpu_fini` (cleans the cache for the GPU). The plugin creates all its pixmaps and the backing store cached (`QT_ETNA2D_CACHED=0` = old write-combine for A/B); `doLock` uses cpu_begin instead of a whole-context `etna2d_finish`, `doUnlock` does cpu_fini and no finish. Ring and scan-out buffers (dma-buf imports) stay write-combine. Kernel already had the support (`etnaviv_gem_cpu_prep/fini` with `dma_sync_sgtable_*`); no kernel change.
 Tests: `hal/libetna2d/cachedtest.c` (CPU write -> GPU blit -> CPU read, GPU fill over dirty cached lines -> CPU read, CPU read-modify-write -> GPU blit, 200 rounds of 1024x600): PASS; CPU read of one frame 109 ms on WC vs 4.8 ms cached. `--matrix` 40/2 unchanged; `--damage` + `VERIFY_FLUSH` bad=0; `etna2d_selftest` passes.
 
