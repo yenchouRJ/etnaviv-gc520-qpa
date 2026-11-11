@@ -90,6 +90,17 @@ Test tools: `qt2dbench --damage --sprites N` (static patterned background, N sma
 - New fact, `hal/libetna2d/opcost.c` (`results/opcost.txt`): a tiny blit costs 3.7-5 us per op once batched (as the plan assumed), 48x48 costs 31 us (copy) / 46 us (src-over), 256x256 0.63 / 0.96 ms, 1024x600 5.4 / 8.1 ms. The DE moves only ~100-190 Mpix/s, so bytes, not op count, set the cost: the bigger the copy the more damage tracking pays.
 - Observed after Step 3: ring-full drops are now 40% of flushes at 1024x600 with this workload (58 dropped/s): the app outruns Weston's release; Step 4 (repaint on release) is what turns these into shown frames.
 
+### Step 3 on the cockpit demo (real app: 1080p H.264 video on primary, Qt UI on overlay)
+`run_cockpit.sh videos/cockpit_1080_30.h264`, kiosk-shell, `QT_ETNA2D_FMT=argb4444 QT2D_FPS=10 SYNC=false` (the script's 1080p defaults), 25 s clip, A/B with `QT_ETNA2D_FULL_FLUSH`. Raw: `results/step3-cockpit-{full,damage}.txt`.
+
+| | full flush | damage flush |
+|---|---|---|
+| flush `etna2d_finish` ms per UI frame | 14.3 | 2.4-3.1 |
+| UI copy MB/s (10 flushes/s) | 39.6 | 5-7 |
+| video fps (gst fpsdisplaysink mean of 1 s samples) | 25.2 | 27.9 |
+
+Video is the primary workload on the shared memory bus, so the UI copy saved shows up as +2.7 fps of video (30 fps source). One run each; repeat before quoting the fps gain as exact. Not checked visually for ghosting (only `VERIFY_FLUSH` on the synthetic test).
+
 ## Step 4: Non-blocking presentation
 - KMS: `drmModePageFlip` without waiting in `flush()`; handle the flip event with a `QSocketNotifier` on the card fd; the next `flush()` while a flip is pending is deferred (single pending frame).
 - Wayland: on ring-full, mark dirty and request a repaint from the `wl_buffer.release` handler instead of dropping. Use dma-buf fence/implicit sync instead of `etna2d_finish()` where the compositor supports it (verify on Weston).
