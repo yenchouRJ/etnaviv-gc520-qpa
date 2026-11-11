@@ -23,6 +23,7 @@
 #include <QWidget>
 #include <QPaintEvent>
 #include <QPainter>
+#include <QStaticText>
 #include <QPainterPath>
 #include <QLinearGradient>
 #include <QPixmap>
@@ -79,8 +80,8 @@ static void cpuPct(const CpuSnap &a, const CpuSnap &b, double &sys, double &app)
 }
 
 /* ------------------------------------------------------------------ ops / sizes */
-enum Op { Fill, AlphaFill, Blit, Alpha, Scale, NOPS };
-static const char *opName[NOPS] = { "fill", "alphafill", "blit", "alpha", "scale" };
+enum Op { Fill, AlphaFill, Blit, Alpha, Scale, Opacity, Text, NOPS };
+static const char *opName[NOPS] = { "fill", "alphafill", "blit", "alpha", "scale", "opacity", "text" };
 
 struct SizeSpec { QString label; int dw, dh, k; };       /* dest rect, ops per pass */
 
@@ -140,6 +141,7 @@ struct OpSet {
 /* One "pass" = k ops of one kind, the same code in display and offscreen mode. */
 static void drawPass(QPainter &p, Op op, const OpSet &s, int W, int H, int phase)
 {
+    p.setOpacity(1.0);
     static const QColor col[8] = { QColor(230, 60, 60), QColor(60, 200, 80), QColor(70, 90, 230), QColor(240, 200, 50),
                                    QColor(200, 80, 200), QColor(60, 200, 200), QColor(250, 140, 40), QColor(160, 160, 160) };
     const int dw = s.sz.dw, dh = s.sz.dh;
@@ -156,6 +158,11 @@ static void drawPass(QPainter &p, Op op, const OpSet &s, int W, int H, int phase
         case Blit:      p.drawPixmap(x, y, s.opaque); break;
         case Alpha:     p.drawPixmap(x, y, s.alpha); break;
         case Scale:     p.drawPixmap(QRect(x, y, dw, dh), s.half); break;
+        case Opacity:   p.setOpacity(0.5); p.drawPixmap(x, y, s.alpha); break;          /* Step 5b: global-alpha blit */
+        case Text:      { /* Step 5b: 16 px text, about dw/9 glyphs per op (glyph cache path) */
+                          static QFont f = [] { QFont q; q.setPixelSize(16); return q; }();
+                          p.setFont(f); p.setPen(col[i & 7]);
+                          p.drawText(x, y + 14, QString(qMax(1, dw / 9), QChar('a' + (i % 26)))); break; }
         default: break;
         }
     }
@@ -471,6 +478,18 @@ static const MatrixCase kCases[] = {
     { "drawImage (QImage source)",      [](QPainter &p, const MatrixFix &f) { p.drawImage(20, 20, f.img); } },
     { "drawTiledPixmap",                [](QPainter &p, const MatrixFix &f) { p.drawTiledPixmap(20, 20, 128, 96, f.opaque); } },
     { "drawText",                       [](QPainter &p, const MatrixFix &) { QFont f; f.setPixelSize(20); p.setFont(f); p.setPen(Qt::white); p.drawText(20, 60, "Hello etnaviv2d"); } },
+    { "drawText, translucent pen",      [](QPainter &p, const MatrixFix &) { QFont f; f.setPixelSize(20); p.setFont(f); p.setPen(QColor(255, 255, 255, 128)); p.drawText(20, 60, "Hello etnaviv2d"); } },
+    { "drawText, rect clip",            [](QPainter &p, const MatrixFix &) { QFont f; f.setPixelSize(24); p.setFont(f); p.setPen(Qt::yellow); p.setClipRect(50, 40, 60, 25); p.drawText(20, 60, "Hello etnaviv2d"); } },
+    { "drawText, painter opacity 0.5",  [](QPainter &p, const MatrixFix &) { QFont f; f.setPixelSize(20); p.setFont(f); p.setPen(Qt::white); p.setOpacity(0.5); p.drawText(20, 60, "Hello etnaviv2d"); } },
+    { "drawText, bold 32px, near edge", [](QPainter &p, const MatrixFix &) { QFont f; f.setPixelSize(32); f.setBold(true); p.setFont(f); p.setPen(Qt::cyan); p.drawText(180, 60, "Hello etnaviv2d"); p.drawText(-10, 120, "off left edge"); p.drawText(20, 253, "bottom edge"); } },
+    { "drawText, scale(2,2) transform", [](QPainter &p, const MatrixFix &) { QFont f; f.setPixelSize(12); p.setFont(f); p.setPen(Qt::white); p.scale(2, 2); p.drawText(10, 30, "Hello etnaviv2d"); } },
+    { "drawText, rotate transform",     [](QPainter &p, const MatrixFix &) { QFont f; f.setPixelSize(20); p.setFont(f); p.setPen(Qt::white); p.translate(60, 60); p.rotate(25); p.drawText(0, 0, "Hello etnaviv2d"); } },
+    { "drawText, underline + many glyphs", [](QPainter &p, const MatrixFix &) { QFont f; f.setPixelSize(14); f.setUnderline(true); p.setFont(f); p.setPen(Qt::white); for (int i = 0; i < 12; ++i) p.drawText(8, 20 + i * 18, "The quick brown fox jumps 0123456789"); } },
+    { "drawText, CompositionMode_Plus", [](QPainter &p, const MatrixFix &) { QFont f; f.setPixelSize(20); p.setFont(f); p.setPen(QColor(100, 60, 60)); p.setCompositionMode(QPainter::CompositionMode_Plus); p.drawText(20, 60, "Hello etnaviv2d"); } },
+    { "drawText on translucent area, then drawPixmap", [](QPainter &p, const MatrixFix &f) { QFont q; q.setPixelSize(20); p.setFont(q); p.setPen(Qt::white); p.drawText(20, 40, "Hello"); p.drawPixmap(20, 20, f.alpha); p.drawText(20, 100, "world"); } },
+    { "drawText, 12 sizes (several glyph caches, atlas growth)", [](QPainter &p, const MatrixFix &) { for (int i = 0; i < 12; ++i) { QFont f; f.setPixelSize(9 + i * 3); p.setFont(f); p.setPen(QColor(255 - i * 12, 200, 60 + i * 15)); p.drawText(4, 20 + i * 20, "Qwerty ABC xyz 0123 @#%&"); } } },
+    { "drawText, QStaticText",         [](QPainter &p, const MatrixFix &) { QFont f; f.setPixelSize(18); p.setFont(f); p.setPen(Qt::white); QStaticText t("Static text 123"); p.drawStaticText(20, 40, t); } },
+    { "drawText in a QPixmap target then drawPixmap", [](QPainter &p, const MatrixFix &) { QPixmap pm(120, 40); pm.fill(Qt::transparent); { QPainter q(&pm); QFont f; f.setPixelSize(20); q.setFont(f); q.setPen(QColor(255, 255, 255)); q.drawText(4, 28, "pixmap text"); } p.fillRect(0, 0, 256, 256, QColor(30, 90, 160)); p.drawPixmap(20, 50, pm); } },
     { "drawLine (pen)",                 [](QPainter &p, const MatrixFix &) { p.setPen(QPen(Qt::white, 3)); p.drawLine(20, 20, 200, 120); } },
     { "drawRoundedRect / path fill",    [](QPainter &p, const MatrixFix &) { p.setPen(Qt::NoPen); p.setBrush(QColor(230, 60, 60)); p.drawRoundedRect(20, 20, 120, 80, 12, 12); } },
     { "drawEllipse, antialiased",       [](QPainter &p, const MatrixFix &) { p.setRenderHint(QPainter::Antialiasing); p.setPen(Qt::NoPen); p.setBrush(QColor(230, 60, 60)); p.drawEllipse(20, 20, 120, 80); } },

@@ -164,6 +164,30 @@ Findings:
 3. **Found and fixed in libetna2d: empty `etna2d_finish()` cost 118 us** (an empty submit plus fence wait) and every CPU fallback does two of them (`doLock` and `doUnlock`), about 240 us per fallback op (64x64 blit through the CPU path was 861 us, now 520; 8x8 fill 254 -> 33 us). `etna2d_finish()` now returns at once when nothing was queued since the last finish (`ctx->dirty`). Selftest passes, `--matrix` 40/2 unchanged, `--clip` unchanged (68 / 110 / 29 / 68 fps). `hal/libetna2d/emptyfinish.c` measures it (empty finish 118 -> 0 us; a real fill + finish stays 127 us, that is the submit round trip). This is the cheap part of Step 2; the per-surface fence part of Step 2 is still open. Deployed to `/usr/lib/libetna2d.so.1` (original saved as `/mnt/graphics_stack/gpu/libetna2d.so.1.orig`).
 4. **Glyphs / opacity on the DE: not proven, not disproven.** The DE register header has `DE_FORMAT_A8`, `DE_FORMAT_MONOCHROME`, `VIVS_DE_SRC_CONFIG_MONO_TRANSPARENCY`, global source/dest alpha modes (`VIVS_DE_ALPHA_MODES_GLOBAL_*`, `GLOBAL_SRC_COLOR`), and the vendor feature database lists `G2D_MASK_AND_COLORKEY` and `2D_A8_TARGET/A8_NO_ALPHA` enums for GC520L, but nothing here proves A8 as a blend source, a coloured mask blit or global opacity works on this core. A text/opacity path needs a register-level probe first (A8 source + GLOBAL_SRC_COLOR blend; global alpha blit), as its own step (5b) with a pixel check against the CPU. Until then text stays CPU and benefits only from Step 1.
 
+## Step 5b: global opacity and text on the DE (done)
+**Probe** (`hal/libetna2d/alphaprobe.c`, brute force over the alpha/colour-multiply register fields, compared with the exact formula on random pixels, run on the board). Result: both work on GC520.
+- **Global opacity**: premultiplied ARGB source, `ALPHA_MODES = SRC_BLEND ONE | DST_BLEND INVERSED | GLOBAL_SRC_ALPHA SCALED`, `COLOR_MULTIPLY = SRC_GLOBAL_PREMULTIPLY_ALPHA`, opacity in the top byte of `GLOBAL_SRC_COLOR`. Max error 2/255 on all four channels for any destination alpha. API `etna2d_blit_opacity()`.
+- **Coloured A8 mask (glyph)**: `ETNA2D_FMT_A8` source, colour from `GLOBAL_SRC_COLOR` (straight ARGB, translucent colours work), same blend mode plus `COLOR_MULTIPLY = SRC_PREMULTIPLY | SRC_GLOBAL_PREMULTIPLY_ALPHA`. Max error 2/255 on rgb AND alpha for any destination alpha. API `etna2d_mask_blit()` and `etna2d_mask_blit_n()` (state emitted once, per glyph only SRC_ORIGIN + CLIP + DRAW_2D). Trap found by the probe: the cheaper "src blend NORMAL" variant is exact on an opaque destination but squares the alpha channel on a translucent one (text into an ARGB pixmap showed saturated colours).
+
+**Plugin**
+- `drawPixmapOpacity`: painter opacity < 1 with source-over, 1:1 goes to `etna2d_blit_opacity` (scaled / other composition modes stay CPU). `QT_ETNA2D_GPU_OPACITY=0` = old path.
+- Text: `EtnaBlittable::drawCachedGlyphs` + `EtnaGlyphCache` (subclass of Qt's `QImageTextureGlyphCache`; the A8 atlas is mirrored into an A8 surface, dirty rectangles uploaded when glyphs were added). Composition modes other than SourceOver, mono and ARGB glyph formats, complex clips, rotated transforms: raster engine (CompositionMode_Plus draws from the same atlas on the CPU).
+- `EtnaPaintEngine` (subclass of `QBlitterPaintEngine`, returned by `EtnaBlittablePlatformPixmap::paintEngine()`): the stock blitter engine locks the pixmap (a whole-context GPU drain) before every text run and again after the blittable's `drawCachedGlyphs`; with those two drains the GPU text was 2-3x SLOWER than the CPU (221 vs 69 us per 1-glyph op). Our engine calls the blittable directly for A8 / scale+translate / rect clip and never maps the surface. `QT_ETNA2D_GPU_TEXT=0` = old path.
+
+**Results** (`run_ops_ab.sh`, us/op, write-combine, default; `results/step5b-*`):
+
+| op | size | before | now | CPU raster ref |
+|---|---|---|---|---|
+| opacity (drawPixmap, opacity 0.5) | 64x64 | 544 | 72 | 132 |
+| | 256x256 | 7915 | 941 | 1705 |
+| | full | 66449 | 8668 | 11958 |
+| text (16 px, dw/9 glyphs per op) | 1 glyph | 76.6 | 69.0 | 69.0 |
+| | 14 glyphs (64) | 206 | 131 | 150 |
+| | 113 glyphs (full) | 2473 | 1266 | 1102 |
+
+All other ops unchanged (+-1%). `--clip` fps unchanged (68.6 / 109.6 / 28.7 / 67.1), `--damage` with `VERIFY_FLUSH` bad=0, `--matrix` 52 match / 2 DIFF (the two known ellipse-clip cases; 12 new text/opacity/atlas-growth/translucent-target cases all match, max diff <= 4).
+Honest limit: Qt's own per-run work (layout, glyph position and cache lookups, about 60 us per `drawText` plus ~10 us per glyph) dominates small text, so the CPU is not freed for 8-16 px text, only for big glyphs, big opacity blits and translucent targets. The 2x speed-up over the write-combine CPU raster is the main gain.
+
 ## Step 6: Safety and hygiene
 - Context/device per thread or mutex (scratch surface, `g_ctx` globals). Test: `test_kms_thread` + a QPainter on a worker thread pixmap.
 - KMS-direct scanout format follows `QT_ETNA2D_FMT`; add ARGB4444 / ARGB1555 fill/blend matrix cases.
@@ -180,5 +204,6 @@ Findings:
 | 2 | todo | | | |
 | 3 | done (Wayland) | 1080p partial update 61 -> 269 loops/s | copy 245 -> 34 MB/s | see git log |
 | 4 | done (Wayland repaint-on-release; KMS deferred) | dropped frames lost | all presented, stale UI fixed | see git log |
-| 5 | done (policy measured, thresholds 0; glyph probe open) | empty finish 118 us | 0 us | see git log |
+| 5 | done (policy measured, thresholds 0) | empty finish 118 us | 0 us | see git log |
+| 5b | done (opacity + text on the DE) | opacity full 66 ms, text 113 glyphs 2.5 ms | 8.7 ms, 1.3 ms | see git log |
 | 6 | todo | | | |

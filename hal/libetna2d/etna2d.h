@@ -161,6 +161,12 @@ int  etna2d_blit_opacity(struct etna2d_context *ctx, struct etna2d_surface *src,
 int  etna2d_mask_blit(struct etna2d_context *ctx, struct etna2d_surface *mask, int sx, int sy,
 		      struct etna2d_surface *dst, int dx, int dy, int w, int h, uint32_t argb);
 
+/* Many mask blits with one colour into one destination (glyph runs): state is emitted once. */
+struct etna2d_mask_rect { int sx, sy, dx, dy, w, h; };
+int  etna2d_mask_blit_n(struct etna2d_context *ctx, struct etna2d_surface *mask,
+			struct etna2d_surface *dst, uint32_t argb,
+			const struct etna2d_mask_rect *r, int n);
+
 /* EXPERIMENTAL (Step 5b probe): 1:1 blit with raw alpha-blend registers.
  * alpha_control / alpha_modes / cm_modes / global_src / global_dst are written
  * verbatim to VIVS_DE_ALPHA_CONTROL / ALPHA_MODES / COLOR_MULTIPLY_MODES /

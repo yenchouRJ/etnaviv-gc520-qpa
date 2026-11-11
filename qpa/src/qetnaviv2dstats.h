@@ -24,7 +24,7 @@ enum Id {
     FlushBlit,    /* queueing the backing->scanout/ring blit               */
     FlipWait,     /* pageFlip() blocking wait                              */
     OpaqueScan,   /* isOpaque() pixel scan                                 */
-    GpuFill, GpuBlit, GpuStretch,  /* count only */
+    GpuFill, GpuBlit, GpuStretch, GpuMask,  /* count only (GpuMask = glyph mask blits) */
     BytesCopied,  /* flush copy bytes (count = bytes)                      */
     Frames,       /* flush() calls                                         */
     DroppedFrames,/* ring full, frame dropped                              */
@@ -57,13 +57,13 @@ inline void report()
     fprintf(stderr,
         "ETNASTATS dt=%.2f frames=%lld dropped=%lld relpresent=%lld | ms/s lockfin=%.1f(%lld) unlockfin=%.1f(%lld) "
         "cpufill=%.1f(%lld) cpupix=%.1f(%lld) flushfin=%.1f(%lld) flushblit=%.1f(%lld) copyMB=%.1f "
-        "flipwait=%.1f(%lld) opaquescan=%.1f(%lld) | gpuops fill=%lld blit=%lld stretch=%lld\n",
+        "flipwait=%.1f(%lld) opaquescan=%.1f(%lld) | gpuops fill=%lld blit=%lld stretch=%lld mask=%lld\n",
         (t - l) / 1e9, c[Frames], c[DroppedFrames], c[RelPresent],
         ms[LockFinish], c[LockFinish], ms[UnlockFinish], c[UnlockFinish],
         ms[CpuFill], c[CpuFill], ms[CpuPixmap], c[CpuPixmap],
         ms[FlushFinish], c[FlushFinish], ms[FlushBlit], c[FlushBlit], c[BytesCopied] / 1048576.0,
         ms[FlipWait], c[FlipWait], ms[OpaqueScan], c[OpaqueScan],
-        c[GpuFill], c[GpuBlit], c[GpuStretch]);
+        c[GpuFill], c[GpuBlit], c[GpuStretch], c[GpuMask]);
 }
 
 /* RAII timer: accumulates elapsed ns into slot id (no-op when disabled). */

@@ -39,7 +39,8 @@ int main(int argc,char**argv){
 	for(int i=0;i<W*H;i++){uint32_t a=rnd()&255,r=rnd()%(a+1),g=rnd()%(a+1),b=rnd()%(a+1);
 		if(i%8==0)a=255;if(i%8==1){a=0;r=g=b=0;}
 		sp[i]=(a<<24)|(r<<16)|(g<<8)|b;mp[i]=(i%8==0)?255:(i%8==1)?0:rnd()&255;
-		dp[i]=0xff000000u|(rnd()&0xffffff);}
+		dp[i]=0xff000000u|(rnd()&0xffffff);
+		if(strchr(mode,'W')){uint32_t da=rnd()&255;if(i%8==2)da=0;if(i%8==3)da=255;dp[i]=(da<<24)|((rnd()%(da+1))<<16)|((rnd()%(da+1))<<8)|(rnd()%(da+1));}}
 	upload(srcA,sp,4);upload(srcM,mp,1);
 	if(strchr(mode,'V')){
 		int ref_ga[]={255,128,10,1,0},ref_ca[]={255,128,32,1,0};int bad=0;
@@ -50,12 +51,12 @@ int main(int argc,char**argv){
 					double e=sc*G+dc*(1-sa*G);int err=abs((int)lround(e*255)-(int)((g>>(8*k))&255));if(err>worst)worst=err;}}
 			etna2d_surface_cpu_fini(dst);printf("V opacity ga=%3d maxerr(all 4 ch)=%d\n",ref_ga[i],worst);if(worst>3)bad++;}
 		for(int i=0;i<5;i++){upload(dst,dp,4);etna2d_mask_blit(c,srcM,0,0,dst,0,0,W,H,((uint32_t)ref_ca[i]<<24)|0x336699);etna2d_finish(c);
-			etna2d_surface_cpu_begin(c,dst);uint8_t*m=etna2d_surface_map(dst);uint32_t st=etna2d_surface_stride(dst);int worst=0;
+			etna2d_surface_cpu_begin(c,dst);uint8_t*m=etna2d_surface_map(dst);uint32_t st=etna2d_surface_stride(dst);int worst=0,worsta=0;
 			for(int y=0;y<H;y++)for(int x=0;x<W;x++){uint32_t g=*(uint32_t*)(m+y*st+x*4);
 				double a=ref_ca[i]/255.0*mp[y*W+x]/255.0;
-				for(int k=0;k<3;k++){double dc=((dp[y*W+x]>>(8*k))&255)/255.0,cc=((0x336699>>(8*k))&255)/255.0;
-					double e=cc*a+dc*(1-a);int err=abs((int)lround(e*255)-(int)((g>>(8*k))&255));if(err>worst)worst=err;}}
-			etna2d_surface_cpu_fini(dst);printf("V mask    ca=%3d maxerr(rgb)=%d\n",ref_ca[i],worst);if(worst>3)bad++;}
+				for(int k=0;k<4;k++){double dc=((dp[y*W+x]>>(8*k))&255)/255.0,cc=k==3?1.0:((0x336699>>(8*k))&255)/255.0;
+					double e=cc*a+dc*(1-a);int err=abs((int)lround(e*255)-(int)((g>>(8*k))&255));if(k==3){if(err>worsta)worsta=err;}else if(err>worst)worst=err;}}
+			etna2d_surface_cpu_fini(dst);printf("V mask    ca=%3d maxerr(rgb)=%d alpha=%d\n",ref_ca[i],worst,worsta);if(worst>3||worsta>3)bad++;}
 		printf(bad?"VFAIL\n":"VPASS\n");return bad;}
 	int ga=0x80;uint32_t Ccol=0x336699;
 	for(int B=0;B<2;B++){
