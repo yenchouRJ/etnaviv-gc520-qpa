@@ -55,6 +55,20 @@ Hypothesis: raster fallback reads the destination from WC memory (uncached, slow
 - Pass: translucent fill >= linuxfb (31 Mpix/s at 1080p, was 13); no stale-pixel artifacts in a 10 min `test_slideshow` run.
 - Fallback if kernel lacks cached sync: keep the backing store in malloc memory and upload (see step 3b).
 
+### Step 1 results (done: cached BOs for CPU-rendered surfaces)
+Change: `libetna2d` gets `etna2d_surface_create_ex(..., ETNA2D_SURF_CACHED)` (kernel `ETNA_BO_CACHED`: cacheable CPU map), `etna2d_surface_cpu_begin(ctx, s)` (submit queued ops, `etna_bo_cpu_prep(READ|WRITE)`: the kernel waits for the GPU fences of that surface only and invalidates the CPU cache) and `etna2d_surface_cpu_fini` (cleans the cache for the GPU). The plugin creates all its pixmaps and the backing store cached (`QT_ETNA2D_CACHED=0` = old write-combine for A/B); `doLock` uses cpu_begin instead of a whole-context `etna2d_finish`, `doUnlock` does cpu_fini and no finish. Ring and scan-out buffers (dma-buf imports) stay write-combine. Kernel already had the support (`etnaviv_gem_cpu_prep/fini` with `dma_sync_sgtable_*`); no kernel change.
+Tests: `hal/libetna2d/cachedtest.c` (CPU write -> GPU blit -> CPU read, GPU fill over dirty cached lines -> CPU read, CPU read-modify-write -> GPU blit, 200 rounds of 1024x600): PASS; CPU read of one frame 109 ms on WC vs 4.8 ms cached. `--matrix` 40/2 unchanged; `--damage` + `VERIFY_FLUSH` bad=0; `etna2d_selftest` passes.
+
+us/op (`run_ops_ab.sh`, 1024x600, plugin GPU path), WC -> cached (CPU raster reference in brackets):
+
+| op | 64x64 | 256x256 | full |
+|---|---|---|---|
+| alphafill (always CPU) | 294 -> 103 (93) | 4609 -> 973 (870) | 35321 -> 7004 (5407) |
+| fill / blit / alpha / scale | within +-5% | +3..+10% | fill 2723 -> 3222, blit 8343 -> 8805 |
+
+Translucent fill is 5x faster and now within ~25-30% of a plain cached QImage; the remaining gap is the cache maintenance.
+**Cost, to be fixed in Step 2**: every paint frame has one lock (QPainter creation locks the pixmap) and one unlock (first GPU op), and the kernel syncs the whole BO each time: measured at 1080p lockfin 5 -> 28 ms/s (about 1 ms per frame) plus the clean at unlock. GPU-only / partial-update workloads therefore lose a little: `--clip` 68 / 110 / 29 / 68 -> 62 / 104 / 27 / 60 fps (-5..-12%), `--damage` 1080p 282 -> 230 loops/s (-18%), 1024x600 275 -> 261 (-5%). CPU-fallback-heavy UIs (text, translucent fills, gradients, AA paths) gain; to get both, Step 2 should avoid the whole-BO sync when nothing needs it (e.g. keep the surface unlocked until a CPU op really starts, track whether the GPU wrote since the last sync).
+
 ## Step 2: Remove the full drain from `doUnlock()`
 - Track a per-surface "GPU write pending" flag (submit counter/fence). `lock()` waits only if set.
   `doUnlock()` does `cpu_fini` only, no `etna2d_finish`. `isOpaque()` becomes a creation-time
@@ -161,7 +175,7 @@ Findings:
 | Step | Status | fps / metric before | after | commit |
 |---|---|---|---|---|
 | 0 | done | baseline in results/ | counters added | see git log |
-| 1 | todo | | | |
+| 1 | done | translucent fill full 35.3 ms | 7.0 ms (GPU-only paths -5..-18%, see Step 2) | see git log |
 | 2 | todo | | | |
 | 3 | done (Wayland) | 1080p partial update 61 -> 269 loops/s | copy 245 -> 34 MB/s | see git log |
 | 4 | done (Wayland repaint-on-release; KMS deferred) | dropped frames lost | all presented, stale UI fixed | see git log |
