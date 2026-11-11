@@ -19,6 +19,7 @@
  */
 #include "qetnaviv2dbackingstore.h"
 #include "qetnaviv2dwaylandtransport.h"
+#include "qetnaviv2dstats.h"
 
 #include <QDebug>
 #include <qpa/qwindowsysteminterface.h>
@@ -108,6 +109,8 @@ void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
     EtnaBlittable *blitter      = m_pmdata->etnaBlittable();
     etna2d_context *ctx         = blitter->context();
     etna2d_surface *backingSurf = blitter->surface();
+    struct FrameEnd { ~FrameEnd() { if (EtnaStats::enabled()) EtnaStats::report(); } } _fe;
+    EtnaStats::add(EtnaStats::Frames);
 
     /* ---- Wayland mode: blit into the ring BO, hand off to transport ---- */
     if (m_transport) {
@@ -116,6 +119,7 @@ void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
             /* All ring slots are in use — Weston hasn't released any yet.
              * Drop the frame (back-pressure): Qt will repaint on the next
              * frame callback when a slot is released. */
+            EtnaStats::add(EtnaStats::DroppedFrames);
             BS_DBG << "flush: wayland ring full — dropping frame (back-pressure)";
             return;
         }
@@ -128,13 +132,18 @@ void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
         int h = etna2d_surface_height(backingSurf);
         BS_DBG << "flush(wayland): blit" << w << "x" << h << "→ ring BO" << ringBo;
 
-        etna2d_blit(ctx,
-                    backingSurf, 0, 0,
-                    ringBo,      0, 0,
-                    w, h,
-                    ETNA2D_BLEND_NONE, ETNA2D_ROP_COPY);
+        {
+            EtnaStats::Scope _t(EtnaStats::FlushBlit);
+            etna2d_blit(ctx,
+                        backingSurf, 0, 0,
+                        ringBo,      0, 0,
+                        w, h,
+                        ETNA2D_BLEND_NONE, ETNA2D_ROP_COPY);
+        }
+        EtnaStats::add(EtnaStats::BytesCopied, 0, (long long)etna2d_surface_stride(backingSurf) * h);
 
         /* 3. Wait for GPU blit */
+        EtnaStats::Scope _tf(EtnaStats::FlushFinish);
         if (etna2d_finish(ctx) != ETNA2D_OK) {
             BS_WARN << "flush(wayland): etna2d_finish failed";
             return;
@@ -166,19 +175,27 @@ void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
     BS_DBG << "flush(KMS): full blit" << surfW << "x" << surfH
            << "(dirty=" << region.boundingRect() << "ignored for correctness)";
 
-    etna2d_blit(ctx,
-                backingSurf, 0, 0,
-                scanoutBack, 0, 0,
-                surfW, surfH,
-                ETNA2D_BLEND_NONE, ETNA2D_ROP_COPY);
+    {
+        EtnaStats::Scope _t(EtnaStats::FlushBlit);
+        etna2d_blit(ctx,
+                    backingSurf, 0, 0,
+                    scanoutBack, 0, 0,
+                    surfW, surfH,
+                    ETNA2D_BLEND_NONE, ETNA2D_ROP_COPY);
+    }
+    EtnaStats::add(EtnaStats::BytesCopied, 0, (long long)etna2d_surface_stride(backingSurf) * surfH);
 
     /* 3. Wait for GPU blit to complete before handing the buffer to display. */
-    if (etna2d_finish(ctx) != ETNA2D_OK) {
-        BS_WARN << "flush(KMS): etna2d_finish failed";
-        return;
+    {
+        EtnaStats::Scope _t(EtnaStats::FlushFinish);
+        if (etna2d_finish(ctx) != ETNA2D_OK) {
+            BS_WARN << "flush(KMS): etna2d_finish failed";
+            return;
+        }
     }
 
     /* 4. Page-flip (blocks until vblank). */
+    EtnaStats::Scope _tp(EtnaStats::FlipWait);
     if (m_screen->pageFlip() != 0)
         BS_WARN << "flush(KMS): pageFlip failed";
 }

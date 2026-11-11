@@ -23,6 +23,28 @@ step N+1 until step N is measured and committed. Every step must keep
   at 1024x600 and 1920x1080, for ARGB8888 and rgb565. Save to `qpa/results/step0-*.txt`.
 - Pass: numbers reproducible (3 runs within 5%). The breakdown shows which of steps 1-4 matters most.
 
+### Step 0 results (done; Wayland ivi, weston 10, kernel 6.6.93, 3 runs each, spread < 1%)
+Counters: `QT_ETNAVIV2D_DEBUG=2` prints one `ETNASTATS` line/s (`src/qetnaviv2dstats.h`). Script: `tests/qt2dbench/run_baseline.sh`, raw output in `results/step0-*.txt`.
+
+| `--clip --sprites 16` | fps | ms/frame | flush finish ms per frame | copy MB/s |
+|---|---|---|---|---|
+| 1024x600 argb8888 | 70.5 | 14.2 | 11.2 (flushfin 683 ms/s over 61 flushes) | 143 |
+| 1024x600 rgb565 | 121 | 8.3 | n/a (see raw) | |
+| 1920x1080 argb8888 | 28.3 | 35.4 | 30.9 (897 ms/s over 29 flushes) | 229 |
+| 1920x1080 rgb565 | 67 | 14.9 | 12 | 237 |
+
+`--ops` (offscreen, 1024x600, argb8888): fill full 211 Mpix/s, blit/alpha full 71, scale full 169, **alphafill 14-17 Mpix/s at every size** (256x256: 4.6 ms/op; it is the CPU raster on WC memory, ~100% of one core). 64x64 ops cost 77-294 us each (a QPixmap round trip, dominated by lock/finish, not the 3 us GPU cost).
+`--matrix`: 40 match, 2 DIFF (the known Qt 5.15 ellipse-clip limitation, section 6 of plan.md). This is the regression gate.
+
+Findings that reorder the plan:
+1. **`flush()` GPU time dominates**: 79% of the frame at 1024x600 and 87% at 1080p is `etna2d_finish()` after the full-frame blit plus the frame's queued ops. The whole-frame copy (Step 3) is therefore the first thing to attack, not Step 1.
+2. rgb565 gives 1.7x/2.4x: the cost scales with bytes, i.e. the frame is memory-bandwidth bound, which confirms Step 3.
+3. `lockfin` / `unlockfin`: 72 per second at ~1 ms each (about 7% of the frame): Step 2, smaller than expected in this scene because it has no CPU fallback (cpufill/cpupix = 0). The CPU fallback hot spot shows up only in `--ops alphafill` (Step 1).
+4. 14% frames dropped at 1024x600 (ring full, `dropped=10-14` per s): back-pressure drop with no re-arm (Step 4). Not seen at 1080p argb (GPU-bound: Weston keeps up).
+5. Build note: `hal/libetna2d` and `qpa` Makefiles default to the `ma35d1_br24_qt5` sysroot; with the graphic tree use `make -C hal/libetna2d BR=<graphic>` and `make plugin QT_BUILD=<graphic qt5base> BR_ROOT=<graphic>` (linking against the qt5 sysroot fails on /lib64/libm).
+
+Proposed order after this: **Step 3 -> Step 2 -> Step 4 -> Step 1 -> 5 -> 6**.
+
 ## Step 1: CPU fallback memory type (WC -> cached)
 Hypothesis: raster fallback reads the destination from WC memory (uncached, slow).
 - libetna2d: `etna2d_surface_create_fmt` gets a flag/variant for `ETNA_BO_CACHED`
@@ -73,7 +95,7 @@ Hypothesis: raster fallback reads the destination from WC memory (uncached, slow
 ## Tracking
 | Step | Status | fps / metric before | after | commit |
 |---|---|---|---|---|
-| 0 | todo | | | |
+| 0 | done | baseline in results/ | counters added | see git log |
 | 1 | todo | | | |
 | 2 | todo | | | |
 | 3 | todo | | | |

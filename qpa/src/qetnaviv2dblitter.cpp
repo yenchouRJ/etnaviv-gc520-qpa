@@ -17,6 +17,7 @@
  */
 #include "qetnaviv2dblitter.h"
 #include "qetnaviv2dformat.h"
+#include "qetnaviv2dstats.h"
 
 #include <QDebug>
 #include <QtGui/private/qpixmap_blitter_p.h>
@@ -161,6 +162,7 @@ bool EtnaBlittable::isOpaque()
     }
     const bool px16 = etnaFmtByEtna(etna2d_surface_format(m_surf)).bpp == 16;
     if (qint64(w) * h <= kOpaqueScanMaxPixels) {
+        EtnaStats::Scope _t(EtnaStats::OpaqueScan);
         QImage *img = lock();               /* finishes pending GPU writes, maps for CPU */
         if (img && !img->isNull()) {
             opaque = true;
@@ -236,6 +238,7 @@ void EtnaBlittable::fillRect(const QRectF &rect, const QColor &color)
                   | uint32_t(color.blue());
     m_opaqueKnown = false;
     ETNA_DBG << "fillRect" << r << Qt::hex << argb;
+    EtnaStats::add(EtnaStats::GpuFill);
     etna2d_fill(m_ctx, m_surf, r.x(), r.y(), r.width(), r.height(), argb);
     /* Note: NOT flushed here — deferred to doUnlock()/backingstore flush(). */
 }
@@ -254,6 +257,7 @@ void EtnaBlittable::fillRect(const QRectF &rect, const QColor &color)
 void EtnaBlittable::cpuFillRect(const QRectF &rect, const QColor &color,
                                 QPainter::CompositionMode cmode)
 {
+    EtnaStats::Scope _t(EtnaStats::CpuFill);
     QImage *dst = lock();
     if (!dst || dst->isNull())
         return;
@@ -267,6 +271,7 @@ void EtnaBlittable::cpuDrawPixmap(const QRectF &rect, const QPixmap &pixmap,
                                   QPainter::CompositionMode cmode, qreal opacity)
 {
     /* Read the source first (maps it for the CPU), then lock the destination. */
+    EtnaStats::Scope _t(EtnaStats::CpuPixmap);
     const QImage src = pixmap.toImage();
     QImage *dst = lock();
     if (!dst || dst->isNull() || src.isNull())
@@ -362,6 +367,7 @@ void EtnaBlittable::drawPixmapOpacity(const QRectF &rect, const QPixmap &pixmap,
         /* Pixel-for-pixel blit. */
         enum etna2d_blend blend = isOver ? ETNA2D_BLEND_SRC_OVER
                                          : ETNA2D_BLEND_NONE;
+        EtnaStats::add(EtnaStats::GpuBlit);
         etna2d_blit(m_ctx,
                     srcSurf, srcR.x(), srcR.y(),
                     m_surf,  dstR.x(), dstR.y(),
@@ -387,6 +393,7 @@ void EtnaBlittable::drawPixmapOpacity(const QRectF &rect, const QPixmap &pixmap,
             EtnaBlittable *srcBl = static_cast<EtnaBlittablePlatformPixmap *>(pixmap.handle())->etnaBlittable();
             if (!isOver || srcBl->isOpaque()) {
                 /* No alpha to blend: plain stretch (copy) is exact. */
+                EtnaStats::add(EtnaStats::GpuStretch);
                 etna2d_stretch(m_ctx, srcSurf, m_surf,
                                dstR.x(), dstR.y(), dstR.width(), dstR.height());
             } else {
@@ -404,6 +411,8 @@ void EtnaBlittable::drawPixmapOpacity(const QRectF &rect, const QPixmap &pixmap,
                     cpuDrawPixmap(rect, pixmap, subrect, cmode, opacity);
                     return;
                 }
+                EtnaStats::add(EtnaStats::GpuStretch);
+                EtnaStats::add(EtnaStats::GpuBlit);
                 etna2d_stretch(m_ctx, srcSurf, tmp, 0, 0, dstR.width(), dstR.height());
                 etna2d_blit(m_ctx,
                             tmp, vis.x() - dstR.x(), vis.y() - dstR.y(),
@@ -429,7 +438,10 @@ QImage *EtnaBlittable::doLock()
 {
     m_opaqueKnown = false;   /* CPU may write */
     /* Finish any pending GPU work so CPU reads see up-to-date pixels. */
-    etna2d_finish(m_ctx);
+    {
+        EtnaStats::Scope _t(EtnaStats::LockFinish);
+        etna2d_finish(m_ctx);
+    }
 
     void *ptr = etna2d_surface_map(m_surf);
     if (!ptr) {
@@ -464,6 +476,7 @@ void EtnaBlittable::doUnlock()
     if (!m_skipFinishOnUnlock) {
         /* Full flush: wait for all queued GPU ops (used for dst surfaces
          * and at frame boundary). */
+        EtnaStats::Scope _t(EtnaStats::UnlockFinish);
         etna2d_finish(m_ctx);
     }
     m_skipFinishOnUnlock = false; /* reset for next lock cycle */

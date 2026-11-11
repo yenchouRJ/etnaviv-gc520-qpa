@@ -21,6 +21,7 @@
 #   make tests       — all four step tests
 #   make clean       — remove build output (does NOT clean Qt build tree)
 
+BR_ROOT   ?= /home/joeylu/Documents/workspace/ma35d1/ma35d1_br24_qt5
 QT_BUILD  ?= /home/joeylu/Documents/workspace/ma35d1/ma35d1_br24_qt5/output/build/qt5base-bebdfd54917e25d1c100e6bd9f5dd53c2e645fd8
 QMAKE     := $(QT_BUILD)/bin/qmake
 
@@ -32,6 +33,7 @@ KMS_INCDIR    ?= $(abspath $(CURDIR)/../hal/kms)
 PLUGIN_INTREE_DIR := $(QT_BUILD)/src/plugins/platforms/etnaviv2d
 
 QMAKE_VARS = \
+    "BR_ROOT=$(BR_ROOT)" \
     "ETNA2D_LIBDIR=$(ETNA2D_LIBDIR)" \
     "ETNA2D_INCDIR=$(ETNA2D_INCDIR)" \
     "KMS_INCDIR=$(KMS_INCDIR)"

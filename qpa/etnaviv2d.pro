@@ -14,6 +14,7 @@
 #   ETNA2D_INCDIR  — path to etna2d.h                   (default: ../hal/libetna2d)
 #   KMS_INCDIR     — path to kms_display.h               (default: ../hal/kms)
 
+isEmpty(BR_ROOT): BR_ROOT = /home/joeylu/Documents/workspace/ma35d1/ma35d1_br24_qt5
 TARGET = qetnaviv2d
 
 DEFINES += QT_NO_FOREACH
@@ -82,9 +83,9 @@ LIBS += -ldrm -ldrm_etnaviv
 # -----------------------------------------------------------------------
 WL_SCANNER   = $$system(which wayland-scanner 2>/dev/null)
 isEmpty(WL_SCANNER) {
-    WL_SCANNER = /home/joeylu/Documents/workspace/ma35d1/ma35d1_br24_qt5/output/host/bin/wayland-scanner
+    WL_SCANNER = $$BR_ROOT/output/host/bin/wayland-scanner
 }
-WL_PROTO_DIR = /home/joeylu/Documents/workspace/ma35d1/ma35d1_br24_qt5/output/host/aarch64-nuvoton-linux-gnu/sysroot/usr/share/wayland-protocols
+WL_PROTO_DIR = $$BR_ROOT/output/host/aarch64-nuvoton-linux-gnu/sysroot/usr/share/wayland-protocols
 
 # xdg-shell — private-code (C source)
 xdg_shell_src.name   = xdg-shell-protocol.c
@@ -121,7 +122,7 @@ dmabuf_hdr.variable_out = HEADERS
 QMAKE_EXTRA_COMPILERS += dmabuf_hdr
 
 # ivi-application (Milestone IVI) — XML lives in the Weston build tree
-IVI_APP_XML = /home/joeylu/Documents/workspace/ma35d1/ma35d1_br24_qt5/output/build/weston-10.0.5/protocol/ivi-application.xml
+IVI_APP_XML = $$BR_ROOT/output/build/weston-10.0.5/protocol/ivi-application.xml
 
 ivi_app_src.name   = ivi-application-protocol.c
 ivi_app_src.input  = IVI_APP_XML
@@ -141,7 +142,7 @@ QMAKE_EXTRA_COMPILERS += ivi_app_hdr
 INCLUDEPATH += $$OUT_PWD
 
 # libwayland-client (target sysroot)
-SYSROOT = /home/joeylu/Documents/workspace/ma35d1/ma35d1_br24_qt5/output/host/aarch64-nuvoton-linux-gnu/sysroot
+SYSROOT = $$BR_ROOT/output/host/aarch64-nuvoton-linux-gnu/sysroot
 LIBS += -L$$SYSROOT/usr/lib -lwayland-client
 INCLUDEPATH += $$SYSROOT/usr/include
 
