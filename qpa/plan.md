@@ -464,3 +464,12 @@ Display underflow (sticky bit, 8 s, Qt alone): `argb8888` underflows on the **pr
 
 Rebuild `libetna2d` (install `etna2d.h` and the `.so` into the sysroot, copy `libetna2d.so.1` to `/usr/lib` on the board), rebuild the plugin, copy `libqetnaviv2d.so`. With Weston (ivi) running and `QT_QPA_PLATFORM=etnaviv2d:plane=wayland QT_IVI_SURFACE_ID=2000`:
 `for cfg in X=1 QT_ETNA2D_RING_FMT=rgb565 QT_ETNA2D_FMT=rgb565; do env $cfg qt2dbench --clip --stage-secs 6 --sprites 16; done` and compare the `STAGE` fps. Underflow: clear `devmem 0x40261518` / `0x40261540`, poll and test bit 5 (primary) and bit 23 (overlay).
+
+### 6. Future work: window / output size (to be reworked)
+
+`QT_IVI_GEOMETRY=WxH` is the only way to set the window size today and is not a standard route. The size is fixed at connect time (`qetnaviv2dwaylandtransport.cpp`, ivi configure path): `QT_IVI_GEOMETRY` if set, else a hard-coded 1024x600; ivi-shell sends a 0x0 configure and no `wl_output` listener reads the real output mode. Consequences: the default does not follow the panel (a 1280x800 or 1920x1080 output needs the variable), and the app cannot choose its size with `setGeometry()` / `resize()` / `showFullScreen()`.
+
+Planned rework (not started):
+- bind `wl_output` and use its current mode as the default window / screen size (full screen by default);
+- make the ring and ivi surface follow the top-level window geometry and reallocate on resize;
+- keep `QT_IVI_GEOMETRY` only as an override for tests and scripts.
