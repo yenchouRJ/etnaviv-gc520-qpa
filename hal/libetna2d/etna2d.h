@@ -114,6 +114,7 @@ enum {
 	ETNA2D_FMT_XRGB8888,      /* DRM_FORMAT_XRGB8888 */
 	ETNA2D_FMT_ARGB1555,      /* DRM_FORMAT_ARGB1555 */
 	ETNA2D_FMT_ARGB4444,      /* DRM_FORMAT_ARGB4444 */
+	ETNA2D_FMT_A8,            /* 8-bit coverage mask (Step 5b probe) */
 	ETNA2D_FMT_COUNT
 };
 /* Allocate a surface of the given format (stride aligned to 64 B). */
@@ -151,6 +152,23 @@ int  etna2d_surface_create_ex(struct etna2d_device *dev, int w, int h, int fmt,
  * Works for WC surfaces too (then it is just the per-surface wait). */
 int  etna2d_surface_cpu_begin(struct etna2d_context *ctx, struct etna2d_surface *s);
 int  etna2d_surface_is_cached(const struct etna2d_surface *s);
+
+/* Source-over blit of a premultiplied ARGB source with a global opacity (0..255). */
+int  etna2d_blit_opacity(struct etna2d_context *ctx, struct etna2d_surface *src, int sx, int sy,
+			 struct etna2d_surface *dst, int dx, int dy, int w, int h, unsigned alpha);
+/* Coloured coverage mask: blend `argb` (straight, non-premultiplied) through an ETNA2D_FMT_A8
+ * source onto dst (glyph / text drawing). */
+int  etna2d_mask_blit(struct etna2d_context *ctx, struct etna2d_surface *mask, int sx, int sy,
+		      struct etna2d_surface *dst, int dx, int dy, int w, int h, uint32_t argb);
+
+/* EXPERIMENTAL (Step 5b probe): 1:1 blit with raw alpha-blend registers.
+ * alpha_control / alpha_modes / cm_modes / global_src / global_dst are written
+ * verbatim to VIVS_DE_ALPHA_CONTROL / ALPHA_MODES / COLOR_MULTIPLY_MODES /
+ * GLOBAL_SRC_COLOR / GLOBAL_DEST_COLOR. src may be an A8 surface. */
+int  etna2d_blit_raw(struct etna2d_context *ctx, struct etna2d_surface *src, int sx, int sy,
+		     struct etna2d_surface *dst, int dx, int dy, int w, int h,
+		     uint32_t alpha_control, uint32_t alpha_modes, uint32_t cm_modes,
+		     uint32_t global_src, uint32_t global_dst);
 
 /* ---------------------------------------------------------------------- */
 /* Context (batched command stream)                                       */
