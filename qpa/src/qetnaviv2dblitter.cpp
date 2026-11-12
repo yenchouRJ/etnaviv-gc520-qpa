@@ -20,6 +20,7 @@
 #include "qetnaviv2dstats.h"
 
 #include <QDebug>
+#include <QMutexLocker>
 #include <QtGui/private/qpixmap_blitter_p.h>
 #include <qpa/qplatformpixmap.h>
 #include <QtGui/private/qtextureglyphcache_p.h>
@@ -33,6 +34,11 @@ QT_BEGIN_NAMESPACE
 /* -----------------------------------------------------------------------
  * Logging — respects QT_ETNAVIV2D_DEBUG env var (0/1).
  * ----------------------------------------------------------------------- */
+/* One GC520 context/queue is shared by every blittable, so GPU calls from several threads
+ * (QPainter on a worker-thread pixmap, QT_THREADED_PAINTING) must be serialised.  Recursive:
+ * lock() -> doLock() -> etna2d_finish() and drawing helpers call each other. */
+QRecursiveMutex &etnaCtxMutex() { static QRecursiveMutex m; return m; }
+
 static bool debugEnabled()
 {
     static int v = qEnvironmentVariableIntValue("QT_ETNAVIV2D_DEBUG");
@@ -86,6 +92,7 @@ etna2d_device  *EtnaBlittablePlatformPixmap::s_dev = nullptr;
 EtnaBlittablePlatformPixmap::EtnaBlittablePlatformPixmap()
     : QBlittablePlatformPixmap()
 {
+    QMutexLocker _etnaLock(&etnaCtxMutex());
 }
 
 void EtnaBlittablePlatformPixmap::setGlobalContext(etna2d_context *ctx,
@@ -125,6 +132,7 @@ static etna2d_surface *scratchSurface(etna2d_context *ctx, etna2d_device *dev, i
 QBlittable *EtnaBlittablePlatformPixmap::createBlittable(const QSize &size,
                                                           bool alpha) const
 {
+    QMutexLocker _etnaLock(&etnaCtxMutex());
     if (!s_ctx || !s_dev) {
         ETNA_WARN << "createBlittable called before setGlobalContext — returning nullptr";
         return nullptr;
@@ -158,6 +166,7 @@ EtnaBlittable::EtnaBlittable(etna2d_context *ctx, etna2d_surface *surf)
     , m_ctx(ctx)
     , m_surf(surf)
 {
+    QMutexLocker _etnaLock(&etnaCtxMutex());
     ETNA_DBG << "EtnaBlittable created:"
              << etna2d_surface_width(surf) << "x" << etna2d_surface_height(surf)
              << "surf=" << surf;
@@ -165,6 +174,7 @@ EtnaBlittable::EtnaBlittable(etna2d_context *ctx, etna2d_surface *surf)
 
 EtnaBlittable::~EtnaBlittable()
 {
+    QMutexLocker _etnaLock(&etnaCtxMutex());
     ETNA_DBG << "EtnaBlittable destroyed surf=" << m_surf;
     unlock(); /* ensure CPU map released before surface destroy */
     etna2d_surface_destroy(m_surf);
@@ -186,6 +196,7 @@ static const qint64 kOpaqueScanMaxPixels = 4 * 1024 * 1024;
 
 bool EtnaBlittable::isOpaque()
 {
+    QMutexLocker _etnaLock(&etnaCtxMutex());
     if (m_opaqueKnown)
         return m_opaque;
     const int w = etna2d_surface_width(m_surf), h = etna2d_surface_height(m_surf);
@@ -221,6 +232,7 @@ bool EtnaBlittable::isOpaque()
 
 void EtnaBlittable::unlockForGpuRead()
 {
+    QMutexLocker _etnaLock(&etnaCtxMutex());
     if (!isLocked())
         return;
     m_skipFinishOnUnlock = true;
@@ -261,6 +273,7 @@ etna2d_surface *EtnaBlittable::surfaceFromPixmap(const QPixmap &pixmap)
  * ----------------------------------------------------------------------- */
 void EtnaBlittable::fillRect(const QRectF &rect, const QColor &color)
 {
+    QMutexLocker _etnaLock(&etnaCtxMutex());
     /* CompositionMode_Source: write opaque color, ignore destination alpha. */
     QRect r = rect.toRect();
     if (r.isEmpty())
@@ -295,6 +308,7 @@ void EtnaBlittable::fillRect(const QRectF &rect, const QColor &color)
 void EtnaBlittable::cpuFillRect(const QRectF &rect, const QColor &color,
                                 QPainter::CompositionMode cmode)
 {
+    QMutexLocker _etnaLock(&etnaCtxMutex());
     EtnaStats::Scope _t(EtnaStats::CpuFill);
     QImage *dst = lock();
     if (!dst || dst->isNull())
@@ -308,6 +322,7 @@ void EtnaBlittable::cpuDrawPixmap(const QRectF &rect, const QPixmap &pixmap,
                                   const QRectF &subrect,
                                   QPainter::CompositionMode cmode, qreal opacity)
 {
+    QMutexLocker _etnaLock(&etnaCtxMutex());
     /* Read the source first (maps it for the CPU), then lock the destination. */
     EtnaStats::Scope _t(EtnaStats::CpuPixmap);
     const QImage src = pixmap.toImage();
@@ -328,6 +343,7 @@ void EtnaBlittable::cpuDrawPixmap(const QRectF &rect, const QPixmap &pixmap,
 void EtnaBlittable::alphaFillRect(const QRectF &rect, const QColor &color,
                                    QPainter::CompositionMode cmode)
 {
+    QMutexLocker _etnaLock(&etnaCtxMutex());
     QRect r = rect.toRect();
     if (r.isEmpty())
         return;
@@ -345,6 +361,7 @@ void EtnaBlittable::alphaFillRect(const QRectF &rect, const QColor &color,
 void EtnaBlittable::drawPixmap(const QRectF &rect, const QPixmap &pixmap,
                                 const QRectF &subrect)
 {
+    QMutexLocker _etnaLock(&etnaCtxMutex());
     drawPixmapOpacity(rect, pixmap, subrect,
                       QPainter::CompositionMode_SourceOver, 1.0);
 }
@@ -357,6 +374,7 @@ void EtnaBlittable::drawPixmapOpacity(const QRectF &rect, const QPixmap &pixmap,
                                        QPainter::CompositionMode cmode,
                                        qreal opacity)
 {
+    QMutexLocker _etnaLock(&etnaCtxMutex());
     QRect dstR = rect.toRect();
     QRect srcR = subrect.toRect();
 
@@ -492,6 +510,7 @@ void EtnaBlittable::drawPixmapOpacity(const QRectF &rect, const QPixmap &pixmap,
  * ----------------------------------------------------------------------- */
 QImage *EtnaBlittable::doLock()
 {
+    QMutexLocker _etnaLock(&etnaCtxMutex());
     m_opaqueKnown = false;   /* CPU may write */
     /* Finish any pending GPU work so CPU reads see up-to-date pixels. */
     {
@@ -530,6 +549,7 @@ QImage *EtnaBlittable::doLock()
  * ----------------------------------------------------------------------- */
 void EtnaBlittable::doUnlock()
 {
+    QMutexLocker _etnaLock(&etnaCtxMutex());
     ETNA_DBG << "doUnlock —"
              << (m_skipFinishOnUnlock ? "cpu_fini only (read-only src)"
                                       : "cpu_fini + finish");
@@ -635,6 +655,7 @@ bool EtnaBlittable::drawCachedGlyphs(const QPaintEngineState *state, QFontEngine
                                      int numGlyphs, const glyph_t *glyphs, const QFixedPoint *positions,
                                      QFontEngine *fontEngine)
 {
+    QMutexLocker _etnaLock(&etnaCtxMutex());
     etna2d_device *dev = EtnaBlittablePlatformPixmap::device();
     if (!dev)
         return false;
@@ -734,6 +755,7 @@ QPaintEngine *EtnaBlittablePlatformPixmap::paintEngine() const
 
 bool EtnaPaintEngine::end()
 {
+    QMutexLocker _etnaLock(&etnaCtxMutex());
     const bool ok = QBlitterPaintEngine::end();
     /* Queued ops otherwise sit in the command stream until something needs them (next lock of a
      * surface they touch, frame flush).  Submitting here is asynchronous (no wait) and lets the GPU

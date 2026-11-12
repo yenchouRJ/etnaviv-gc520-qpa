@@ -458,7 +458,7 @@ Display underflow (sticky bit, 8 s, Qt alone): `argb8888` underflows on the **pr
 - `flush()` still copies the whole backing store into the ring every frame (the dirty region is ignored for correctness) and `doCommit()` damages the whole buffer; a 16 bpp backing store halves that copy, damage tracking would remove most of it (needs per-ring-slot damage history).
 - Pixmaps with alpha, the stretch scratch surface and the 32x32 `wl_shm` cursor are ARGB8888.
 - KMS-direct paths (`qetnaviv2dscreen.cpp`: dumb buffer `bpp = 32`, `DRM_FORMAT_ARGB8888` / `XRGB8888`, `mDepth = 32`) were not changed; only the Wayland ring follows the setting.
-- Fills and blends into ARGB4444 / ARGB1555 destinations are untested.
+- Fills and blends into ARGB4444 / ARGB1555 destinations: covered in Step 6 (selftest + matrix tolerance).
 
 ### 5. Procedure
 

@@ -23,6 +23,8 @@
 
 #include <QDebug>
 #include <QTimer>
+#include <QMutexLocker>
+#include "qetnaviv2dblitter.h"
 #include <string.h>
 #include <qpa/qwindowsysteminterface.h>
 
@@ -188,6 +190,7 @@ void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
                                    const QRegion &region,
                                    const QPoint  &offset)
 {
+    QMutexLocker _etnaLock(&etnaCtxMutex());   /* shared GC520 queue (Step 6) */
     Q_UNUSED(offset); /* offset is always (0,0) for full-screen QFbScreen */
 
     if (!m_pmdata || !m_pmdata->etnaBlittable()) {

@@ -510,13 +510,17 @@ static void runMatrix()
         { QPainter p(&dst); c.draw(p, fx); }
         fprintf(stderr, "MATRIX-END\n"); fflush(stderr);
         QImage got = dst.toImage().convertToFormat(QImage::Format_ARGB32_Premultiplied);
+        /* QT2D_MATRIX_TOL: per-channel tolerance (default 8).  Low-bit formats (rgb565/argb4444) quantise
+         * against the 8-bit offscreen reference; use e.g. 20/40 there.  Gross errors (swapped channels,
+         * wrong blend) are still far above it. */
+        static const int tol = qEnvironmentVariableIsEmpty("QT2D_MATRIX_TOL") ? 8 : qEnvironmentVariableIntValue("QT2D_MATRIX_TOL");
         int maxd = 0; long nd = 0; int fx0 = -1, fy0 = -1; QRgb fa = 0, fb = 0;
         for (int y = 0; y < 256; ++y) {
             const QRgb *a = reinterpret_cast<const QRgb *>(ref.constScanLine(y)), *b = reinterpret_cast<const QRgb *>(got.constScanLine(y));
             for (int x = 0; x < 256; ++x) {
                 int d = qMax(qMax(abs(qRed(a[x]) - qRed(b[x])), abs(qGreen(a[x]) - qGreen(b[x]))), abs(qBlue(a[x]) - qBlue(b[x])));
                 if (d > maxd) maxd = d;
-                if (d > 8) { if (!nd) { fx0 = x; fy0 = y; fa = a[x]; fb = b[x]; } ++nd; }
+                if (d > tol) { if (!nd) { fx0 = x; fy0 = y; fa = a[x]; fb = b[x]; } ++nd; }
             }
         }
         printf("MATRIX-RESULT name=\"%s\" max_diff=%d pixels_over_8=%ld %s\n", c.name, maxd, nd, nd == 0 ? "match" : "DIFF");
@@ -530,6 +534,44 @@ static void runMatrix()
  * GPU work queued on pixmap A (big alpha blits), then a CPU-only raster job (antialiased ellipses,
  * a GPU fallback) on an UNRELATED pixmap B.  With a whole-context drain at lock time the CPU job
  * waits for A's GPU work; with a per-surface wait the two overlap. */
+/* Step 6: QPainter on worker-thread pixmaps while the GUI thread also draws (shared GC520 queue). */
+#include <QThread>
+#include <atomic>
+static void runThreads(double secs)
+{
+    std::atomic<long> bad(0), iters(0);
+    std::atomic<bool> stop(false);
+    struct W : QThread {
+        int id; std::atomic<long> *bad, *iters; std::atomic<bool> *stop;
+        void run() override {
+            const QColor col(40 + id * 50, 200 - id * 40, 90 + id * 30);
+            QPixmap dst(160, 120), spr(32, 32);
+            spr.fill(col);
+            while (!*stop) {
+                { QPainter p(&dst); p.fillRect(dst.rect(), Qt::black);
+                  for (int i = 0; i < 4; ++i) p.drawPixmap(10 + i * 36, 10, spr);
+                  p.fillRect(QRect(10, 60, 100, 20), QColor(col.red(), col.green(), col.blue(), 255));
+                  p.setPen(Qt::white); p.drawText(10, 105, QStringLiteral("thread %1").arg(id)); }
+                QImage im = dst.toImage().convertToFormat(QImage::Format_ARGB32);
+                const QRgb a = im.pixel(20, 20), b = im.pixel(50, 70);
+                if (a != col.rgba() || b != col.rgba() || im.pixel(150, 5) != qRgb(0, 0, 0)) ++*bad;
+                ++*iters;
+            }
+        }
+    } th[4];
+    for (int i = 0; i < 4; ++i) { th[i].id = i; th[i].bad = &bad; th[i].iters = &iters; th[i].stop = &stop; th[i].start(); }
+    QPixmap A(300, 200); QPixmap spr = OpSet::mkAlpha(64, 64, 200);
+    QElapsedTimer t; t.start(); long gui = 0;
+    while (t.elapsed() < secs * 1000.0) {
+        QPainter p(&A); p.fillRect(A.rect(), QColor(10, 20, 30)); p.drawPixmap(5, 5, spr); p.end();
+        QImage im = A.toImage().convertToFormat(QImage::Format_ARGB32);
+        if (im.pixel(290, 190) != qRgb(10, 20, 30)) ++bad;
+        ++gui;
+    }
+    stop = true; for (auto &w : th) w.wait();
+    printf("THREADS iters=%ld gui=%ld bad=%ld %s\n", iters.load(), gui, bad.load(), bad ? "FAIL" : "PASS");
+}
+
 static void runMixed(double secs)
 {
     const QString plat = QGuiApplication::platformName();
@@ -627,7 +669,7 @@ private:
 /* ------------------------------------------------------------------ main */
 int main(int argc, char **argv)
 {
-    bool clip = false, ops = false, display = false, matrix = false, damage = false, mixed = false;
+    bool clip = false, ops = false, display = false, matrix = false, damage = false, mixed = false, threads = false;
     double secs = 3.0, stageSecs = 5.0;
     QVector<int> counts = { 16, 32, 64, 128, 256 };
     for (int i = 1; i < argc; ++i) {
@@ -637,6 +679,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--matrix")) matrix = true;
         else if (!strcmp(argv[i], "--damage")) damage = true;
         else if (!strcmp(argv[i], "--mixed")) mixed = true;
+        else if (!strcmp(argv[i], "--threads")) threads = true;
         else if (!strcmp(argv[i], "--secs") && i + 1 < argc) secs = atof(argv[++i]);
         else if (!strcmp(argv[i], "--stage-secs") && i + 1 < argc) stageSecs = atof(argv[++i]);
         else if (!strcmp(argv[i], "--sprites") && i + 1 < argc) {
@@ -647,6 +690,7 @@ int main(int argc, char **argv)
                                  "       qt2dbench --damage [--sprites N] [--secs S]   (partial-update workload)\n       qt2dbench --matrix   (QPainter feature matrix: GPU or CPU, pixels vs raster)\n"); return 2; }
     }
     if (matrix) { QApplication app(argc, argv); runMatrix(); return 0; }
+    if (threads) { QApplication app(argc, argv); runThreads(secs); return 0; }
     if (mixed) { QApplication app(argc, argv); runMixed(secs); return 0; }
     if (damage) { QApplication app(argc, argv); DamageWindow w(qMin(64, counts.first()), secs); w.begin(); return app.exec(); }
     if (clip == ops) { fprintf(stderr, "choose exactly one of --clip / --ops\n"); return 2; }

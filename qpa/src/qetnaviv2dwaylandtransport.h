@@ -71,6 +71,7 @@ struct wl_pointer;
 struct wl_touch;
 struct wl_keyboard;
 struct wl_shm;
+struct wl_output;
 struct wl_shm_pool;
 struct xdg_wm_base;
 struct xdg_surface;
@@ -151,6 +152,12 @@ public:
 
     /* Disconnect and free all Wayland and BO resources. */
     void disconnect();
+    QSize defaultSize() const;
+    static void outputGeometry(void *, wl_output *, int32_t, int32_t, int32_t, int32_t, int32_t,
+                               const char *, const char *, int32_t transform);
+    static void outputMode(void *, wl_output *, uint32_t flags, int32_t w, int32_t h, int32_t);
+    static void outputDone(void *, wl_output *);
+    static void outputScale(void *, wl_output *, int32_t);
 
     /* Is the transport connected and operational? */
     bool isConnected() const { return m_connected; }
@@ -282,6 +289,8 @@ private:
     wl_display          *m_display    = nullptr;
     wl_registry         *m_registry   = nullptr;
     wl_compositor       *m_compositor = nullptr;
+    wl_output           *m_output = nullptr;      /* first wl_output (Step 6) */
+    int                  m_outModeW = 0, m_outModeH = 0, m_outTransform = 0;
     wl_surface          *m_surface    = nullptr;
     /* xdg-shell role (kiosk-shell) */
     xdg_wm_base         *m_xdgWmBase  = nullptr;

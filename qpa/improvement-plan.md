@@ -201,6 +201,12 @@ Honest limit: Qt's own per-run work (layout, glyph position and cache lookups, a
 - KMS-direct scanout format follows `QT_ETNA2D_FMT`; add ARGB4444 / ARGB1555 fill/blend matrix cases.
 - Bind `wl_output`, size the ring/ivi surface from the toplevel (plan.md section 6.6); keep `QT_IVI_GEOMETRY` as override.
 
+### Step 6 results (done)
+- **Thread safety:** one GC520 context/queue is shared by all blittables, so a global recursive mutex (`etnaCtxMutex()`, `qetnaviv2dblitter.cpp`) now serialises every entry that touches it: blittable draw/lock/unlock/destroy, `createBlittable`, `EtnaPaintEngine::end`, and `QEtnaviv2dBackingStore::flush`. The mutex is not held while Qt rasterises into a locked image. Test `qt2dbench --threads`: 4 worker threads (QPixmap fill/drawPixmap/drawText/toImage with pixel check) plus the GUI thread, 5 s: bad=0, PASS. No fps change (`--clip` 90 fps, `--matrix` 52/2).
+- **KMS scanout format:** dumb-BO `bpp`, DRM fourcc and the imported etnaviv surface format now follow `QT_ETNA2D_FMT` (alpha planes need an alpha format; default stays argb8888 for overlay/composite and xrgb8888 for primary). Build-checked only; the KMS-direct path is still not run on the board (Weston owns the DRM master).
+- **Low-bit formats:** `qt2dbench --matrix` takes `QT2D_MATRIX_TOL` (per-channel tolerance, default 8) because 565/4444 quantise against the 8-bit offscreen reference. With `QT_ETNA2D_FMT=rgb565 QT2D_MATRIX_TOL=20` and `argb4444 QT2D_MATRIX_TOL=40`: 52 match / 2 known ellipse-clip DIFF, same as argb8888. ARGB1555 has no Qt image equivalent, so it is covered at the library level: `etna2d_selftest` now checks fill, 1:1 copy and SrcOver on ARGB4444 / ARGB1555 / RGB565 (all pass).
+- **wl_output:** the transport binds the first `wl_output`; the default window / ring size is its current mode (rotation swaps), `QT_IVI_GEOMETRY` still overrides, fallback 1024x600. Verified: unset gives 1920x1080 on this setup, `QT_IVI_GEOMETRY=800x480` gives 800x480. Behaviour change: scripts that relied on the 1024x600 default must set `QT_IVI_GEOMETRY`. Resizing the ring after connect (window `resize()`) is not done.
+
 ## Step 7 (optional, structural)
 - Replace the hand-written Wayland client (`qetnaviv2dwaylandtransport.cpp`) with QtWayland plus a custom buffer integration. Only if steps 1-4 leave the transport as a maintenance or perf problem.
 
@@ -214,4 +220,4 @@ Honest limit: Qt's own per-run work (layout, glyph position and cache lookups, a
 | 4 | done (Wayland repaint-on-release; KMS deferred) | dropped frames lost | all presented, stale UI fixed | see git log |
 | 5 | done (policy measured, thresholds 0) | empty finish 118 us | 0 us | see git log |
 | 5b | done (opacity + text on the DE) | opacity full 66 ms, text 113 glyphs 2.5 ms | 8.7 ms, 1.3 ms | see git log |
-| 6 | todo | | | |
+| 6 | done (mutex, KMS fmt, 16-bit tests, wl_output default; no live resize) | threads untested | --threads PASS | see git log |
