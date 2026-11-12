@@ -207,8 +207,21 @@ Honest limit: Qt's own per-run work (layout, glyph position and cache lookups, a
 - **Low-bit formats:** `qt2dbench --matrix` takes `QT2D_MATRIX_TOL` (per-channel tolerance, default 8) because 565/4444 quantise against the 8-bit offscreen reference. With `QT_ETNA2D_FMT=rgb565 QT2D_MATRIX_TOL=20` and `argb4444 QT2D_MATRIX_TOL=40`: 52 match / 2 known ellipse-clip DIFF, same as argb8888. ARGB1555 has no Qt image equivalent, so it is covered at the library level: `etna2d_selftest` now checks fill, 1:1 copy and SrcOver on ARGB4444 / ARGB1555 / RGB565 (all pass).
 - **wl_output:** the transport binds the first `wl_output`; the default window / ring size is its current mode (rotation swaps), `QT_IVI_GEOMETRY` still overrides, fallback 1024x600. Verified: unset gives 1920x1080 on this setup, `QT_IVI_GEOMETRY=800x480` gives 800x480. Behaviour change: scripts that relied on the 1024x600 default must set `QT_IVI_GEOMETRY`. Resizing the ring after connect (window `resize()`) is not done.
 
-## Step 7 (optional, structural)
-- Replace the hand-written Wayland client (`qetnaviv2dwaylandtransport.cpp`) with QtWayland plus a custom buffer integration. Only if steps 1-4 leave the transport as a maintenance or perf problem.
+## Step 7: Live output / window size update (replaces the QtWayland migration)
+QtWayland replacement dropped: direct KMS must stay supported and shares the backing store, blitter and damage tracking with the Wayland path, and QtWayland cannot drive KMS planes (see discussion, no technical blocker was ever recorded for the hand-written client).
+
+Today the size is read once at connect (`wl_output.mode` after two roundtrips, `QT_IVI_GEOMETRY` override) and the ring never changes (`allocateRing()` once from `integration.cpp`).
+- Keep listening to `wl_output.mode` / `done` after connect (current mode only, apply on `done`). Re-evaluate `defaultSize()`; ignore when `QT_IVI_GEOMETRY` is set.
+- Transport: `reallocateRing(w, h)`: stop committing, wait for/ignore pending `wl_buffer.release`, destroy the 3 `wl_buffer`s and BOs after `etna2d_finish`, allocate new ones, reset per-slot damage history (`takeDamage` must treat every slot as fully dirty), drop any pending frame callback state.
+- Screen: update `mGeometry` / physical size (use `wl_output.geometry` mm) and call `QWindowSystemInterface::handleScreenGeometryChange`; the top-level window follows when it is fullscreen / maximised. `Screen` already has a geometry-update path (`qetnaviv2dscreen.cpp` ~593).
+- Backing store: `resize()` reallocates the backing surface for the new size (blitter surfaces are fixed size), force a full flush for the first frame.
+- App-driven size: `QWindow::resize()` / `setGeometry()` on the top-level reallocates the ring to the window size (not only the output size); ivi surface size follows. Optional follow-up: `wl_output.scale`.
+- Hazards: resize while a frame is in flight; Weston still holding old buffers (do not free before `release` or `finish`); the context mutex from Step 6 must cover the realloc; `QT_ETNA2D_VERIFY_FLUSH` must stay bad=0 across a resize.
+- Test:
+  - add `qt2dbench --resize`: change the window size repeatedly (`resize()` between frames, e.g. 1024x600 <-> 800x480 <-> 1920x1080) with `VERIFY_FLUSH=1`: bad=0, no crash, no leaked BOs (count stays constant), content correct after each resize.
+  - Weston side: change the output mode (`weston.ini` mode or `weston-info` check) and confirm the ring is reallocated and `STAGE` fps is unchanged afterwards.
+  - Regression: `--matrix` 52/2, `--clip` fps within noise, `--threads` PASS.
+- Pass: no stale/garbled frame after a resize, no leaks, no fps regression.
 
 ## Tracking
 | Step | Status | fps / metric before | after | commit |
@@ -221,3 +234,4 @@ Honest limit: Qt's own per-run work (layout, glyph position and cache lookups, a
 | 5 | done (policy measured, thresholds 0) | empty finish 118 us | 0 us | see git log |
 | 5b | done (opacity + text on the DE) | opacity full 66 ms, text 113 glyphs 2.5 ms | 8.7 ms, 1.3 ms | see git log |
 | 6 | done (mutex, KMS fmt, 16-bit tests, wl_output default; no live resize) | threads untested | --threads PASS | see git log |
+| 7 | todo (live output/window resize; QtWayland migration dropped) | | | |
