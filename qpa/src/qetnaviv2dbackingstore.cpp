@@ -341,7 +341,7 @@ void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
 
     verifyTarget(backingSurf, scanoutBack, "kms");
 
-    /* 4. Page-flip (blocks until vblank only in composite / QT_ETNA2D_SYNC_FLIP mode). */
+    /* 4. Page-flip (blocks until vblank only with QT_ETNA2D_SYNC_FLIP=1). */
     m_dropped = false;
     EtnaStats::Scope _tp(EtnaStats::FlipWait);
     if (m_screen->pageFlip() != 0)
