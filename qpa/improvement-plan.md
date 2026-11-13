@@ -223,6 +223,14 @@ Today the size is read once at connect (`wl_output.mode` after two roundtrips, `
   - Regression: `--matrix` 52/2, `--clip` fps within noise, `--threads` PASS.
 - Pass: no stale/garbled frame after a resize, no leaks, no fps regression.
 
+### Step 7 results (done)
+- **Transport:** `resizeRing(size)` (under `etnaCtxMutex`): `etna2d_finish`, destroy the 3 wl_buffers / surfaces / dmabuf fds (destroying a buffer Weston still shows is legal), drop the pending commit, allocate at the new size. `allocateRing`/`freeRing` share one code path. `wl_output` is now listened to after connect: a changed current mode (on `done`) updates the output geometry and calls a hook; ignored when `QT_IVI_GEOMETRY` pins the size. Physical size (mm) from `wl_output.geometry` now feeds the screen DPI.
+- **Screen:** `setWaylandGeometry` emits the geometry change and calls `resizeMaximizedWindows()`, so fullscreen/maximised windows follow the output. (Without it Qt does not resize them: found by test.)
+- **Backing store:** at present time (`flush`), a top-level `Qt::Window` whose backing store size differs from the ring resizes the ring (stale map cleared, full flush). So `resize()`, `showFullScreen()` and output changes all end in one reallocation; popups/tooltips never touch the ring. `QT_IVI_GEOMETRY` pins the ring (old behaviour) for scripts.
+- **Tests:** `qt2dbench --resize` (window cycled through 640x400, 800x480, 1024x600, 320x240, 1280x720; fd count before/after; `VERIFY_FLUSH`): PASS, 22 resizes, fds 15 -> 15, also with `QT_ETNA2D_TEST_DROP=3`. `QT_ETNA2D_TEST_OUTPUT=WxH` (debug) injects a wl_output mode change 1 s after the first frame, since Weston cannot change mode at runtime: output change -> screen geometry -> window 800x480 -> ring 800x480, `VERIFYFLUSH bad=0`. Regression: `--matrix` 52/2, `--threads` PASS, `--clip` 90 fps, plain `--damage` 1080p 88 fps.
+- **Behaviour change:** the ring is now the top-level window size, not the output size (with `QT_IVI_GEOMETRY` unset). A non-fullscreen window gets a ring and ivi surface of its own size. A short-lived 640x480 ring appears at start before a widget goes fullscreen (cost: one extra allocation).
+- **Not done:** `wl_output.scale`, multiple outputs, a real Weston mode switch (only injected), rotation of an existing window.
+
 ## Tracking
 | Step | Status | fps / metric before | after | commit |
 |---|---|---|---|---|
@@ -234,4 +242,4 @@ Today the size is read once at connect (`wl_output.mode` after two roundtrips, `
 | 5 | done (policy measured, thresholds 0) | empty finish 118 us | 0 us | see git log |
 | 5b | done (opacity + text on the DE) | opacity full 66 ms, text 113 glyphs 2.5 ms | 8.7 ms, 1.3 ms | see git log |
 | 6 | done (mutex, KMS fmt, 16-bit tests, wl_output default; no live resize) | threads untested | --threads PASS | see git log |
-| 7 | todo (live output/window resize; QtWayland migration dropped) | | | |
+| 7 | done (live output/window resize; QtWayland migration dropped) | ring fixed at connect | follows window/output, --resize PASS | see git log |

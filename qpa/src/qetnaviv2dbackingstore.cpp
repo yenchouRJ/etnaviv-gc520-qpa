@@ -208,6 +208,21 @@ void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
     if (m_transport) {
         /* QT_ETNA2D_TEST_DROP=N (debug): behave as if the ring were full on every Nth flush,
          * to exercise the damage accumulation of dropped frames. */
+        /* Step 7: the ring follows the top-level window size (resize(), showFullScreen(), output
+         * mode change) unless QT_IVI_GEOMETRY pins it.  Done here, at present time, so a window
+         * that is resized several times before painting costs one reallocation. */
+        {
+            static const bool pinned = !qEnvironmentVariableIsEmpty("QT_IVI_GEOMETRY");
+            const QSize want(m_pmdata->width(), m_pmdata->height());
+            if (!pinned && window() && window()->type() == Qt::Window
+                    && !want.isEmpty() && m_transport->ringSize() != want) {
+                m_stale.clear();   /* new ring surfaces: every target is fully stale */
+                if (!m_transport->resizeRing(want)) {
+                    BS_WARN << "flush(wayland): ring resize to" << want << "failed";
+                    return;
+                }
+            }
+        }
         static const int testDrop = qEnvironmentVariableIntValue("QT_ETNA2D_TEST_DROP");
         static int flushCount = 0;
         etna2d_surface *ringBo = (testDrop > 0 && ++flushCount % testDrop == 0) ? nullptr

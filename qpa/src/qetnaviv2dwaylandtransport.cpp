@@ -35,6 +35,9 @@
 #include <QAbstractEventDispatcher>
 #include <QCoreApplication>
 #include <QDebug>
+#include <QTimer>
+#include <QMutexLocker>
+#include "qetnaviv2dblitter.h"
 #include <qpa/qwindowsysteminterface.h>
 
 #include <cerrno>
@@ -217,9 +220,52 @@ bool QEtnaviv2dWaylandTransport::allocateRing()
         WL_WARN << "allocateRing: not yet configured";
         return false;
     }
+    return allocRingSized(m_outputGeometry.width(), m_outputGeometry.height());
+}
 
-    const int w = m_outputGeometry.width();
-    const int h = m_outputGeometry.height();
+/* Release the ring (wl_buffers, GPU surfaces, dmabuf fds).  Queued GPU work is drained first
+ * (the caller holds etnaCtxMutex).  Destroying a wl_buffer Weston still shows is legal: the
+ * compositor keeps the content until the next attach. */
+void QEtnaviv2dWaylandTransport::freeRing()
+{
+    if (m_ring[0].surf || m_ring[1].surf || m_ring[2].surf)
+        etna2d_finish(EtnaBlittablePlatformPixmap::context());
+    for (int i = 0; i < WL_RING_SIZE; ++i) {
+        ArgbBo &slot = m_ring[i];
+        if (slot.wl_buf) { wl_buffer_destroy(slot.wl_buf); slot.wl_buf = nullptr; }
+        if (slot.surf)   { etna2d_surface_destroy(slot.surf); slot.surf = nullptr; }
+        if (slot.dmabuf_fd >= 0) { close(slot.dmabuf_fd); slot.dmabuf_fd = -1; }
+        slot.in_use.store(false);
+    }
+    m_ringSize = QSize();
+}
+
+/* Step 7: re-create the ring at a new size.  GUI thread only.  The pending commit (if any)
+ * referred to a destroyed slot and is dropped; the caller repaints in full. */
+bool QEtnaviv2dWaylandTransport::resizeRing(const QSize &size)
+{
+    if (!m_connected || size.isEmpty())
+        return false;
+    if (size == m_ringSize)
+        return true;
+    QMutexLocker _l(&etnaCtxMutex());
+    WL_INFO << "ring resize" << m_ringSize << "->" << size;
+    freeRing();
+    m_dirty = false;
+    m_pendingCommitSlot = -1;
+    m_commitDamage = QRegion();
+    m_currentSlot = 0;
+    if (!allocRingSized(size.width(), size.height())) {
+        WL_WARN << "ring resize failed; ring is down until the next resize";
+        freeRing();
+        return false;
+    }
+    return true;
+}
+
+bool QEtnaviv2dWaylandTransport::allocRingSized(int w, int h)
+{
+
 
     /* Ring pixel format: QT_ETNA2D_RING_FMT, else QT_ETNA2D_FMT, else argb8888 (see
      * qetnaviv2dformat.h). The GPU blit from the backing store converts on copy if they differ. */
@@ -323,6 +369,7 @@ bool QEtnaviv2dWaylandTransport::allocateRing()
                << "wl_buf=" << slot.wl_buf;
     }
 
+    m_ringSize = QSize(w, h);
     WL_INFO << "ring allocated:" << WL_RING_SIZE << "x"
             << w << "x" << h << rf.name << "/LINEAR";
     return true;
@@ -374,6 +421,22 @@ void QEtnaviv2dWaylandTransport::commitFrame(etna2d_surface *bo, const QRegion &
     /* Arm the QSocketNotifier lazily on first commit — by this point
      * QApplication::exec() is running and the notifier will work correctly. */
     armNotifier();
+    /* QT_ETNA2D_TEST_OUTPUT=WxH (debug): 1 s after the first ring, pretend wl_output reported
+     * that mode, to exercise the live path (Weston cannot change its mode at runtime). */
+    static bool testArmed = false;
+    if (!testArmed) {
+        const QByteArray t = qgetenv("QT_ETNA2D_TEST_OUTPUT");
+        const QList<QByteArray> p = t.split('x');
+        if (p.size() == 2 && p[0].toInt() > 0 && p[1].toInt() > 0) {
+            testArmed = true;
+            const int tw = p[0].toInt(), th = p[1].toInt();
+            QTimer::singleShot(1000, this, [this, tw, th]() {
+                m_outModeW = tw; m_outModeH = th; m_outTransform = 0;
+                m_outputGeometry = QRect(0, 0, 1, 1);   /* force "changed" */
+                applyOutputSize();
+            });
+        }
+    }
     /* Find which slot was rendered into */
     int slot = -1;
     for (int i = 0; i < WL_RING_SIZE; ++i) {
@@ -411,7 +474,7 @@ void QEtnaviv2dWaylandTransport::doCommit(int slot)
     {
         QVector<QRect> rects = m_commitDamage.rects();
         if (rects.isEmpty() || rects.size() > 16)
-            rects = { m_commitDamage.isEmpty() ? QRect(QPoint(0, 0), m_outputGeometry.size())
+            rects = { m_commitDamage.isEmpty() ? QRect(QPoint(0, 0), m_ringSize)
                                                : m_commitDamage.boundingRect() };
         for (const QRect &r : qAsConst(rects))
             wl_surface_damage_buffer(m_surface, r.x(), r.y(), r.width(), r.height());
@@ -478,14 +541,7 @@ void QEtnaviv2dWaylandTransport::disconnect()
         m_frameCallback = nullptr;
     }
 
-    /* Free ring BOs */
-    for (int i = 0; i < WL_RING_SIZE; ++i) {
-        ArgbBo &slot = m_ring[i];
-        if (slot.wl_buf) { wl_buffer_destroy(slot.wl_buf); slot.wl_buf = nullptr; }
-        if (slot.surf)   { etna2d_surface_destroy(slot.surf); slot.surf = nullptr; }
-        if (slot.dmabuf_fd >= 0) { close(slot.dmabuf_fd); slot.dmabuf_fd = -1; }
-        slot.in_use.store(false);
-    }
+    freeRing();
 
     if (m_xdgToplevel) { xdg_toplevel_destroy(m_xdgToplevel); m_xdgToplevel = nullptr; }
     if (m_xdgSurface)  { xdg_surface_destroy(m_xdgSurface);   m_xdgSurface  = nullptr; }
@@ -541,10 +597,12 @@ void QEtnaviv2dWaylandTransport::onAboutToBlock()
  * wl_registry listeners
  * ----------------------------------------------------------------------- */
 void QEtnaviv2dWaylandTransport::outputGeometry(void *data, wl_output *, int32_t, int32_t,
-                                                int32_t, int32_t, int32_t, const char *,
+                                                int32_t physW, int32_t physH, int32_t, const char *,
                                                 const char *, int32_t transform)
 {
-    static_cast<QEtnaviv2dWaylandTransport *>(data)->m_outTransform = transform;
+    auto *self = static_cast<QEtnaviv2dWaylandTransport *>(data);
+    self->m_outTransform = transform;
+    self->m_outPhysW = physW; self->m_outPhysH = physH;
 }
 
 void QEtnaviv2dWaylandTransport::outputMode(void *data, wl_output *, uint32_t flags,
@@ -557,7 +615,27 @@ void QEtnaviv2dWaylandTransport::outputMode(void *data, wl_output *, uint32_t fl
     }
 }
 
-void QEtnaviv2dWaylandTransport::outputDone(void *, wl_output *) {}
+void QEtnaviv2dWaylandTransport::outputDone(void *data, wl_output *)
+{
+    auto *self = static_cast<QEtnaviv2dWaylandTransport *>(data);
+    self->applyOutputSize();
+}
+
+/* Step 7: the output mode changed after connect.  Report the new geometry (screen geometry
+ * change); Qt resizes fullscreen windows, whose backing store then resizes the ring on the
+ * next flush.  Ignored when QT_IVI_GEOMETRY pins the size. */
+void QEtnaviv2dWaylandTransport::applyOutputSize()
+{
+    if (!m_configured || m_outModeW <= 0)
+        return;
+    const QSize sz = defaultSize();
+    if (sz == m_outputGeometry.size())
+        return;
+    WL_INFO << "output mode changed:" << m_outputGeometry.size() << "->" << sz;
+    m_outputGeometry = QRect(QPoint(0, 0), sz);
+    if (m_outputHook && qEnvironmentVariableIsEmpty("QT_IVI_GEOMETRY"))
+        m_outputHook(m_outputGeometry, QSizeF(m_outPhysW, m_outPhysH));
+}
 void QEtnaviv2dWaylandTransport::outputScale(void *, wl_output *, int32_t) {}
 
 /* Default window size: QT_IVI_GEOMETRY override, else the wl_output current mode (rotated

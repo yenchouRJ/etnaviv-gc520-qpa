@@ -572,6 +572,47 @@ static void runThreads(double secs)
     printf("THREADS iters=%ld gui=%ld bad=%ld %s\n", iters.load(), gui, bad.load(), bad ? "FAIL" : "PASS");
 }
 
+/* ------------------------------------------------------------------ resize mode (Step 7)
+ * Window is resized every ~250 ms through a list of sizes while animating; the pattern encodes the
+ * window size (border + diagonal) so a stale / wrong-size ring shows up.  Run with
+ * QT_ETNA2D_VERIFY_FLUSH=1 (bad=0) and QT_ETNAVIV2D_DEBUG=1 (shows "ring resize").  Prints the
+ * open fd count before/after: it must not grow (ring BOs, dmabuf fds). */
+#include <dirent.h>
+static int countFds() { int n = 0; if (DIR *d = opendir("/proc/self/fd")) { while (readdir(d)) ++n; closedir(d); } return n; }
+class ResizeWindow : public QWidget
+{
+public:
+    ResizeWindow(double secs) : m_secs(secs) { setAttribute(Qt::WA_OpaquePaintEvent); }
+    void begin()
+    {
+        m_fd0 = -1; show(); m_t.start();
+        QTimer::singleShot(500, this, [this]() { m_fd0 = countFds(); step(); });
+    }
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter p(this);
+        p.fillRect(rect(), QColor(20 + (m_i * 37) % 120, 40, 80));
+        p.setPen(QPen(Qt::white, 3)); p.drawRect(rect().adjusted(1, 1, -2, -2));
+        p.drawLine(0, 0, width(), height());
+        p.drawText(20, 40, QStringLiteral("%1x%2 #%3").arg(width()).arg(height()).arg(m_i));
+    }
+private:
+    void step()
+    {
+        if (m_t.elapsed() > m_secs * 1000.0) {
+            printf("RESIZE steps=%d fds_before=%d fds_after=%d %s\n", m_i, m_fd0, countFds(),
+                   countFds() <= m_fd0 + 2 ? "PASS" : "LEAK"); fflush(stdout);
+            QTimer::singleShot(300, qApp, &QApplication::quit); return;
+        }
+        static const QSize S[] = { {640, 400}, {800, 480}, {1024, 600}, {320, 240}, {1280, 720}, {1024, 600} };
+        const QSize sz = S[m_i++ % (sizeof(S) / sizeof(S[0]))];
+        resize(sz); update();
+        QTimer::singleShot(250, this, &ResizeWindow::step);
+    }
+    double m_secs; int m_i = 0, m_fd0 = 0; QElapsedTimer m_t;
+};
+
 static void runMixed(double secs)
 {
     const QString plat = QGuiApplication::platformName();
@@ -669,7 +710,7 @@ private:
 /* ------------------------------------------------------------------ main */
 int main(int argc, char **argv)
 {
-    bool clip = false, ops = false, display = false, matrix = false, damage = false, mixed = false, threads = false;
+    bool clip = false, ops = false, display = false, matrix = false, damage = false, mixed = false, threads = false, resizeT = false;
     double secs = 3.0, stageSecs = 5.0;
     QVector<int> counts = { 16, 32, 64, 128, 256 };
     for (int i = 1; i < argc; ++i) {
@@ -680,6 +721,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--damage")) damage = true;
         else if (!strcmp(argv[i], "--mixed")) mixed = true;
         else if (!strcmp(argv[i], "--threads")) threads = true;
+        else if (!strcmp(argv[i], "--resize")) resizeT = true;
         else if (!strcmp(argv[i], "--secs") && i + 1 < argc) secs = atof(argv[++i]);
         else if (!strcmp(argv[i], "--stage-secs") && i + 1 < argc) stageSecs = atof(argv[++i]);
         else if (!strcmp(argv[i], "--sprites") && i + 1 < argc) {
@@ -690,6 +732,7 @@ int main(int argc, char **argv)
                                  "       qt2dbench --damage [--sprites N] [--secs S]   (partial-update workload)\n       qt2dbench --matrix   (QPainter feature matrix: GPU or CPU, pixels vs raster)\n"); return 2; }
     }
     if (matrix) { QApplication app(argc, argv); runMatrix(); return 0; }
+    if (resizeT) { QApplication app(argc, argv); ResizeWindow w(secs); w.begin(); return app.exec(); }
     if (threads) { QApplication app(argc, argv); runThreads(secs); return 0; }
     if (mixed) { QApplication app(argc, argv); runMixed(secs); return 0; }
     if (damage) { QApplication app(argc, argv); DamageWindow w(qMin(64, counts.first()), secs); w.begin(); return app.exec(); }
