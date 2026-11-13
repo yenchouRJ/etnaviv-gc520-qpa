@@ -17,6 +17,7 @@
  */
 #include "qetnaviv2dblitter.h"
 #include "qetnaviv2dformat.h"
+#include "qetnaviv2dconfig.h"
 #include "qetnaviv2dstats.h"
 
 #include <QDebug>
@@ -32,56 +33,15 @@
 QT_BEGIN_NAMESPACE
 
 /* -----------------------------------------------------------------------
- * Logging — respects QT_ETNAVIV2D_DEBUG env var (0/1).
+ * Context mutex
  * ----------------------------------------------------------------------- */
 /* One GC520 context/queue is shared by every blittable, so GPU calls from several threads
  * (QPainter on a worker-thread pixmap, QT_THREADED_PAINTING) must be serialised.  Recursive:
  * lock() -> doLock() -> etna2d_finish() and drawing helpers call each other. */
 QRecursiveMutex &etnaCtxMutex() { static QRecursiveMutex m; return m; }
 
-static bool debugEnabled()
-{
-    static int v = qEnvironmentVariableIntValue("QT_ETNAVIV2D_DEBUG");
-    return v > 0;
-}
-
-/* When set to 1, source-pixmap unlock reverts to the conservative path:
- * etna2d_finish() is called on every drawPixmap source surface before the
- * blit op is queued.  This serialises all GPU ops and eliminates batching.
- * Default 0 (batch mode on): finish is deferred to frame boundary. */
-static bool noBatch()
-{
-    static int v = qEnvironmentVariableIntValue("QT_ETNAVIV2D_NO_BATCH");
-    return v > 0;
-}
-
-/* Step 5b switches (default on): QT_ETNA2D_GPU_TEXT=0 / QT_ETNA2D_GPU_OPACITY=0 restore the CPU paths for A/B. */
-static bool envOn(const char *name) { return qEnvironmentVariableIsEmpty(name) || qEnvironmentVariableIntValue(name) != 0; }
-static bool gpuText()    { static const bool v = envOn("QT_ETNA2D_GPU_TEXT");    return v; }
-static bool submitOnEnd() { static const bool v = envOn("QT_ETNA2D_SUBMIT_ON_END"); return v; }
-static bool gpuOpacity() { static const bool v = envOn("QT_ETNA2D_GPU_OPACITY"); return v; }
-
-#define ETNA_DBG if (debugEnabled()) qDebug() << "[etnaviv2d|blitter]"
-#define ETNA_WARN qWarning() << "[etnaviv2d|blitter]"
-
-/* Step 5: GPU-use policy.  Below a destination area (pixels) an op is drawn by the CPU raster
- * engine instead of the GC520.  0 = always GPU.  Env: QT_ETNA2D_MIN_FILL / _BLIT / _ALPHA / _SCALE
- * (alpha = source-over blit, scale = stretch) or QT_ETNA2D_MIN_ALL for all four. */
-struct GpuPolicy { qint64 fill, blit, alpha, scale; };
-static const GpuPolicy &policy()
-{
-    static const GpuPolicy p = []() {
-        auto get = [](const char *name) -> qint64 {
-            bool ok = false; qint64 v = qEnvironmentVariable(name).toLongLong(&ok);
-            if (ok) return v;
-            v = qEnvironmentVariable("QT_ETNA2D_MIN_ALL").toLongLong(&ok);
-            return ok ? v : 0;
-        };
-        return GpuPolicy{ get("QT_ETNA2D_MIN_FILL"), get("QT_ETNA2D_MIN_BLIT"),
-                          get("QT_ETNA2D_MIN_ALPHA"), get("QT_ETNA2D_MIN_SCALE") };
-    }();
-    return p;
-}
+#define ETNA_DBG  ETNA_LOG_DBG("blitter")
+#define ETNA_WARN ETNA_LOG_WARN("blitter")
 
 /* -----------------------------------------------------------------------
  * EtnaBlittablePlatformPixmap — statics
@@ -139,7 +99,7 @@ QBlittable *EtnaBlittablePlatformPixmap::createBlittable(const QSize &size,
     }
     etna2d_surface *surf = nullptr;
     /* Surfaces the CPU rasterises into are cacheable (Step 1); QT_ETNA2D_CACHED=1 opts in (default write-combine). */
-    static const bool cached = qEnvironmentVariableIntValue("QT_ETNA2D_CACHED") != 0;
+    const bool cached = etnaConfig().cached;
     int rc = etna2d_surface_create_ex(s_dev, size.width(), size.height(),
                                       etnaStorageFmt(alpha).etna,
                                       cached ? ETNA2D_SURF_CACHED : 0, &surf);
@@ -162,7 +122,7 @@ EtnaBlittable::EtnaBlittable(etna2d_context *ctx, etna2d_surface *surf)
                               | SourceOverPixmapCapability
                               | SourceOverScaledPixmapCapability
                               | OpacityPixmapCapability
-                              | (gpuText() ? DrawScaledCachedGlyphsCapability : Capability(0))))
+                              | (etnaConfig().gpuText ? DrawScaledCachedGlyphsCapability : Capability(0))))
     , m_ctx(ctx)
     , m_surf(surf)
 {
@@ -261,7 +221,7 @@ etna2d_surface *EtnaBlittable::surfaceFromPixmap(const QPixmap &pixmap)
      *
      * QT_ETNAVIV2D_NO_BATCH=1 falls back to the conservative full unlock
      * (cpu_fini + etna2d_finish) for debugging or single-context comparison. */
-    if (noBatch())
+    if (etnaConfig().noBatch)
         blitter->unlock();
     else
         blitter->unlockForGpuRead();
@@ -283,10 +243,6 @@ void EtnaBlittable::fillRect(const QRectF &rect, const QColor &color)
                   | (uint32_t(color.red())   << 16)
                   | (uint32_t(color.green())  <<  8)
                   | uint32_t(color.blue());
-    if (color.alpha() == 255 && qint64(r.width()) * r.height() < policy().fill) {
-        cpuFillRect(rect, color, QPainter::CompositionMode_Source);
-        return;
-    }
     m_opaqueKnown = false;
     ETNA_DBG << "fillRect" << r << Qt::hex << argb;
     EtnaStats::add(EtnaStats::GpuFill);
@@ -415,8 +371,7 @@ void EtnaBlittable::drawPixmapOpacity(const QRectF &rect, const QPixmap &pixmap,
     if (hasOpacity) {
         /* Global-opacity blit (Step 5b, probed on the GC520): source-over of a premultiplied source
          * scaled by the painter opacity.  Scaled and non-source-over variants stay on the CPU. */
-        if (gpuOpacity() && !isStretch && isOver
-            && qint64(dstR.width()) * dstR.height() >= policy().alpha) {
+        if (!isStretch && isOver) {
             EtnaStats::add(EtnaStats::GpuBlit);
             etna2d_blit_opacity(m_ctx, srcSurf, srcR.x(), srcR.y(), m_surf, dstR.x(), dstR.y(),
                                 srcR.width(), srcR.height(), unsigned(qBound(0, qRound(opacity * 255), 255)));
@@ -425,16 +380,6 @@ void EtnaBlittable::drawPixmapOpacity(const QRectF &rect, const QPixmap &pixmap,
         ETNA_DBG << "drawPixmapOpacity: opacity < 1.0 — CPU draw";
         cpuDrawPixmap(rect, pixmap, subrect, cmode, opacity);
         return;
-    }
-
-    {
-        const qint64 area = qint64(dstR.width()) * dstR.height();
-        const qint64 minArea = isStretch ? policy().scale : (isOver ? policy().alpha : policy().blit);
-        if (area < minArea) {
-            ETNA_DBG << "drawPixmapOpacity: below GPU threshold — CPU draw";
-            cpuDrawPixmap(rect, pixmap, subrect, cmode, opacity);
-            return;
-        }
     }
 
     if (!isStretch) {
@@ -760,15 +705,14 @@ bool EtnaPaintEngine::end()
     /* Queued ops otherwise sit in the command stream until something needs them (next lock of a
      * surface they touch, frame flush).  Submitting here is asynchronous (no wait) and lets the GPU
      * work overlap the CPU work that follows.  A no-op when nothing is queued. */
-    if (submitOnEnd())
-        etna2d_flush(EtnaBlittablePlatformPixmap::context());
+    etna2d_flush(EtnaBlittablePlatformPixmap::context());
     return ok;
 }
 
 bool EtnaPaintEngine::gpuGlyphs(int numGlyphs, const glyph_t *glyphs, const QFixedPoint *positions,
                                 QFontEngine *fe)
 {
-    if (!gpuText())
+    if (!etnaConfig().gpuText)
         return false;
     QRasterPaintEngineState *s = state();
     if (!s || s->matrix.type() > QTransform::TxScale)

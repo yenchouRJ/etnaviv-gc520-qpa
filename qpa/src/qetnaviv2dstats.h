@@ -8,6 +8,7 @@
 #ifndef QETNAVIV2DSTATS_H
 #define QETNAVIV2DSTATS_H
 
+#include "qetnaviv2dconfig.h"
 #include <QtCore/qglobal.h>
 #include <atomic>
 #include <time.h>
@@ -34,7 +35,7 @@ enum Id {
 
 struct Slot { std::atomic<long long> ns{0}; std::atomic<long long> n{0}; };
 inline Slot *statSlots() { static Slot s[N]; return s; }
-inline bool enabled() { static int v = qEnvironmentVariableIntValue("QT_ETNAVIV2D_DEBUG"); return v >= 2; }
+inline bool enabled() { return etnaConfig().debug >= 2; }
 inline long long nowNs() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000000000LL + t.tv_nsec; }
 
 inline void add(Id i, long long ns = 0, long long n = 1)

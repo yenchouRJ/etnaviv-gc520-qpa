@@ -29,13 +29,9 @@ if [ "$TAG" = all ]; then
 	run base          X=1
 	run fmt_rgb565    QT_ETNA2D_FMT=rgb565
 	run fmt_xrgb8888  QT_ETNA2D_FMT=xrgb8888
-	run ring_rgb565   QT_ETNA2D_RING_FMT=rgb565
 	run cached        QT_ETNA2D_CACHED=1
 	run text_cpu      QT_ETNA2D_GPU_TEXT=0
-	run opacity_cpu   QT_ETNA2D_GPU_OPACITY=0
 	run full_flush    QT_ETNA2D_FULL_FLUSH=1
-	run no_represent  QT_ETNA2D_NO_REPRESENT=1
-	run no_submit_end QT_ETNA2D_SUBMIT_ON_END=0
 	run no_batch      QT_ETNAVIV2D_NO_BATCH=1
 	exit 0
 fi
@@ -43,7 +39,7 @@ fi
 start_weston
 SURF=2000
 if [ "$BG" = 1 ]; then     # primary client: same plugin, idle, default format, so the primary plane scans out 1080p
-	( env -u QT_ETNA2D_FMT -u QT_ETNA2D_RING_FMT QT_QPA_PLATFORM=etnaviv2d:plane=wayland QT_IVI_SURFACE_ID=1000 QT2D_FPS=1 \
+	( env -u QT_ETNA2D_FMT QT_QPA_PLATFORM=etnaviv2d:plane=wayland QT_IVI_SURFACE_ID=1000 QT2D_FPS=1 \
 	  $BIN --clip --stage-secs 600 --sprites 1 >/tmp/ddr_bg.log 2>&1 ) &
 	BGP=$!; sleep 3
 fi
@@ -69,6 +65,6 @@ kill -9 $(pidof qt2dbench) 2>/dev/null; sleep 1
 CPU=$(awk -v t=$((T1-T0)) -v i=$((I1-I0)) 'BEGIN{printf "%.0f", 100*(t-i)/t}')
 DT=$((AT1-AT0)); [ $DT -le 0 ] && DT=1
 bw() { awk -v n=$(( ($1-$2) & 0xFFFFFFFF )) -v d=$DT 'BEGIN{printf "%.0f", n*16/1e6/(d/100)}'; }
-LINE="DDRRESULT tag=$TAG fmt=${QT_ETNA2D_FMT:-argb8888} ring=${QT_ETNA2D_RING_FMT:-follow} cpu_sys_pct=$CPU uf_primary_steady=$SUP/$SP uf_overlay_steady=$SUO/$SP uf_primary_all=$UP/$POLLS axi_pri_rd_MBps=$(bw $AV1 $AV0) axi_ovl_rd_MBps=$(bw $AO1 $AO0) disp_fps=$(awk -v n=$(( (AF1-AF0) & 0xFFFFFFFF )) -v d=$DT 'BEGIN{printf "%.1f", n/(d/100)}') sprites=$SPRITES pace=${QT2D_FPS:-0} bg=$BG env=\"$(env | grep -E '^QT_ETNA' | tr '\n' ' ')\""
+LINE="DDRRESULT tag=$TAG fmt=${QT_ETNA2D_FMT:-argb8888} cpu_sys_pct=$CPU uf_primary_steady=$SUP/$SP uf_overlay_steady=$SUO/$SP uf_primary_all=$UP/$POLLS axi_pri_rd_MBps=$(bw $AV1 $AV0) axi_ovl_rd_MBps=$(bw $AO1 $AO0) disp_fps=$(awk -v n=$(( (AF1-AF0) & 0xFFFFFFFF )) -v d=$DT 'BEGIN{printf "%.1f", n/(d/100)}') sprites=$SPRITES pace=${QT2D_FPS:-0} bg=$BG env=\"$(env | grep -E '^QT_ETNA' | tr '\n' ' ')\""
 echo "$LINE"; echo "$LINE" >> "$OUT/ddr_bench.log"
 [ -n "$BGP" ] && kill -9 $(pidof qt2dbench) 2>/dev/null

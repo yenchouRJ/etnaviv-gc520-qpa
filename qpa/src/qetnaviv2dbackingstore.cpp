@@ -20,6 +20,7 @@
 #include "qetnaviv2dbackingstore.h"
 #include "qetnaviv2dwaylandtransport.h"
 #include "qetnaviv2dstats.h"
+#include "qetnaviv2dconfig.h"
 
 #include <QDebug>
 #include <QTimer>
@@ -30,14 +31,8 @@
 
 QT_BEGIN_NAMESPACE
 
-static bool bsDebug()
-{
-    static int v = qEnvironmentVariableIntValue("QT_ETNAVIV2D_DEBUG");
-    return v > 0;
-}
-
-#define BS_DBG  if (bsDebug()) qDebug() << "[etnaviv2d|backingstore]"
-#define BS_WARN qWarning() << "[etnaviv2d|backingstore]"
+#define BS_DBG  ETNA_LOG_DBG("backingstore")
+#define BS_WARN ETNA_LOG_WARN("backingstore")
 
 /* -----------------------------------------------------------------------
  * Construction / destruction
@@ -49,7 +44,7 @@ QEtnaviv2dBackingStore::QEtnaviv2dBackingStore(QWindow *window,
     , m_screen(screen)
     , m_transport(transport)
 {
-    m_fullFlush = qEnvironmentVariableIntValue("QT_ETNA2D_FULL_FLUSH") > 0;
+    m_fullFlush = etnaConfig().fullFlush;
     if (m_transport) {
         m_transport->setReleaseHook([this]() { presentPending(); });
     } else if (m_screen && m_screen->asyncFlip()) {
@@ -114,7 +109,7 @@ void QEtnaviv2dBackingStore::resize(const QSize &size,
  * backing store everywhere, not only inside the damage region.  Slow (reads WC memory). */
 static void verifyTarget(etna2d_surface *src, etna2d_surface *dst, const char *what)
 {
-    static int en = qEnvironmentVariableIntValue("QT_ETNA2D_VERIFY_FLUSH");
+    const bool en = etnaConfig().verifyFlush;
     if (!en || etna2d_surface_format(src) != etna2d_surface_format(dst))
         return;
     const uchar *a = static_cast<const uchar *>(etna2d_surface_map(src));
@@ -217,7 +212,7 @@ void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
          * mode change) unless QT_IVI_GEOMETRY pins it.  Done here, at present time, so a window
          * that is resized several times before painting costs one reallocation. */
         {
-            static const bool pinned = !qEnvironmentVariableIsEmpty("QT_IVI_GEOMETRY");
+            const bool pinned = etnaConfig().iviPinned;
             const QSize want(m_pmdata->width(), m_pmdata->height());
             if (!pinned && window() && window()->type() == Qt::Window
                     && !want.isEmpty() && m_transport->ringSize() != want) {
@@ -228,7 +223,7 @@ void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
                 }
             }
         }
-        static const int testDrop = qEnvironmentVariableIntValue("QT_ETNA2D_TEST_DROP");
+        const int testDrop = etnaConfig().testDrop;
         static int flushCount = 0;
         etna2d_surface *ringBo = (testDrop > 0 && ++flushCount % testDrop == 0) ? nullptr
                                                                            : m_transport->currentBo();
@@ -301,7 +296,7 @@ void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
     /* Step 8: non-blocking flip.  While the previous flip is in flight the back buffer is not
      * ours; keep the damage (like a full Wayland ring) and present from the flip-done hook. */
     if (m_screen->asyncFlip()) {
-        static const int testDrop = qEnvironmentVariableIntValue("QT_ETNA2D_TEST_DROP");
+        const int testDrop = etnaConfig().testDrop;
         static int flushCount = 0;
         const bool fake = testDrop > 0 && ++flushCount % testDrop == 0;
         if (fake || m_screen->flipBusy()) {
@@ -350,8 +345,7 @@ void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
 
 void QEtnaviv2dBackingStore::presentPending()
 {
-    static const bool off = qEnvironmentVariableIntValue("QT_ETNA2D_NO_REPRESENT") > 0; /* A/B: old behaviour */
-    if (off || !m_dropped || !window())
+    if (!m_dropped || !window())
         return;
     EtnaStats::add(EtnaStats::RelPresent);
     BS_DBG << "presenting frame dropped earlier (ring slot available)";
