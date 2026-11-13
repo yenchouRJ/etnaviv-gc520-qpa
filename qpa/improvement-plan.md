@@ -231,6 +231,41 @@ Today the size is read once at connect (`wl_output.mode` after two roundtrips, `
 - **Behaviour change:** the ring is now the top-level window size, not the output size (with `QT_IVI_GEOMETRY` unset). A non-fullscreen window gets a ring and ivi surface of its own size. A short-lived 640x480 ring appears at start before a widget goes fullscreen (cost: one extra allocation).
 - **Not done:** `wl_output.scale`, multiple outputs, a real Weston mode switch (only injected), rotation of an existing window.
 
+## Step 8: Direct KMS alignment (fixed screen, no live modeset)
+Scope decisions (user): the screen is fixed; no live modeset or hotplug. Screen size comes from the connector's preferred mode at startup (no hardcoded size; `QT_IVI_GEOMETRY` is a Wayland-only override and is ignored here). Primary plane and overlay plane are both implemented and tested on the shared code, but only the primary plane is exposed/documented. The self-made composite mode (video on primary + UI on overlay) is not exposed and not touched: the only compositor is Weston, so composite code stays as is (no new work, no regression gate). Wayland stays the primary path.
+
+### 8.0 Baseline (before any change)
+- Stop Weston on the board (DRM master), run primary plane: `QT_QPA_PLATFORM=etnaviv2d` (plane unset = primary) with `qt2dbench --matrix`, `--clip`, `--damage` + `QT_ETNA2D_VERIFY_FLUSH=1`, `--threads`, `--resize`, and `test_kms_thread`, `test_screen`. Same with `QT_ETNAVIV2D_PLANE=overlay`.
+- Save raw output to `qpa/results/step8-kms-baseline-*.txt`. Record what already fails (KMS has not run since Step 3).
+- Add counters like the Wayland ones: flips presented, flips deferred, `ETNAFINAL pending_drop=`.
+- Pass: baseline recorded, no crash; known failures listed.
+
+### 8.1 Non-blocking flip (the deferred part of Step 4)
+- `pageFlip()` commits `NONBLOCK | PAGE_FLIP_EVENT` and returns; no `select()` while holding `m_flipMutex`.
+- A `QSocketNotifier` on the card fd (GUI thread) runs `drmHandleEvent`; the flip handler clears `m_flipPending`, swaps front/back, then calls the backing store `presentPending()`.
+- `flush()` while a flip is pending: damage already accumulated by `takeDamage`; set `m_dropped` and return (same as Wayland ring-full). One pending frame at most. With the 2-buffer scanout the blit target is the back buffer, which is not on screen, so it is only the flip commit that is deferred; the back buffer must not be blitted again while its flip is pending (that would tear): defer the whole flush, not only the commit.
+- Keep: `m_shuttingDown` guard, `EINTR` on teardown (drain/cancel the notifier, wait the last event once in the destructor), render-thread flushes (mutex), `QT_ETNA2D_NO_REPRESENT` A/B.
+- Composite-only code (video staging, release callback) is not changed in behaviour; it must still compile and the legacy blocking wait may stay for that mode only.
+- Test: `--damage` with `QT_ETNA2D_TEST_DROP` and `VERIFY_FLUSH` (bad=0), idle-tail check `pending_drop=0`, `--clip` paced 60 fps (frame time variance, no GUI block: CPU time in `select` ~ 0), 5 min soak without tearing/stuck frame (visual).
+- Pass: no GUI-thread block on vblank, no stuck frame, fps >= baseline.
+
+### 8.2 Fixed screen policy
+- Screen geometry = connector mode, read once, no constants. Verify no remaining literal sizes in `qetnaviv2dscreen.cpp` / integration for the KMS path.
+- Fullscreen/maximised windows already follow it (`resizeMaximizedWindows`). A smaller top-level keeps its own backing store size and is blitted at (0,0) of the scanout buffer; the rest of the buffer is cleared once at allocation (no stale garbage). A larger window is clipped to the scanout size. Document it; no ring-like resize.
+- Test: `--resize` in KMS mode (window size cycles, scanout stays fixed): no crash, no fd/BO leak, `VERIFY_FLUSH` bad=0 (verify compares the visible rect only).
+
+### 8.3 Formats and planes
+- Run the 16-bit scanout formats (`QT_ETNA2D_FMT=rgb565`, `argb4444`) on primary and overlay: modeset accepted, `--matrix` with `QT2D_MATRIX_TOL`, visual check.
+- Overlay plane: alpha format required (argb); primary default stays xrgb8888. Overlay is exercised by the same tests but over a Weston-less black primary; it stays unexposed.
+- Primary-plane underflow poll with the overlay at 32 bpp (the unmeasured Step 3 pass item) is dropped: overlay is not exposed, so only the primary-alone case is measured.
+
+### 8.4 Wrap-up
+- Add the KMS gate to `reminder.md` / README of `qpa` (Weston stopped, commands, expected: `--matrix` 52/2, `--threads` PASS, `--damage` bad=0, `pending_drop=0`).
+- Update this plan (results table), tracking row, and the Step 4 "KMS deferred" note. Commit per sub-step (8.0 baseline, 8.1, 8.2/8.3 docs+tests).
+
+### Out of scope
+Live modeset / hotplug / mode change, multiple connectors, composite mode changes, plane scaling or rotation, `wl_output.scale`.
+
 ## Tracking
 | Step | Status | fps / metric before | after | commit |
 |---|---|---|---|---|
@@ -243,3 +278,4 @@ Today the size is read once at connect (`wl_output.mode` after two roundtrips, `
 | 5b | done (opacity + text on the DE) | opacity full 66 ms, text 113 glyphs 2.5 ms | 8.7 ms, 1.3 ms | see git log |
 | 6 | done (mutex, KMS fmt, 16-bit tests, wl_output default; no live resize) | threads untested | --threads PASS | see git log |
 | 7 | done (live output/window resize; QtWayland migration dropped) | ring fixed at connect | follows window/output, --resize PASS | see git log |
+| 8 | todo (direct KMS: baseline, non-blocking flip, fixed screen, formats; primary+overlay, no composite) | KMS blocks a vblank per flush, not run since Step 3 | | |
