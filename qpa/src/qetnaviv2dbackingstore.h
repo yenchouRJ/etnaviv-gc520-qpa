@@ -60,6 +60,11 @@ private:
     void    blitRegion(etna2d_context *ctx, etna2d_surface *src, etna2d_surface *dst,
                        const QRegion &r);
 
+    /* Shared by the Wayland and KMS present paths. */
+    void    deferFrame(const QRegion &region, const QRect &bounds, bool retryFromLoop);
+    bool    blitToTarget(EtnaBlittable *src, etna2d_surface *target, const QRegion &region,
+                         const QRect &bounds, const char *what, QRegion *copied);  /* damage -> blit -> finish -> verify */
+
     void presentPending();                 /* Step 4: present a frame dropped for lack of a free ring slot */
     bool m_dropped = false;                /* flush() was dropped; the stale regions are waiting */
     bool m_retryQueued = false;

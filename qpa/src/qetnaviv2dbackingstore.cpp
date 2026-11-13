@@ -184,14 +184,68 @@ void QEtnaviv2dBackingStore::blitRegion(etna2d_context *ctx, etna2d_surface *src
 }
 
 /* -----------------------------------------------------------------------
- * flush — blit backing BO → target back-buffer, then page-flip or commit
+ * Present helpers shared by the Wayland and KMS paths
+ * ----------------------------------------------------------------------- */
+
+/* The target buffer is not available (ring full / flip pending): the backing store already holds
+ * the pixels, so remember the region as stale for every target and present it from the next
+ * release / flip-done event.  retryFromLoop: no event will come (QT_ETNA2D_TEST_DROP), so retry
+ * from the event loop. */
+void QEtnaviv2dBackingStore::deferFrame(const QRegion &region, const QRect &bounds, bool retryFromLoop)
+{
+    EtnaStats::add(EtnaStats::DroppedFrames);
+    accumulateStale(region, bounds);
+    m_dropped = true;
+    if (retryFromLoop && !m_retryQueued) {
+        m_retryQueued = true;
+        QTimer::singleShot(0, [this]() { m_retryQueued = false; presentPending(); });
+    }
+    BS_DBG << "flush: target busy, frame deferred";
+}
+
+/* Copy what 'target' is missing (damage tracking) from the backing surface and wait for the GPU.
+ * *copied gets the copied region (may be empty); false if the GPU wait failed. */
+bool QEtnaviv2dBackingStore::blitToTarget(EtnaBlittable *src, etna2d_surface *target,
+                                          const QRegion &region, const QRect &bounds,
+                                          const char *what, QRegion *copied)
+{
+    etna2d_context *ctx         = src->context();
+    etna2d_surface *backingSurf = src->surface();
+
+    /* Drain CPU writes + GPU fence for any raster-fallback ops. */
+    src->unlock();
+
+    /* Only what this target is missing: it lags the backing store by the regions flushed since it
+     * was last written, so no ghosting. */
+    const QRegion damage = takeDamage(target, region, bounds);
+    BS_DBG << "flush(" << what << "): blit" << damage.boundingRect() << "(" << damage.rectCount()
+           << "rects) ->" << target;
+    {
+        EtnaStats::Scope _t(EtnaStats::FlushBlit);
+        blitRegion(ctx, backingSurf, target, damage);
+    }
+    {
+        EtnaStats::Scope _tf(EtnaStats::FlushFinish);
+        if (etna2d_finish(ctx) != ETNA2D_OK) {
+            BS_WARN << "flush(" << what << "): etna2d_finish failed";
+            m_stale.remove(target);      /* contents unknown: fully stale again */
+            return false;
+        }
+    }
+    verifyTarget(backingSurf, target, what);
+    *copied = damage;
+    return true;
+}
+
+/* -----------------------------------------------------------------------
+ * flush — blit backing BO → target buffer, then commit / page-flip
  * ----------------------------------------------------------------------- */
 void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
                                    const QRegion &region,
                                    const QPoint  &offset)
 {
     QMutexLocker _etnaLock(&etnaCtxMutex());   /* shared GC520 queue (Step 6) */
-    Q_UNUSED(offset); /* offset is always (0,0) for full-screen QFbScreen */
+    Q_UNUSED(offset); /* always (0,0): the backing store is the whole window */
 
     if (!m_pmdata || !m_pmdata->etnaBlittable()) {
         BS_WARN << "flush: no backing blittable";
@@ -199,91 +253,48 @@ void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
     }
 
     EtnaBlittable *blitter      = m_pmdata->etnaBlittable();
-    etna2d_context *ctx         = blitter->context();
     etna2d_surface *backingSurf = blitter->surface();
     struct FrameEnd { ~FrameEnd() { if (EtnaStats::enabled()) EtnaStats::report(); } } _fe;
     EtnaStats::add(EtnaStats::Frames);
 
+    /* QT_ETNA2D_TEST_DROP=N (test): behave as if the target were busy on every Nth flush. */
+    static int flushCount = 0;
+    const int testDrop = etnaConfig().testDrop;
+    const bool fakeBusy = testDrop > 0 && ++flushCount % testDrop == 0;
+
     /* ---- Wayland mode: blit into the ring BO, hand off to transport ---- */
     if (m_transport) {
-        /* QT_ETNA2D_TEST_DROP=N (debug): behave as if the ring were full on every Nth flush,
-         * to exercise the damage accumulation of dropped frames. */
         /* Step 7: the ring follows the top-level window size (resize(), showFullScreen(), output
          * mode change) unless QT_IVI_GEOMETRY pins it.  Done here, at present time, so a window
          * that is resized several times before painting costs one reallocation. */
-        {
-            const bool pinned = etnaConfig().iviPinned;
-            const QSize want(m_pmdata->width(), m_pmdata->height());
-            if (!pinned && window() && window()->type() == Qt::Window
-                    && !want.isEmpty() && m_transport->ringSize() != want) {
-                m_stale.clear();   /* new ring surfaces: every target is fully stale */
-                if (!m_transport->resizeRing(want)) {
-                    BS_WARN << "flush(wayland): ring resize to" << want << "failed";
-                    return;
-                }
-            }
-        }
-        const int testDrop = etnaConfig().testDrop;
-        static int flushCount = 0;
-        etna2d_surface *ringBo = (testDrop > 0 && ++flushCount % testDrop == 0) ? nullptr
-                                                                           : m_transport->currentBo();
-        if (!ringBo) {
-            /* All ring slots are in use — Weston hasn't released any yet.
-             * Drop the frame (back-pressure): Qt will repaint on the next
-             * frame callback when a slot is released. */
-            EtnaStats::add(EtnaStats::DroppedFrames);
-            accumulateStale(region, QRect(0, 0, m_pmdata->width(), m_pmdata->height()));
-            /* Do not lose the frame: the backing store already holds it, only the ring
-             * slot is missing.  Present it when Weston releases a slot (wl_buffer.release);
-             * if no slot is held (only in the QT_ETNA2D_TEST_DROP test) retry from the
-             * event loop. */
-            m_dropped = true;
-            if (!m_transport->ringBusy() && !m_retryQueued) {
-                m_retryQueued = true;
-                QTimer::singleShot(0, [this]() { m_retryQueued = false; presentPending(); });
-            }
-            BS_DBG << "flush: wayland ring full — dropping frame (back-pressure)";
-            return;
-        }
-
-        /* 1. Unlock backing surface */
-        blitter->unlock();
-
-        /* 2. GPU blit only what this ring slot is missing (damage tracking) */
-        const QRect bounds(0, 0, etna2d_surface_width(backingSurf), etna2d_surface_height(backingSurf));
-        const QRegion damage = takeDamage(ringBo, region, bounds);
-        BS_DBG << "flush(wayland): blit" << damage.boundingRect() << "(" << damage.rectCount()
-               << "rects) -> ring BO" << ringBo;
-        {
-            EtnaStats::Scope _t(EtnaStats::FlushBlit);
-            blitRegion(ctx, backingSurf, ringBo, damage);
-        }
-
-        /* 3. Wait for GPU blit */
-        {
-            EtnaStats::Scope _tf(EtnaStats::FlushFinish);
-            if (etna2d_finish(ctx) != ETNA2D_OK) {
-                BS_WARN << "flush(wayland): etna2d_finish failed";
+        const QSize want(m_pmdata->width(), m_pmdata->height());
+        if (!etnaConfig().iviPinned && window() && window()->type() == Qt::Window
+                && !want.isEmpty() && m_transport->ringSize() != want) {
+            m_stale.clear();   /* new ring surfaces: every target is fully stale */
+            if (!m_transport->resizeRing(want)) {
+                BS_WARN << "flush(wayland): ring resize to" << want << "failed";
                 return;
             }
         }
-
-        verifyTarget(backingSurf, ringBo, "wayland");
-
-        /* 4. Hand off to transport — frame-callback will commit */
+        const QRect bounds(0, 0, etna2d_surface_width(backingSurf), etna2d_surface_height(backingSurf));
+        etna2d_surface *ringBo = fakeBusy ? nullptr : m_transport->currentBo();
+        if (!ringBo) {
+            /* All ring slots are held by Weston: present from wl_buffer.release (Step 4). */
+            deferFrame(region, bounds, /*retryFromLoop=*/!m_transport->ringBusy());
+            return;
+        }
+        QRegion damage;
+        if (!blitToTarget(blitter, ringBo, region, bounds, "wayland", &damage))
+            return;
         m_dropped = false;
-        m_transport->commitFrame(ringBo, damage);
+        m_transport->commitFrame(ringBo, damage);   /* frame callback commits */
         return;
     }
 
-    /* ---- KMS modes: existing path ---- */
+    /* ---- KMS: blit into the back scanout buffer, flip ---- */
     etna2d_surface *scanoutBack = m_screen->backSurface();
-
     if (!scanoutBack) {
-        /* isStub() with no transport — shouldn't happen after Milestone B,
-         * but guard it just in case. */
-        if (!m_screen->isStub())
-            BS_WARN << "flush: no scanout back surface";
+        BS_WARN << "flush: no scanout back surface";
         return;
     }
 
@@ -293,50 +304,18 @@ void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
                              .intersected(QRect(0, 0, etna2d_surface_width(scanoutBack),
                                                       etna2d_surface_height(scanoutBack)));
 
-    /* Step 8: non-blocking flip.  While the previous flip is in flight the back buffer is not
-     * ours; keep the damage (like a full Wayland ring) and present from the flip-done hook. */
-    if (m_screen->asyncFlip()) {
-        const int testDrop = etnaConfig().testDrop;
-        static int flushCount = 0;
-        const bool fake = testDrop > 0 && ++flushCount % testDrop == 0;
-        if (fake || m_screen->flipBusy()) {
-            EtnaStats::add(EtnaStats::DroppedFrames);
-            accumulateStale(region, bounds);
-            m_dropped = true;
-            if (fake && !m_retryQueued) {
-                m_retryQueued = true;
-                QTimer::singleShot(0, [this]() { m_retryQueued = false; presentPending(); });
-            }
-            BS_DBG << "flush(KMS): flip pending, deferring";
-            return;
-        }
+    /* Non-blocking flip: while the previous flip is in flight the back buffer is not ours;
+     * present from the flip-done hook. */
+    if (m_screen->asyncFlip() && (fakeBusy || m_screen->flipBusy())) {
+        deferFrame(region, bounds, /*retryFromLoop=*/fakeBusy);
+        return;
     }
 
-    /* 1. Unlock: drain CPU writes + GPU fence for any raster-fallback ops. */
-    blitter->unlock();
+    QRegion damage;
+    if (!blitToTarget(blitter, scanoutBack, region, bounds, "kms", &damage))
+        return;
 
-    /* 2. GPU blit only what this scanout buffer is missing (damage tracking:
-     *    the back buffer lags the backing store by the regions flushed since it
-     *    was last written, so no ghosting). */
-    const QRegion damage = takeDamage(scanoutBack, region, bounds);
-    BS_DBG << "flush(KMS): blit" << damage.boundingRect() << "(" << damage.rectCount() << "rects)";
-    {
-        EtnaStats::Scope _t(EtnaStats::FlushBlit);
-        blitRegion(ctx, backingSurf, scanoutBack, damage);
-    }
-
-    /* 3. Wait for GPU blit to complete before handing the buffer to display. */
-    {
-        EtnaStats::Scope _t(EtnaStats::FlushFinish);
-        if (etna2d_finish(ctx) != ETNA2D_OK) {
-            BS_WARN << "flush(KMS): etna2d_finish failed";
-            return;
-        }
-    }
-
-    verifyTarget(backingSurf, scanoutBack, "kms");
-
-    /* 4. Page-flip (blocks until vblank only with QT_ETNA2D_SYNC_FLIP=1). */
+    /* Blocks until vblank only with QT_ETNA2D_SYNC_FLIP=1. */
     m_dropped = false;
     EtnaStats::Scope _tp(EtnaStats::FlipWait);
     if (m_screen->pageFlip() != 0)
