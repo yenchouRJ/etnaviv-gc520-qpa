@@ -2,7 +2,7 @@
  * qetnaviv2dscreen.h — KMS display screen for the etnaviv2d QPA plugin.
  *
  * Owns the DRM/KMS display side (card0, dumb BOs, page-flip) using the
- * Phase-3 kms_display helper.  Reuses QFbScreen for the window-stack
+ * DRM/KMS atomic API.  Reuses QFbScreen for the window-stack
  * and damage-tracking scaffolding; overrides doRedraw() to suppress
  * QFbScreen's software compositing (our backing-store flush() drives
  * all scanout updates directly).
@@ -10,7 +10,7 @@
  * Double-buffer state: two dumb BOs on card0 → PRIME-exported → imported
  * into etnaviv as etna2d_surface*.  The backing store renders into an
  * independent offscreen surface then etna2d_blit()s into the back scanout
- * BO before flipping (option B, decided in plan.md).
+ * BO before flipping.
  *
  * Thread safety: all KMS calls are serialised by m_flipMutex.  pageFlip()
  * may be called from a render thread (QT_THREADED_PAINTING=1); the mutex
@@ -41,10 +41,10 @@ static constexpr int KMS_NUM_BUFS = 2; /* double buffer */
 enum class PlaneMode {
     Primary,   /* PRIMARY plane, full-screen opaque (default)                    */
     Overlay,   /* OVERLAY plane, ARGB8888, SRC_OVER blend                        */
-    Wayland,   /* handoff stub — no DRM master, no modeset                       */
+    Wayland,   /* Weston client — no DRM master, no modeset                      */
 };
 
-/* Minimal scanout framebuffer descriptor (mirrors kms_display's kms_fb). */
+/* Minimal scanout framebuffer descriptor . */
 struct EtnaKmsFb {
     uint32_t fb_id  = 0;
     uint32_t handle = 0;
@@ -165,7 +165,7 @@ private:
     etna2d_device  *m_etnadev;
     bool            m_ownsKfd    = true;  /* false when sharedKfd was provided */
 
-    /* KMS state (replicated from kms_display internals for Qt integration). */
+    /* KMS state . */
     int             m_kfd         = -1;
     uint32_t        m_connId      = 0;
     uint32_t        m_crtcId      = 0;

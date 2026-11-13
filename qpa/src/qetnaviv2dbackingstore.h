@@ -1,7 +1,7 @@
 /*
  * qetnaviv2dbackingstore.h — QPlatformBackingStore for the etnaviv2d plugin.
  *
- * Strategy (option B, decided in plan.md):
+ * Strategy :
  *  - paintDevice() returns a QPixmap backed by an EtnaBlittablePlatformPixmap
  *    (an offscreen GPU surface).  Qt paints into it via QBlitterPaintEngine.
  *  - flush() blits the offscreen backing BO into the current target back-buffer

@@ -284,6 +284,14 @@ Board: kernel 6.6.93, Weston killed, `QT_QPA_PLATFORM=etnaviv2d` (primary) and `
 - **Gate (Weston stopped):** `killall weston; export QT_QPA_PLATFORM=etnaviv2d; ./qt2dbench --matrix` (52), `--threads` (PASS), `--resize` (PASS), `QT_ETNA2D_VERIFY_FLUSH=1 QT_ETNA2D_TEST_DROP=3 ./qt2dbench --damage` (no `VERIFY FAIL`), `QT_ETNAVIV2D_DEBUG=2` for `ETNAFINAL pending_drop=0`. Restart Weston afterwards (see Wayland run line).
 - **Not done:** composite mode (not exposed), live modeset, visual confirmation of the 16-bit scanout, the old underflow poll.
 
+## Cleanup before porting to main (done on `opt`)
+- Removed `ETNAVIV2D_LEGACY_KMS` (build option, `drmModeSetCrtc` path) and the self-made composite plane mode (`attachPrimaryFb`, release callback, D12 video-present path). `pageFlip()` is now one atomic path: event-driven by default, blocking with `QT_ETNA2D_SYNC_FLIP=1`.
+- One `qetnaviv2dconfig.h`: every switch is read once (`etnaConfig()`), one set of log macros (`ETNA_LOG_*`, `QT_ETNAVIV2D_DEBUG` cached; the per-call env read in the integration and Wayland logs is gone). The header comment lists every variable.
+- Variables dropped (fixed behaviour): `QT_ETNA2D_MIN_*` (always GPU), `QT_ETNA2D_RING_FMT` (ring follows `QT_ETNA2D_FMT`), `QT_ETNA2D_GPU_OPACITY` (GPU), `QT_ETNA2D_SUBMIT_ON_END` (always), `QT_ETNA2D_NO_REPRESENT` (always; `ETNAFINAL pending_drop` guards it).
+- Variables kept: `QT_ETNA2D_FMT`, `_CACHED`, `_GPU_TEXT`, `_FULL_FLUSH`, `_SYNC_FLIP`, `QT_ETNAVIV2D_NO_BATCH`, `QT_ETNAVIV2D_DEBUG` (0/1/2), `QT_IVI_GEOMETRY`, `QT_IVI_SURFACE_ID`, `QT_ETNAVIV2D_PLANE`; test hooks `_VERIFY_FLUSH`, `_TEST_DROP`, `_TEST_OUTPUT`.
+- `flush()`: `deferFrame()` and `blitToTarget()` shared by the Wayland and KMS paths (one drop/defer implementation, one damage-blit-finish-verify sequence).
+- Gate after each commit (Weston and KMS): `--matrix` 52, `--threads` PASS, `--resize` PASS, `--damage` + `VERIFY_FLUSH` + `TEST_DROP=3` no failure and `pending_drop=0`, `--clip` unchanged (KMS ~70 fps, Wayland 1080p ~31 fps).
+
 ## Tracking
 | Step | Status | fps / metric before | after | commit |
 |---|---|---|---|---|

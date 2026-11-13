@@ -182,12 +182,10 @@ QEtnaviv2dScreen::~QEtnaviv2dScreen()
  * ----------------------------------------------------------------------- */
 bool QEtnaviv2dScreen::initialize()
 {
-    /* --- Wayland handoff stub: no DRM master, no modeset.
-     *     The QPA's direct-KMS transport is disabled; a future Weston
-     *     client path switches only this transport, leaving libetna2d/
-     *     EtnaBlittable untouched (D11). --- */
+    /* --- Wayland mode: no DRM master, no modeset.  The Wayland transport owns
+     *     presentation; the geometry below is replaced by the wl_output mode. --- */
     if (m_planeMode == PlaneMode::Wayland) {
-        SCR_INFO << "plane=wayland: handoff stub — no KMS ops";
+        SCR_INFO << "plane=wayland: no KMS ops";
         mGeometry     = QRect(0, 0, 1920, 1080); /* nominal until Weston provides geometry */
         mDepth        = 32;
         mFormat       = QImage::Format_ARGB32_Premultiplied;

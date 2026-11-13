@@ -197,7 +197,7 @@ bool QEtnaviv2dIntegration::initializeHardware()
      *
      * In wayland mode the QPA must NOT open /dev/input directly — Weston is
      * the libinput master (it owns touchscreen calibration etc).  Input will
-     * arrive over wl_seat in Milestone I.  Skip evdev/libinput entirely here. */
+     * arrive over wl_seat via wl_seat.  Skip evdev/libinput entirely here. */
     m_vtHandler.reset(new QFbVtHandler);
 
     if (planeMode != PlaneMode::Wayland &&
@@ -284,7 +284,7 @@ QPlatformBackingStore *QEtnaviv2dIntegration::createPlatformBackingStore(
 QPlatformWindow *QEtnaviv2dIntegration::createPlatformWindow(
         QWindow *window) const
 {
-    /* Milestone I: hand the first top-level window to the transport so it
+    /* Hand the first top-level window to the transport so it
      * can target QWindowSystemInterface input events at it. */
     if (m_waylandTransport && !m_waylandTransport->window())
         m_waylandTransport->setWindow(window);
