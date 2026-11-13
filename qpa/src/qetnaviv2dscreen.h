@@ -144,6 +144,16 @@ public:
      * Thread-safe: serialised by m_flipMutex. */
     int pageFlip(bool videoOnly = false);
 
+    /* Step 8: non-blocking flip (primary / overlay planes; composite keeps the blocking wait).
+     * pageFlip() then returns right after the commit; the flip event (QSocketNotifier on the
+     * card fd, GUI thread) swaps front/back and runs the flip-done hook.  While flipBusy() the
+     * back buffer belongs to the display engine: the backing store must not blit into it. */
+    bool asyncFlip() const { return m_asyncFlip; }
+    bool flipBusy()  const { return m_asyncFlip && m_flipPending; }
+    void setFlipDoneHook(std::function<void()> cb) { m_flipDoneHook = std::move(cb); }
+    int  scanoutWidth()  const { return m_modeInfo.hdisplay; }
+    int  scanoutHeight() const { return m_modeInfo.vdisplay; }
+
     /* Raw DRM fd (for drmHandleEvent poll if needed outside the screen). */
     int drmFd() const { return m_kfd; }
 
@@ -234,6 +244,13 @@ private:
     int             m_frontIdx   = 0;
     int             m_backIdx    = 1;
     volatile int    m_flipPending = 0;
+    bool            m_asyncFlip = false;        /* Step 8: event-driven flip, no wait in pageFlip() */
+    class QSocketNotifier *m_flipNotifier = nullptr;
+    std::function<void()> m_flipDoneHook;
+    void onDrmEvent();
+public:
+    void armFlipNotifier();
+private:
 
     QMutex          m_flipMutex;                /* serialises pageFlip() callers */
     volatile bool   m_shuttingDown = false;     /* set in cleanup(); drops late flushes */

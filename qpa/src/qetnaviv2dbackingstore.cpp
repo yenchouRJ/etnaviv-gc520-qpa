@@ -52,6 +52,9 @@ QEtnaviv2dBackingStore::QEtnaviv2dBackingStore(QWindow *window,
     m_fullFlush = qEnvironmentVariableIntValue("QT_ETNA2D_FULL_FLUSH") > 0;
     if (m_transport) {
         m_transport->setReleaseHook([this]() { presentPending(); });
+    } else if (m_screen && m_screen->asyncFlip()) {
+        m_screen->armFlipNotifier();
+        m_screen->setFlipDoneHook([this]() { presentPending(); });   /* Step 8 */
     }
     BS_DBG << "created for window" << window
            << (transport ? "(wayland mode)" : "(KMS mode)");
@@ -63,6 +66,8 @@ QEtnaviv2dBackingStore::~QEtnaviv2dBackingStore()
 {
     if (m_transport)
         m_transport->setReleaseHook(nullptr);
+    else if (m_screen)
+        m_screen->setFlipDoneHook(nullptr);
     if (EtnaStats::enabled())
         fprintf(stderr, "ETNAFINAL pending_drop=%d (must be 0: a dropped frame was never presented otherwise)\n", int(m_dropped));
     BS_DBG << "destroyed";
@@ -287,13 +292,37 @@ void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
         return;
     }
 
+    /* Fixed screen (Step 8): the scanout is the connector mode; a larger window is clipped to
+     * it, a smaller one leaves the (black-cleared) rest untouched. */
+    const QRect bounds = QRect(0, 0, etna2d_surface_width(backingSurf), etna2d_surface_height(backingSurf))
+                             .intersected(QRect(0, 0, etna2d_surface_width(scanoutBack),
+                                                      etna2d_surface_height(scanoutBack)));
+
+    /* Step 8: non-blocking flip.  While the previous flip is in flight the back buffer is not
+     * ours; keep the damage (like a full Wayland ring) and present from the flip-done hook. */
+    if (m_screen->asyncFlip()) {
+        static const int testDrop = qEnvironmentVariableIntValue("QT_ETNA2D_TEST_DROP");
+        static int flushCount = 0;
+        const bool fake = testDrop > 0 && ++flushCount % testDrop == 0;
+        if (fake || m_screen->flipBusy()) {
+            EtnaStats::add(EtnaStats::DroppedFrames);
+            accumulateStale(region, bounds);
+            m_dropped = true;
+            if (fake && !m_retryQueued) {
+                m_retryQueued = true;
+                QTimer::singleShot(0, [this]() { m_retryQueued = false; presentPending(); });
+            }
+            BS_DBG << "flush(KMS): flip pending, deferring";
+            return;
+        }
+    }
+
     /* 1. Unlock: drain CPU writes + GPU fence for any raster-fallback ops. */
     blitter->unlock();
 
     /* 2. GPU blit only what this scanout buffer is missing (damage tracking:
      *    the back buffer lags the backing store by the regions flushed since it
      *    was last written, so no ghosting). */
-    const QRect bounds(0, 0, etna2d_surface_width(backingSurf), etna2d_surface_height(backingSurf));
     const QRegion damage = takeDamage(scanoutBack, region, bounds);
     BS_DBG << "flush(KMS): blit" << damage.boundingRect() << "(" << damage.rectCount() << "rects)";
     {
@@ -312,7 +341,8 @@ void QEtnaviv2dBackingStore::flush(QWindow * /*window*/,
 
     verifyTarget(backingSurf, scanoutBack, "kms");
 
-    /* 4. Page-flip (blocks until vblank). */
+    /* 4. Page-flip (blocks until vblank only in composite / QT_ETNA2D_SYNC_FLIP mode). */
+    m_dropped = false;
     EtnaStats::Scope _tp(EtnaStats::FlipWait);
     if (m_screen->pageFlip() != 0)
         BS_WARN << "flush(KMS): pageFlip failed";

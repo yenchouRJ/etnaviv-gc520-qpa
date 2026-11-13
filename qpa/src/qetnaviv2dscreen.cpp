@@ -46,6 +46,7 @@
 #include <cstring>
 
 #include <QMutexLocker>
+#include <QSocketNotifier>
 
 #include <drm_fourcc.h>
 #include "qetnaviv2dformat.h"
@@ -578,6 +579,14 @@ bool QEtnaviv2dScreen::initialize()
     }
     mPhysicalSize = QSizeF(mmW, mmH);
 
+#ifndef ETNAVIV2D_LEGACY_KMS
+    /* Step 8: primary / overlay flips are event-driven; composite keeps the blocking wait
+     * (video staging + release callback live inside pageFlip()). QT_ETNA2D_SYNC_FLIP=1 = old
+     * blocking behaviour (A/B). */
+    if (m_planeMode != PlaneMode::Composite && qEnvironmentVariableIntValue("QT_ETNA2D_SYNC_FLIP") == 0) {
+        m_asyncFlip = true;
+    }
+#endif
     return true;
 }
 
@@ -717,6 +726,12 @@ int QEtnaviv2dScreen::pageFlip(bool videoOnly)
     }
 #endif
 
+    if (m_asyncFlip && !videoOnly) {
+        /* Step 8: event-driven.  onDrmEvent() swaps front/back when the flip lands. */
+        SCR_DBG << "pageFlip queued (async)";
+        return 0;
+    }
+
     /* Snapshot the retired primary buffer — the one the DC was scanning before
      * this commit.  After the flip event it is safe to release back to the
      * producer.  m_retiredPrimary was set above before advancing m_onScreenPrimary. */
@@ -775,6 +790,40 @@ int QEtnaviv2dScreen::pageFlip(bool videoOnly)
     return 0;
 }
 
+/* The notifier needs the GUI thread's event dispatcher, which does not exist yet while the
+ * platform integration is created: arm it from the first backing store. */
+void QEtnaviv2dScreen::armFlipNotifier()
+{
+    if (!m_asyncFlip || m_flipNotifier || m_kfd < 0)
+        return;
+    m_flipNotifier = new QSocketNotifier(m_kfd, QSocketNotifier::Read, this);
+    connect(m_flipNotifier, &QSocketNotifier::activated, this, [this]() { onDrmEvent(); });
+}
+
+/* -----------------------------------------------------------------------
+ * onDrmEvent() — card fd readable (GUI thread): flip completed (Step 8).
+ * ----------------------------------------------------------------------- */
+void QEtnaviv2dScreen::onDrmEvent()
+{
+    drmEventContext ev = {};
+    ev.version           = DRM_EVENT_CONTEXT_VERSION;
+    ev.page_flip_handler = flipHandler;
+    bool done = false;
+    {
+        QMutexLocker lock(&m_flipMutex);
+        if (m_shuttingDown)
+            return;
+        const int was = m_flipPending;
+        drmHandleEvent(m_kfd, &ev);
+        if (was && !m_flipPending) {
+            std::swap(m_frontIdx, m_backIdx);
+            done = true;
+        }
+    }
+    if (done && m_flipDoneHook)
+        m_flipDoneHook();
+}
+
 /* -----------------------------------------------------------------------
  * cleanup()
  * ----------------------------------------------------------------------- */
@@ -785,7 +834,10 @@ void QEtnaviv2dScreen::cleanup()
          * release the mutex before we tear down KMS state under it. */
         QMutexLocker lock(&m_flipMutex);
         m_shuttingDown = true;
+        m_flipDoneHook = nullptr;
     }
+    delete m_flipNotifier;
+    m_flipNotifier = nullptr;
 
 #ifdef ETNAVIV2D_LEGACY_KMS
     /* Restore saved CRTC (legacy). */

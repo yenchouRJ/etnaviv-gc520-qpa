@@ -266,6 +266,24 @@ Scope decisions (user): the screen is fixed; no live modeset or hotplug. Screen 
 ### Out of scope
 Live modeset / hotplug / mode change, multiple connectors, composite mode changes, plane scaling or rotation, `wl_output.scale`.
 
+### Step 8 results (done)
+Board: kernel 6.6.93, Weston killed, `QT_QPA_PLATFORM=etnaviv2d` (primary) and `QT_ETNAVIV2D_PLANE=overlay`, 1920x1080 mode read from the connector (no constants in the KMS path).
+
+- **8.0 baseline (blocking flip):** `--matrix` 52/2 match, `--damage` 1080p 63 fps (vblank bound), `--threads` PASS, `--resize` PASS (fds 18 -> 18), `--clip` 16 sprites 29.1 fps; overlay `--damage` 58 fps. KMS works on this kernel (it had not been run since Step 3).
+- **8.1 non-blocking flip:** `pageFlip()` commits `NONBLOCK | PAGE_FLIP_EVENT` and returns; a `QSocketNotifier` (armed by the first backing store, because it needs the GUI event dispatcher) calls `onDrmEvent()`: it swaps front/back and runs the flip-done hook, which calls `presentPending()`. `flush()` while a flip is pending accumulates the stale region, sets `m_dropped` and returns without touching the back buffer. `QT_ETNA2D_TEST_DROP` works on KMS too. `QT_ETNA2D_SYNC_FLIP=1` restores the blocking wait (A/B). Composite mode keeps the blocking path unchanged (not exposed).
+
+| 1080p `--damage`, primary | blocking | non-blocking |
+|---|---|---|
+| GUI time in flip wait, ms per second | 150 (19 flips) | 4.5 (20 flips) |
+| `--clip` 16 sprites fps | 29.1 | 69.1 |
+| `--damage` app loops/s (unpaced) | 63 | 300 |
+
+  `VERIFY_FLUSH` bad=0 with `QT_ETNA2D_TEST_DROP` 0/2/3 (primary) and 3 (overlay; the verify read of the WC scanout BO is slow, 9 fps); `ETNAFINAL pending_drop=0`; `--matrix` 52/2; `--threads` PASS; `--resize` PASS.
+- **8.2 fixed screen:** the flush clips the damage to scanout size (a larger window cannot blit outside the buffer); a smaller window shows at (0,0) over the black-cleared scanout. `--resize` in KMS mode: PASS, `VERIFY_FLUSH` no failure.
+- **8.3 formats:** `QT_ETNA2D_FMT=rgb565` and `argb4444` accepted on primary and overlay (modeset ok, no warning, `--damage` runs). Not verified by `VERIFY_FLUSH` (scanout format differs from the 32-bit backing store, the check skips); visual check still to do by eye.
+- **Gate (Weston stopped):** `killall weston; export QT_QPA_PLATFORM=etnaviv2d; ./qt2dbench --matrix` (52), `--threads` (PASS), `--resize` (PASS), `QT_ETNA2D_VERIFY_FLUSH=1 QT_ETNA2D_TEST_DROP=3 ./qt2dbench --damage` (no `VERIFY FAIL`), `QT_ETNAVIV2D_DEBUG=2` for `ETNAFINAL pending_drop=0`. Restart Weston afterwards (see Wayland run line).
+- **Not done:** composite mode (not exposed), live modeset, visual confirmation of the 16-bit scanout, the old underflow poll.
+
 ## Tracking
 | Step | Status | fps / metric before | after | commit |
 |---|---|---|---|---|
@@ -278,4 +296,4 @@ Live modeset / hotplug / mode change, multiple connectors, composite mode change
 | 5b | done (opacity + text on the DE) | opacity full 66 ms, text 113 glyphs 2.5 ms | 8.7 ms, 1.3 ms | see git log |
 | 6 | done (mutex, KMS fmt, 16-bit tests, wl_output default; no live resize) | threads untested | --threads PASS | see git log |
 | 7 | done (live output/window resize; QtWayland migration dropped) | ring fixed at connect | follows window/output, --resize PASS | see git log |
-| 8 | todo (direct KMS: baseline, non-blocking flip, fixed screen, formats; primary+overlay, no composite) | KMS blocks a vblank per flush, not run since Step 3 | | |
+| 8 | done (direct KMS: non-blocking flip, fixed screen, primary+overlay) | GUI blocked 150 ms/s in flip wait; --clip 29 fps | 4.5 ms/s; --clip 69 fps | see git log |
