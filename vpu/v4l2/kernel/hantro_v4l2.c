@@ -234,6 +234,9 @@ static int vidioc_enum_fmt(struct file *file, void *priv,
 	skip_mode_none = capture == ctx->is_encoder;
 
 	formats = hantro_get_formats(ctx, &num_fmts, HANTRO_AUTO_POSTPROC);
+	/* With the post-processor forced on, only post-processed raw formats */
+	if (capture && !ctx->is_encoder && ctx->need_postproc)
+		num_fmts = 0;
 	for (i = 0; i < num_fmts; i++) {
 		bool mode_none = formats[i].codec_mode == HANTRO_MODE_NONE;
 		fmt = &formats[i];
@@ -441,6 +444,10 @@ hantro_reset_raw_fmt(struct hantro_ctx *ctx, int bit_depth, bool need_postproc)
 	const struct hantro_fmt *raw_vpu_fmt;
 	struct v4l2_pix_format_mplane raw_fmt, *encoded_fmt;
 	int ret;
+
+	if (!ctx->is_encoder && ctx->dev->variant->force_postproc &&
+	    *ctx->dev->variant->force_postproc)
+		need_postproc = HANTRO_FORCE_POSTPROC;
 
 	raw_vpu_fmt = hantro_get_default_fmt(ctx, false, bit_depth, need_postproc);
 	if (!raw_vpu_fmt)

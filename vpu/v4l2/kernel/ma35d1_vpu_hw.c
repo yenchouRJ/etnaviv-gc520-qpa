@@ -21,6 +21,31 @@ static bool ma35d1_soft_reset;
 module_param_named(ma35d1_soft_reset, ma35d1_soft_reset, bool, 0644);
 MODULE_PARM_DESC(ma35d1_soft_reset, "Write swreg101 soft reset on ctx reset (default 0)");
 
+/*
+ * Test aid for the post-processor work (pp/plan.md T2): route every decode
+ * through the PP at 1:1 so its output can be compared with the native one.
+ * Takes effect on the next open of the video device.
+ */
+static bool ma35d1_force_pp;
+module_param_named(ma35d1_force_pp, ma35d1_force_pp, bool, 0644);
+MODULE_PARM_DESC(ma35d1_force_pp, "Run the decoder through the post-processor (default 0)");
+
+static const struct hantro_fmt ma35d1_vpu_postproc_fmts[] = {
+	{
+		.fourcc = V4L2_PIX_FMT_NV12,
+		.codec_mode = HANTRO_MODE_NONE,
+		.postprocessed = true,
+		.frmsize = {
+			.min_width = FMT_MIN_WIDTH,
+			.max_width = FMT_FHD_WIDTH,
+			.step_width = MB_DIM,
+			.min_height = FMT_MIN_HEIGHT,
+			.max_height = FMT_FHD_HEIGHT,
+			.step_height = MB_DIM,
+		},
+	},
+};
+
 static const struct hantro_fmt ma35d1_vpu_fmts[] = {
 	{
 		.fourcc = V4L2_PIX_FMT_NV12,
@@ -113,6 +138,10 @@ static const char * const ma35d1_vpu_clk_names[] = { "vpu" };
 const struct hantro_variant ma35d1_vpu_variant = {
 	.dec_fmts = ma35d1_vpu_fmts,
 	.num_dec_fmts = ARRAY_SIZE(ma35d1_vpu_fmts),
+	.postproc_fmts = ma35d1_vpu_postproc_fmts,
+	.num_postproc_fmts = ARRAY_SIZE(ma35d1_vpu_postproc_fmts),
+	.postproc_ops = &hantro_g1_postproc_ops,
+	.force_postproc = &ma35d1_force_pp,
 	.codec = HANTRO_H264_DECODER,
 	.codec_ops = ma35d1_vpu_codec_ops,
 	.irqs = ma35d1_vpu_irqs,

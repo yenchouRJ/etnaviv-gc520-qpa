@@ -77,6 +77,8 @@ struct hantro_irq {
  * @double_buffer:		core needs double buffering
  * @legacy_regs:		core uses legacy register set
  * @late_postproc:		postproc must be set up at the end of the job
+ * @force_postproc:		optional, if it points to a true value every
+ *				decoder context uses the post-processor (test aid)
  */
 struct hantro_variant {
 	unsigned int enc_offset;
@@ -101,6 +103,7 @@ struct hantro_variant {
 	unsigned int double_buffer : 1;
 	unsigned int legacy_regs : 1;
 	unsigned int late_postproc : 1;
+	const bool *force_postproc;
 };
 
 /**
@@ -316,6 +319,7 @@ struct hantro_postproc_regs {
 	struct hantro_reg out_swap32;
 	struct hantro_reg out_endian;
 	struct hantro_reg out_luma_base;
+	struct hantro_reg out_chroma_base;
 	struct hantro_reg input_width;
 	struct hantro_reg input_height;
 	struct hantro_reg output_width;

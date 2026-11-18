@@ -34,6 +34,7 @@
 #define VPU_PP_IN_YUV240_TILED		0x5
 #define VPU_PP_OUT_RGB			0x0
 #define VPU_PP_OUT_YUYV			0x3
+#define VPU_PP_OUT_NV12			0x5	/* YCh 4:2:0 chroma interleaved */
 
 static const struct hantro_postproc_regs hantro_g1_postproc_regs = {
 	.pipeline_en = {G1_REG_PP_INTERRUPT, 1, 0x1},
@@ -42,6 +43,7 @@ static const struct hantro_postproc_regs hantro_g1_postproc_regs = {
 	.out_swap32 = {G1_REG_PP_DEV_CONFIG, 5, 0x1},
 	.out_endian = {G1_REG_PP_DEV_CONFIG, 6, 0x1},
 	.out_luma_base = {G1_REG_PP_OUT_LUMA_BASE, 0, 0xffffffff},
+	.out_chroma_base = {G1_REG_PP_OUT_CHROMA_BASE, 0, 0xffffffff},
 	.input_width = {G1_REG_PP_INPUT_SIZE, 0, 0x1ff},
 	/* swreg72 bits 16:9: 8 bits (bit 17 unused); overflow goes to input_height_ext */
 	.input_height = {G1_REG_PP_INPUT_SIZE, 9, 0xff},
@@ -81,6 +83,9 @@ static void hantro_postproc_g1_enable(struct hantro_ctx *ctx)
 	src_pp_fmt = VPU_PP_IN_NV12;
 
 	switch (ctx->vpu_dst_fmt->fourcc) {
+	case V4L2_PIX_FMT_NV12:
+		dst_pp_fmt = VPU_PP_OUT_NV12;
+		break;
 	case V4L2_PIX_FMT_YUYV:
 		dst_pp_fmt = VPU_PP_OUT_YUYV;
 		break;
@@ -99,20 +104,25 @@ static void hantro_postproc_g1_enable(struct hantro_ctx *ctx)
 	HANTRO_PP_REG_WRITE(vpu, out_swap32, 0x1);
 	HANTRO_PP_REG_WRITE(vpu, max_burst, 16);
 	HANTRO_PP_REG_WRITE(vpu, out_luma_base, dst_dma);
-	HANTRO_PP_REG_WRITE(vpu, input_width, MB_WIDTH(ctx->dst_fmt.width));
-	HANTRO_PP_REG_WRITE(vpu, input_height, MB_HEIGHT(ctx->dst_fmt.height));
+	if (ctx->vpu_dst_fmt->fourcc == V4L2_PIX_FMT_NV12)
+		HANTRO_PP_REG_WRITE(vpu, out_chroma_base,
+				    dst_dma + ctx->dst_fmt.plane_fmt[0].bytesperline *
+				    ctx->dst_fmt.height);
+	/* The PP input is the decoded (reference) picture, not the output. */
+	HANTRO_PP_REG_WRITE(vpu, input_width, MB_WIDTH(ctx->ref_fmt.width));
+	HANTRO_PP_REG_WRITE(vpu, input_height, MB_HEIGHT(ctx->ref_fmt.height));
 	HANTRO_PP_REG_WRITE(vpu, input_fmt, src_pp_fmt);
 	HANTRO_PP_REG_WRITE(vpu, output_fmt, dst_pp_fmt);
 	HANTRO_PP_REG_WRITE(vpu, output_width, ctx->dst_fmt.width);
 	HANTRO_PP_REG_WRITE(vpu, output_height, ctx->dst_fmt.height);
-	HANTRO_PP_REG_WRITE(vpu, orig_width, MB_WIDTH(ctx->dst_fmt.width));
+	HANTRO_PP_REG_WRITE(vpu, orig_width, MB_WIDTH(ctx->ref_fmt.width));
 	HANTRO_PP_REG_WRITE(vpu, display_width, ctx->dst_fmt.width);
-	HANTRO_PP_REG_WRITE(vpu, input_width_ext, MB_WIDTH(ctx->dst_fmt.width) >> 9);
+	HANTRO_PP_REG_WRITE(vpu, input_width_ext, MB_WIDTH(ctx->ref_fmt.width) >> 9);
 	/*
 	 * Height extension is MBs >> 8 (8-bit field in swreg72). The 6.18
 	 * code has MB_HEIGHT(h >> 8), which yields 1 for any normal height.
 	 */
-	HANTRO_PP_REG_WRITE(vpu, input_height_ext, MB_HEIGHT(ctx->dst_fmt.height) >> 8);
+	HANTRO_PP_REG_WRITE(vpu, input_height_ext, MB_HEIGHT(ctx->ref_fmt.height) >> 8);
 }
 
 static int down_scale_factor(struct hantro_ctx *ctx)
