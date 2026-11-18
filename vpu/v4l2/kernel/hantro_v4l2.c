@@ -196,7 +196,8 @@ static int vidioc_enum_framesizes(struct file *file, void *priv,
 
 	/* For non-coded formats check if postprocessing scaling is possible */
 	if (fmt->codec_mode == HANTRO_MODE_NONE) {
-		if (hantro_needs_postproc(ctx, fmt))
+		if (hantro_needs_postproc(ctx, fmt) ||
+		    (!ctx->is_encoder && ctx->dev->variant->pp_scaler))
 			return hanto_postproc_enum_framesizes(ctx, fsize);
 		else
 			return -ENOTTY;
@@ -210,6 +211,21 @@ static int vidioc_enum_framesizes(struct file *file, void *priv,
 	fsize->stepwise = fmt->frmsize;
 
 	return 0;
+}
+
+static bool hantro_native_has_fourcc(const struct hantro_ctx *ctx, u32 fourcc)
+{
+	const struct hantro_fmt *formats;
+	unsigned int i, num_fmts;
+
+	if (hantro_postproc_forced(ctx))
+		return false;
+	formats = hantro_get_formats(ctx, &num_fmts, HANTRO_AUTO_POSTPROC);
+	for (i = 0; i < num_fmts; i++)
+		if (formats[i].codec_mode == HANTRO_MODE_NONE &&
+		    formats[i].fourcc == fourcc)
+			return true;
+	return false;
 }
 
 static int vidioc_enum_fmt(struct file *file, void *priv,
@@ -235,7 +251,7 @@ static int vidioc_enum_fmt(struct file *file, void *priv,
 
 	formats = hantro_get_formats(ctx, &num_fmts, HANTRO_AUTO_POSTPROC);
 	/* With the post-processor forced on, only post-processed raw formats */
-	if (capture && !ctx->is_encoder && ctx->need_postproc)
+	if (capture && hantro_postproc_forced(ctx))
 		num_fmts = 0;
 	for (i = 0; i < num_fmts; i++) {
 		bool mode_none = formats[i].codec_mode == HANTRO_MODE_NONE;
@@ -264,6 +280,9 @@ static int vidioc_enum_fmt(struct file *file, void *priv,
 		fmt = &formats[i];
 
 		if (!hantro_check_depth_match(fmt, ctx->bit_depth))
+			continue;
+		/* a post-processed variant of a native format is the same V4L2 format */
+		if (hantro_native_has_fourcc(ctx, fmt->fourcc))
 			continue;
 		if (j == f->index) {
 			f->pixelformat = fmt->fourcc;
@@ -320,7 +339,7 @@ static int hantro_try_fmt(const struct hantro_ctx *ctx,
 	const struct hantro_fmt *fmt;
 	const struct hantro_fmt *vpu_fmt;
 	bool capture = V4L2_TYPE_IS_CAPTURE(type);
-	bool coded;
+	bool coded, scaled = false, pp;
 
 	coded = capture == ctx->is_encoder;
 
@@ -343,40 +362,50 @@ static int hantro_try_fmt(const struct hantro_ctx *ctx,
 		vpu_fmt = hantro_find_format(ctx, ctx->dst_fmt.pixelformat);
 	} else {
 		/*
-		 * Width/height on the CAPTURE end of a decoder are ignored and
-		 * replaced by the OUTPUT ones.
+		 * Width/height on the CAPTURE end of a decoder are replaced by the
+		 * OUTPUT ones, unless the post-processor can scale to the request.
 		 */
-		pix_mp->width = ctx->src_fmt.width;
-		pix_mp->height = ctx->src_fmt.height;
+		if (ctx->dev->variant->pp_scaler)
+			scaled = hantro_postproc_try_size(ctx, &pix_mp->width,
+							  &pix_mp->height);
+		else {
+			pix_mp->width = ctx->src_fmt.width;
+			pix_mp->height = ctx->src_fmt.height;
+		}
 		vpu_fmt = fmt;
 	}
 
 	pix_mp->field = V4L2_FIELD_NONE;
 
-	v4l2_apply_frmsize_constraints(&pix_mp->width, &pix_mp->height,
-				       &vpu_fmt->frmsize);
+	if (!scaled)
+		v4l2_apply_frmsize_constraints(&pix_mp->width, &pix_mp->height,
+					       &vpu_fmt->frmsize);
+
+	/* With a scaler the PP state follows the requested size, not stale ctx state */
+	pp = (!coded && !ctx->is_encoder && ctx->dev->variant->pp_scaler) ?
+	     (scaled || hantro_postproc_forced(ctx)) : hantro_needs_postproc(ctx, fmt);
 
 	if (!coded) {
 		/* Fill remaining fields */
 		v4l2_fill_pixfmt_mp(pix_mp, fmt->fourcc, pix_mp->width,
 				    pix_mp->height);
 		if (ctx->vpu_src_fmt->fourcc == V4L2_PIX_FMT_H264_SLICE &&
-		    !hantro_needs_postproc(ctx, fmt))
+		    !pp)
 			pix_mp->plane_fmt[0].sizeimage +=
 				hantro_h264_mv_size(pix_mp->width,
 						    pix_mp->height);
 		else if (ctx->vpu_src_fmt->fourcc == V4L2_PIX_FMT_VP9_FRAME &&
-			 !hantro_needs_postproc(ctx, fmt))
+			 !pp)
 			pix_mp->plane_fmt[0].sizeimage +=
 				hantro_vp9_mv_size(pix_mp->width,
 						   pix_mp->height);
 		else if (ctx->vpu_src_fmt->fourcc == V4L2_PIX_FMT_HEVC_SLICE &&
-			 !hantro_needs_postproc(ctx, fmt))
+			 !pp)
 			pix_mp->plane_fmt[0].sizeimage +=
 				hantro_hevc_mv_size(pix_mp->width,
 						    pix_mp->height);
 		else if (ctx->vpu_src_fmt->fourcc == V4L2_PIX_FMT_AV1_FRAME &&
-			 !hantro_needs_postproc(ctx, fmt))
+			 !pp)
 			pix_mp->plane_fmt[0].sizeimage +=
 				hantro_av1_mv_size(pix_mp->width,
 						   pix_mp->height);
@@ -637,6 +666,11 @@ static int hantro_set_fmt_cap(struct hantro_ctx *ctx,
 	ret = hantro_set_reference_frames_format(ctx);
 	if (ret)
 		return ret;
+	/* PP scaling needed when the CAPTURE size differs from the decoded one */
+	if (!ctx->is_encoder && ctx->dev->variant->pp_scaler)
+		ctx->need_postproc = hantro_postproc_forced(ctx) ||
+				     pix_mp->width != ctx->ref_fmt.width ||
+				     pix_mp->height != ctx->ref_fmt.height;
 
 	/*
 	 * Current raw format might have become invalid with newly

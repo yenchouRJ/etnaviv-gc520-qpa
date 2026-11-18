@@ -142,6 +142,7 @@ const struct hantro_variant ma35d1_vpu_variant = {
 	.num_postproc_fmts = ARRAY_SIZE(ma35d1_vpu_postproc_fmts),
 	.postproc_ops = &hantro_g1_postproc_ops,
 	.force_postproc = &ma35d1_force_pp,
+	.pp_scaler = 1,
 	.codec = HANTRO_H264_DECODER,
 	.codec_ops = ma35d1_vpu_codec_ops,
 	.irqs = ma35d1_vpu_irqs,

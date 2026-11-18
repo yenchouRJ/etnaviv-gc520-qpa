@@ -340,6 +340,7 @@
 #define     G1_REG_PP_RGB_16(v) ((v) ? BIT(28) : 0)
 #define G1_REG_PP_SCALING1		G1_SWREG(80)
 #define     G1_REG_PP_PADD_B(v)	(((v) << 18) & GENMASK(22, 18))
+#define G1_REG_PP_SCALING2		G1_SWREG(81)
 #define G1_REG_PP_MASK_R		G1_SWREG(82)
 #define G1_REG_PP_MASK_G		G1_SWREG(83)
 #define G1_REG_PP_MASK_B		G1_SWREG(84)

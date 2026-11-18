@@ -5,7 +5,7 @@ display needs, in NV12, with **no CPU fallback**. Built on the stateless mainlin
 (`../kernel/`, our MA35D1 variant) with our own patches. The vendor-based work (`vpu/vc8k`, the
 6.18 BSP `drivers/media/platform/nuvoton/ma35d1/`) is reference only.
 
-Status: T1 (PP refactor backport) and T2 (PP forced on at 1:1) are done and verified on the board: S1-S6 md5 identical with `ma35d1_force_pp=1` (kernel 6.6.93, CMA 96 MB). T0 probe log is coded but its output was not captured yet (`run_v4.sh` clears dmesg; read it with `dmesg | grep 'pp fuse'` right after boot, before any test). T3 next.
+Status: T1 (PP refactor backport) and T2 (PP forced on at 1:1) are done and verified on the board: S1-S6 md5 identical with `ma35d1_force_pp=1` (kernel 6.6.93, CMA 96 MB). T0 probe log is coded but its output was not captured yet (`run_v4.sh` clears dmesg; read it with `dmesg | grep 'pp fuse'` right after boot, before any test). T3 is coded; the size rules are verified on the board (`tests/t_pp_fmt`, 74 checks); the scaler registers and the scaled pixels are not verified yet (needs a scaled decode, see T3 test plan).
 
 ## 1. Decisions
 
@@ -143,7 +143,32 @@ roughly 245k MB/s. Measure on the board; unclocked 1080p decode is about 28 fps 
 - CMA: S6 (1080p, 1:1, 12+12 buffers) failed with ENOMEM on STREAMON at CMA 64 MB (about
   30 MB free at idle); passes at 96 MB. Scaled 1080p to 1024x600 needs less (§2).
 
-### T3 — G1 scaler
+### T3 — G1 scaler — CODED, size rules verified, pixels NOT yet verified
+- Implemented (`hantro_postproc.c`, `hantro_v4l2.c`, variant flag `pp_scaler`):
+  - `hantro_postproc_try_size()`: step 8 x 2, 16..4096, up-scale at most 3x (3x - 2 height);
+    mixed up/down: the up-scaled axis is clamped to the source size (down-scale wins);
+    a request equal to the coded size after rounding up to 16 (visible 1080 of coded 1088)
+    stays on the native path, same as before.
+  - `set_fmt_cap`: `need_postproc` = forced or CAPTURE size != `ref_fmt` size.
+  - Scaler registers follow the vendor driver (`ppinternal.c`), not the guide's wording:
+    up: `ratio = ((out-1)<<16)/(in-1)`, `invra = ((in-1)<<16)/(out-1)`;
+    down width: `invra = (out<<16)/in`; down height: `invra = (out<<16)/in + 1`.
+    Output width/height bits 12:11 go to swreg71/swreg70 bits 31:30.
+  - `ENUM_FRAMESIZES` on CAPTURE returns one STEPWISE entry; ENUM_FMT lists NV12 once.
+- Verified (`tests/t_pp_fmt`, `make` in `tests/`, run on the board with `ma35d1_force_pp=0`):
+  stepwise range per source size, step/clamp/3x limits, mixed up/down clamp, native vs scaled
+  `sizeimage`, 1:1 request (also the visible 1080 of coded 1088) stays native. S1-S6 still PASS.
+- Not verified: the scaler registers (nothing scaled has been decoded). Stock gst 1.22.9
+  `v4l2codecs` cannot drive it (only DISCRETE sizes are enumerated, `select_src_format` never
+  sets the CAPTURE size, output caps use the SPS display size), so the T3 pixel test uses an
+  LD_PRELOAD shim on the stock `v4l2slh264dec` that turns the CAPTURE `G_FMT` into an
+  `S_FMT` of `PP_W x PP_H`; frames are dumped raw (buffer pitch = sizeimage) and compared
+  on the host with ffmpeg (PSNR-Y / SSIM against an ffmpeg-scaled reference, P12 layer 2).
+  The real gst patch stays in T4.
+- Known limits: the kernel does not know the visible (cropped) size (the SPS control has no
+  crop), so the scaler input is the MB-aligned picture (1920x1088): about 0.7 % vertical
+  squeeze and 8 junk lines at the bottom for 1080p until a crop selection is added (T4).
+  The vendor `cHworkaroundFlag` (only for ASIC id 0x6731114x) is not implemented.
 - Program scale mode, ratios, inverse ratios, sizes; `enum_framesizes` (stepwise); `try_fmt` rules.
 - Pass: P12 layer 2 for 1080p to 1024x600, 720p to 1024x600, 640x480 to 1024x600 (up),
   1080p to 512x300; frame count exact; no kernel warnings.

@@ -56,7 +56,110 @@ static const struct hantro_postproc_regs hantro_g1_postproc_regs = {
 	.display_width = {G1_REG_PP_DISPLAY_WIDTH_IN_EXT, 0, 0x1fff},
 	.input_width_ext = {G1_REG_PP_DISPLAY_WIDTH_IN_EXT, 26, 0x7},
 	.input_height_ext = {G1_REG_PP_DISPLAY_WIDTH_IN_EXT, 29, 0x7},
+	/* output size bits 12:11 (swreg70 / swreg71 bits 31:30) */
+	.output_height_ext = {G1_REG_PP_COLOR_CONVERSION0, 30, 0x3},
+	.output_width_ext = {G1_REG_PP_COLOR_CONVERSION1, 30, 0x3},
+	.hor_scale_mode = {G1_REG_PP_SCALING1, 25, 0x3},
+	.ver_scale_mode = {G1_REG_PP_SCALING1, 23, 0x3},
+	.scale_wratio = {G1_REG_PP_SCALING0, 0, 0x3ffff},
+	.scale_hratio = {G1_REG_PP_SCALING1, 0, 0x3ffff},
+	.wscale_invra = {G1_REG_PP_SCALING2, 16, 0xffff},
+	.hscale_invra = {G1_REG_PP_SCALING2, 0, 0xffff},
 };
+
+#define PP_SCALE_OFF	0
+#define PP_SCALE_UP	1
+#define PP_SCALE_DOWN	2
+
+bool hantro_postproc_forced(const struct hantro_ctx *ctx)
+{
+	const struct hantro_variant *v = ctx->dev->variant;
+
+	return !ctx->is_encoder && v->force_postproc && *v->force_postproc;
+}
+
+/*
+ * Validate a requested CAPTURE size against the PP scaler limits (HW Integration Guide
+ * 2.3 / vendor ppinternal.c): width step 8, height step 2, 16..4096, up-scale at most 3x
+ * (3x - 2 for the height), no up-scale on one axis together with a down-scale on the
+ * other.  Returns true when the PP has to scale; false (size reset to the coded size) when
+ * the request equals the coded size, e.g. the visible 1080 of a coded 1088.
+ */
+bool hantro_postproc_try_size(const struct hantro_ctx *ctx, u32 *width, u32 *height)
+{
+	u32 sw = ctx->src_fmt.width, sh = ctx->src_fmt.height;
+	u32 w = *width, h = *height;
+
+	if (!w || !h || (ALIGN(w, MB_DIM) == sw && ALIGN(h, MB_DIM) == sh)) {
+		*width = sw;
+		*height = sh;
+		return false;
+	}
+
+	w = ALIGN(clamp(w, 16U, min(4096U, 3 * sw)), 8);
+	h = ALIGN(clamp(h, 16U, min(4096U, 3 * sh - 2)), 2);
+	w = min(w, min(4096U, 3 * sw) & ~7U);
+	h = min(h, min(4096U, 3 * sh - 2) & ~1U);
+
+	/* Mixed up/down scaling is not possible: the up-scaled axis stays at the source size */
+	if (w > sw && h < sh)
+		w = sw;
+	else if (h > sh && w < sw)
+		h = sh;
+
+	*width = w;
+	*height = h;
+	return w != sw || h != sh;
+}
+
+static void hantro_postproc_g1_scale(struct hantro_ctx *ctx)
+{
+	struct hantro_dev *vpu = ctx->dev;
+	u32 iw = ctx->ref_fmt.width, ih = ctx->ref_fmt.height;
+	u32 ow = ctx->dst_fmt.width, oh = ctx->dst_fmt.height;
+
+	/* Ratios as in the vendor PP driver (ppinternal.c), 16-bit fixed point */
+	if (iw < ow) {
+		HANTRO_PP_REG_WRITE(vpu, hor_scale_mode, PP_SCALE_UP);
+		HANTRO_PP_REG_WRITE(vpu, scale_wratio, ((ow - 1) << 16) / (iw - 1));
+		HANTRO_PP_REG_WRITE(vpu, wscale_invra, ((iw - 1) << 16) / (ow - 1));
+	} else if (iw > ow) {
+		HANTRO_PP_REG_WRITE(vpu, hor_scale_mode, PP_SCALE_DOWN);
+		HANTRO_PP_REG_WRITE(vpu, wscale_invra, (ow << 16) / iw);
+	} else {
+		HANTRO_PP_REG_WRITE(vpu, hor_scale_mode, PP_SCALE_OFF);
+		HANTRO_PP_REG_WRITE(vpu, wscale_invra, 0);
+	}
+
+	if (ih < oh) {
+		HANTRO_PP_REG_WRITE(vpu, ver_scale_mode, PP_SCALE_UP);
+		HANTRO_PP_REG_WRITE(vpu, scale_hratio, ((oh - 1) << 16) / (ih - 1));
+		HANTRO_PP_REG_WRITE(vpu, hscale_invra, ((ih - 1) << 16) / (oh - 1));
+	} else if (ih > oh) {
+		HANTRO_PP_REG_WRITE(vpu, ver_scale_mode, PP_SCALE_DOWN);
+		HANTRO_PP_REG_WRITE(vpu, hscale_invra, ((oh << 16) / ih) + 1);
+	} else {
+		HANTRO_PP_REG_WRITE(vpu, ver_scale_mode, PP_SCALE_OFF);
+		HANTRO_PP_REG_WRITE(vpu, hscale_invra, 0);
+	}
+}
+
+static int hantro_postproc_g1_enum_framesizes(struct hantro_ctx *ctx,
+					      struct v4l2_frmsizeenum *fsize)
+{
+	if (fsize->index || !ctx->src_fmt.width || !ctx->src_fmt.height)
+		return -EINVAL;
+
+	fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
+	fsize->stepwise.min_width = 16;
+	fsize->stepwise.min_height = 16;
+	fsize->stepwise.max_width = min(4096U, 3 * ctx->src_fmt.width);
+	fsize->stepwise.max_height = min(4096U, 3 * ctx->src_fmt.height - 2);
+	fsize->stepwise.step_width = 8;
+	fsize->stepwise.step_height = 2;
+
+	return 0;
+}
 
 bool hantro_needs_postproc(const struct hantro_ctx *ctx,
 			   const struct hantro_fmt *fmt)
@@ -115,6 +218,9 @@ static void hantro_postproc_g1_enable(struct hantro_ctx *ctx)
 	HANTRO_PP_REG_WRITE(vpu, output_fmt, dst_pp_fmt);
 	HANTRO_PP_REG_WRITE(vpu, output_width, ctx->dst_fmt.width);
 	HANTRO_PP_REG_WRITE(vpu, output_height, ctx->dst_fmt.height);
+	HANTRO_PP_REG_WRITE(vpu, output_width_ext, ctx->dst_fmt.width >> 11);
+	HANTRO_PP_REG_WRITE(vpu, output_height_ext, ctx->dst_fmt.height >> 11);
+	hantro_postproc_g1_scale(ctx);
 	HANTRO_PP_REG_WRITE(vpu, orig_width, MB_WIDTH(ctx->ref_fmt.width));
 	HANTRO_PP_REG_WRITE(vpu, display_width, ctx->dst_fmt.width);
 	HANTRO_PP_REG_WRITE(vpu, input_width_ext, MB_WIDTH(ctx->ref_fmt.width) >> 9);
@@ -345,6 +451,7 @@ int hanto_postproc_enum_framesizes(struct hantro_ctx *ctx,
 const struct hantro_postproc_ops hantro_g1_postproc_ops = {
 	.enable = hantro_postproc_g1_enable,
 	.disable = hantro_postproc_g1_disable,
+	.enum_framesizes = hantro_postproc_g1_enum_framesizes,
 };
 
 const struct hantro_postproc_ops hantro_g2_postproc_ops = {

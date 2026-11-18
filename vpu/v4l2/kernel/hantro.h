@@ -77,6 +77,7 @@ struct hantro_irq {
  * @double_buffer:		core needs double buffering
  * @legacy_regs:		core uses legacy register set
  * @late_postproc:		postproc must be set up at the end of the job
+ * @pp_scaler:			post-processor can scale (CAPTURE size may differ from the coded size)
  * @force_postproc:		optional, if it points to a true value every
  *				decoder context uses the post-processor (test aid)
  */
@@ -103,6 +104,7 @@ struct hantro_variant {
 	unsigned int double_buffer : 1;
 	unsigned int legacy_regs : 1;
 	unsigned int late_postproc : 1;
+	unsigned int pp_scaler : 1;
 	const bool *force_postproc;
 };
 
@@ -330,6 +332,14 @@ struct hantro_postproc_regs {
 	struct hantro_reg display_width;
 	struct hantro_reg input_width_ext;
 	struct hantro_reg input_height_ext;
+	struct hantro_reg output_width_ext;
+	struct hantro_reg output_height_ext;
+	struct hantro_reg hor_scale_mode;
+	struct hantro_reg ver_scale_mode;
+	struct hantro_reg scale_wratio;
+	struct hantro_reg scale_hratio;
+	struct hantro_reg wscale_invra;
+	struct hantro_reg hscale_invra;
 };
 
 struct hantro_vp9_decoded_buffer_info {
@@ -498,6 +508,8 @@ void hantro_postproc_disable(struct hantro_ctx *ctx);
 void hantro_postproc_enable(struct hantro_ctx *ctx);
 int hantro_postproc_init(struct hantro_ctx *ctx);
 void hantro_postproc_free(struct hantro_ctx *ctx);
+bool hantro_postproc_forced(const struct hantro_ctx *ctx);
+bool hantro_postproc_try_size(const struct hantro_ctx *ctx, u32 *width, u32 *height);
 int hanto_postproc_enum_framesizes(struct hantro_ctx *ctx,
 				   struct v4l2_frmsizeenum *fsize);
 
