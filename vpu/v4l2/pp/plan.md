@@ -183,12 +183,21 @@ roughly 245k MB/s. Measure on the board; unclocked 1080p decode is about 28 fps 
 - Pass: P12 layer 2 for 1080p to 1024x600, 720p to 1024x600, 640x480 to 1024x600 (up),
   1080p to 512x300; frame count exact; no kernel warnings.
 
-### T4 — GStreamer
-- Patch `gstv4l2decoder.c` (`enum_size_for_format` / `probe_caps_for_format`) for stepwise
-  and aspect change; keep the patch in `patches/gst1-plugins-bad/`.
-- Pass: `filesrc ! h264parse ! v4l2slh264dec ! video/x-raw,width=1024,height=600 ! waylandsink`
-  on the primary plane under Weston, zero-copy, user-confirmed smooth; S10 (1080p drone) at
-  real time.
+### T4 — GStreamer — DONE (patch kept in the gst tree, generate into `patches/` at the end)
+- Changes in `sys/v4l2codecs` (gst tree commit 7b98618): stepwise `ENUM_FRAMESIZES` -> int-range
+  caps; `select_src_format` does `S_FMT` with the width/height fixed by downstream caps;
+  `S_SELECTION(OUTPUT, CROP)` with the SPS crop before it; h264 display size = scaled CAPTURE
+  size; h264 `getcaps` returns the template (the default one copied the downstream size onto
+  the h264 sink caps -> not-negotiated).
+- Verified: `run_scale.sh` 11 cases PASS with a capsfilter and no shim; S1-S6 unscaled PASS;
+  user checked s10-s12 on the panel: upscale and 1:1 smooth, downscale OK with the cockpit
+  1080p clip (drone 1080p clip still shows lag).
+- Performance (s10, sync=false): scaled 1080p ~33.5 fps independent of the output size
+  (1024x600 / 640x360 / 1024x576), unscaled zero-copy ~41.5 fps. Matches the guide's cycle
+  count at 180 MHz (HP 426 + PP ~158 cycles/MB) within ~11 %. Switching VC8K to E-PLL/2
+  (250 MHz, TF-A writes the protected CLKSEL0 bit 2; user-managed) did not remove the
+  bottleneck, so it is probably the pipeline or DDR bandwidth, not the VPU clock.
+- Not done: dedicated `waylandsink` pass criteria measurements beyond visual checks.
 
 ### T5 — Memory measurement of (a)
 - `tests/mon_decoder_cma.sh` on S10 scaled to 1024x600; record CMA, compare with §2.
