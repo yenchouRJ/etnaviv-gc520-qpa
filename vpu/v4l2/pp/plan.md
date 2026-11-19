@@ -199,13 +199,25 @@ roughly 245k MB/s. Measure on the board; unclocked 1080p decode is about 28 fps 
   bottleneck, so it is probably the pipeline or DDR bandwidth, not the VPU clock.
 - Not done: dedicated `waylandsink` pass criteria measurements beyond visual checks.
 
-### T5 — Memory measurement of (a)
-- `tests/mon_decoder_cma.sh` on S10 scaled to 1024x600; record CMA, compare with §2.
+### T5 — Memory measurement of (a) — DONE (1024x600 and 1920x1080 panels)
+- `tests/mon_cma_scaled.sh gst|cockpit [file] [sec]` (target); `cockpit_1080_30.h264`, kiosk Weston,
+  `waylandsink`, capsfilter = panel size. 11 CAPTURE buffers (gst requests 11; 2 OUTPUT).
+- Pinned CMA use (page cache dropped mid-run; the clip's page cache also sits in CMA and
+  inflates `CmaFree` use to ~85 MB, it is reclaimable): single gst 57.4 MB, gst + Qt cockpit UI
+  59.6 MB, of 96 MB CMA (~14 MB free). Matches §2 estimate (~55 MB). No ENOMEM, no dmesg errors.
+- fps of this clip with sync=true: avg ~18 (15-22) - below 30, decode-bound (see T4 perf notes).
+- 1920x1080 panel, CMA 120 MB, `SYNC=false`, 14 s each (pinned use / fps avg):
+  1080 clip 1:1 gst 52.9 MB / 32.3; 1080 clip 1:1 + cockpit 64.0 MB / 27.6;
+  1280 clip upscaled gst 57.5 MB / 46.0; 1280 clip upscaled + cockpit 70.5 MB / 38.6.
+  Min free incl. page cache >= 7 MB, no errors. The Qt UI costs ~11-13 MB here (~2 MB on 1024x600).
+- Decision on T6 (b): (a) fits in 96 MB with the Qt UI; (b) only if more clients share the CMA.
 
-### T6 — (b) decoupled full-size pool (P3 b)
+### T6 — (b) decoupled full-size pool (P3 b) — NOT REQUIRED (deferred)
+- T5 shows (a) fits (53-71 MB pinned, single decoder + Qt UI). Revisit only for several simultaneous
+  1080p decoders (dashboard demo, not measured) or a smaller CMA (saves ~40 MB per decoder).
 - Only after T5; pool of DPB + 1 full-size buffers; same pass criteria as T2/T3.
 
-### J — JPEG decode (after T4)
+### J — JPEG decode — moved to its own plan (T0-T5 of this plan are done)
 - Variant gets `V4L2_PIX_FMT_JPEG` on OUTPUT; header parse with `v4l2_jpeg_parse_header()`;
   reject progressive/non-interleaved; program the G1 JPEG decoder; PP always on to NV12.
 - Source-change event sequence so stock `v4l2jpegdec` works; check it unpatched first.
