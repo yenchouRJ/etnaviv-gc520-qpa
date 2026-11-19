@@ -11,11 +11,9 @@ CFLAGS ?= -O2 -g -Wall -Wextra
 OUT := build
 TESTS := t_pp_fmt
 
-all: $(addprefix $(OUT)/,$(TESTS)) $(OUT)/pp_scale_shim.so
+all: $(addprefix $(OUT)/,$(TESTS))
 $(OUT)/%: %.c pp_test.h | $(OUT)
 	$(CC) $(CFLAGS) -o $@ $<
-$(OUT)/pp_scale_shim.so: pp_scale_shim.c | $(OUT)
-	$(CC) $(CFLAGS) -shared -fPIC -o $@ $< -ldl
 $(OUT):
 	mkdir -p $@
 .PHONY: all

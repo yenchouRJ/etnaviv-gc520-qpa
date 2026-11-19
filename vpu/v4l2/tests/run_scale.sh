@@ -1,10 +1,9 @@
 #!/bin/sh
 # On the board: ./run_scale.sh [videodir]   decodes through the PP scaler, raw NV12 to $OUT.
 # Then on the host: ./cmp_scale.sh <outdir> <videodir>
-# Needs pp_scale_shim.so next to this script, ma35d1_force_pp=0 and the gst patch
-# patches/gst1-plugins-bad/0005 (stock gst copies scaled frames using the SPS display size).
+# Needs ma35d1_force_pp=0 and the patched v4l2codecs plugin (stepwise sizes, S_FMT from the
+# downstream caps size, S_SELECTION crop; see patches/gst1-plugins-bad/).
 D=${1:-/mnt/vc8k/videos}
-HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=${OUT:-/mnt/vc8k/out/scale}; mkdir -p $OUT
 TMO=${TMO:-120}
 # stream  PP_W x PP_H
@@ -14,10 +13,8 @@ for c in $CASES; do
 	O=$OUT/${s}_${w}x${h}.nv12; rm -f $O; dmesg -c >/dev/null 2>&1
 	sync; echo 3 > /proc/sys/vm/drop_caches   # order-5 ctx allocation in hantro_open fails when fragmented
 	echo "=== $s -> ${w}x${h}"
-	case $s in s6_*) export PP_CROP_W=1920 PP_CROP_H=1080;; *) unset PP_CROP_W PP_CROP_H;; esac
-	PP_W=$w PP_H=$h LD_PRELOAD=$HERE/pp_scale_shim.so \
-		gst-launch-1.0 -q filesrc location=$D/$s.h264 ! h264parse ! v4l2slh264dec ! \
-		video/x-raw,format=NV12 ! filesink location=$O &
+	gst-launch-1.0 -q filesrc location=$D/$s.h264 ! h264parse ! v4l2slh264dec ! \
+		video/x-raw,format=NV12,width=$w,height=$h ! filesink location=$O &
 	p=$!; t=0
 	while kill -0 $p 2>/dev/null && [ $t -lt $TMO ]; do sleep 1; t=$((t+1)); done
 	kill -0 $p 2>/dev/null && { echo "TIMEOUT, killing"; kill -9 $p; }
