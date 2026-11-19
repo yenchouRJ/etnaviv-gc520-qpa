@@ -55,6 +55,14 @@ static const struct hantro_postproc_regs hantro_g1_postproc_regs = {
 	/* swreg92 bits 12:0: 13 bits so a 4096 wide output fits (mainline: 0xfff) */
 	.display_width = {G1_REG_PP_DISPLAY_WIDTH_IN_EXT, 0, 0x1fff},
 	.input_width_ext = {G1_REG_PP_DISPLAY_WIDTH_IN_EXT, 26, 0x7},
+	/* input crop origin: vendor table 8170table.h (STARTX swreg71 [29:21], STARTY swreg72 [31:24]) */
+	.crop_startx = {G1_REG_PP_COLOR_CONVERSION1, 21, 0x1ff},
+	.crop_starty = {G1_REG_PP_INPUT_SIZE, 24, 0xff},
+	.crop_startx_ext = {G1_REG_PP_DISPLAY_WIDTH_IN_EXT, 20, 0x7},
+	.crop_starty_ext = {G1_REG_PP_DISPLAY_WIDTH_IN_EXT, 23, 0x7},
+	/* swreg85 bit 1 / bit 0: right / bottom crop not a multiple of 16 */
+	.crop8_r_e = {G1_REG_PP_CONTROL, 1, 0x1},
+	.crop8_d_e = {G1_REG_PP_CONTROL, 0, 0x1},
 	.input_height_ext = {G1_REG_PP_DISPLAY_WIDTH_IN_EXT, 29, 0x7},
 	/* output size bits 12:11 (swreg70 / swreg71 bits 31:30) */
 	.output_height_ext = {G1_REG_PP_COLOR_CONVERSION0, 30, 0x3},
@@ -88,7 +96,15 @@ bool hantro_postproc_forced(const struct hantro_ctx *ctx)
 bool hantro_postproc_try_size(const struct hantro_ctx *ctx, u32 *width, u32 *height)
 {
 	u32 sw = ctx->src_fmt.width, sh = ctx->src_fmt.height;
+	u32 vw = sw, vh = sh;
 	u32 w = *width, h = *height;
+
+	/* The scaler reads the visible part of the picture when the SPS crops it */
+	if (ctx->crop_w && ctx->crop_h && ALIGN(ctx->crop_w, MB_DIM) == sw &&
+	    ALIGN(ctx->crop_h, MB_DIM) == sh) {
+		vw = ctx->crop_w;
+		vh = ctx->crop_h;
+	}
 
 	if (!w || !h || (ALIGN(w, MB_DIM) == sw && ALIGN(h, MB_DIM) == sh)) {
 		*width = sw;
@@ -96,27 +112,48 @@ bool hantro_postproc_try_size(const struct hantro_ctx *ctx, u32 *width, u32 *hei
 		return false;
 	}
 
-	w = ALIGN(clamp(w, 16U, min(4096U, 3 * sw)), 8);
-	h = ALIGN(clamp(h, 16U, min(4096U, 3 * sh - 2)), 2);
-	w = min(w, min(4096U, 3 * sw) & ~7U);
-	h = min(h, min(4096U, 3 * sh - 2) & ~1U);
+	w = ALIGN(clamp(w, 16U, min(4096U, 3 * vw)), 8);
+	h = ALIGN(clamp(h, 16U, min(4096U, 3 * vh - 2)), 2);
+	w = min(w, min(4096U, 3 * vw) & ~7U);
+	h = min(h, min(4096U, 3 * vh - 2) & ~1U);
 
 	/* Mixed up/down scaling is not possible: the up-scaled axis stays at the source size */
-	if (w > sw && h < sh)
-		w = sw;
-	else if (h > sh && w < sw)
-		h = sh;
+	if (w > vw && h < vh)
+		w = vw;
+	else if (h > vh && w < vw)
+		h = vh;
 
 	*width = w;
 	*height = h;
 	return w != sw || h != sh;
 }
 
+/*
+ * PP input crop: true (and the cropped size) when the PP scales a picture whose SPS crop
+ * is usable.  Without scaling the whole coded picture is passed through.
+ */
+bool hantro_postproc_crop(const struct hantro_ctx *ctx, u32 *w, u32 *h)
+{
+	*w = ctx->ref_fmt.width;
+	*h = ctx->ref_fmt.height;
+
+	if (!ctx->crop_w || !ctx->crop_h ||
+	    ALIGN(ctx->crop_w, MB_DIM) != *w || ALIGN(ctx->crop_h, MB_DIM) != *h ||
+	    (ctx->dst_fmt.width == *w && ctx->dst_fmt.height == *h))
+		return false;
+
+	*w = ctx->crop_w;
+	*h = ctx->crop_h;
+	return true;
+}
+
 static void hantro_postproc_g1_scale(struct hantro_ctx *ctx)
 {
 	struct hantro_dev *vpu = ctx->dev;
-	u32 iw = ctx->ref_fmt.width, ih = ctx->ref_fmt.height;
+	u32 iw, ih;
 	u32 ow = ctx->dst_fmt.width, oh = ctx->dst_fmt.height;
+
+	hantro_postproc_crop(ctx, &iw, &ih);
 
 	/* Ratios as in the vendor PP driver (ppinternal.c), 16-bit fixed point */
 	if (iw < ow) {
@@ -144,6 +181,25 @@ static void hantro_postproc_g1_scale(struct hantro_ctx *ctx)
 	}
 }
 
+static void hantro_postproc_g1_crop(struct hantro_ctx *ctx)
+{
+	struct hantro_dev *vpu = ctx->dev;
+	u32 w, h;
+	bool crop = hantro_postproc_crop(ctx, &w, &h);
+
+	/* Input size in MBs is the cropped one; the crop origin is always 0 */
+	HANTRO_PP_REG_WRITE(vpu, input_width, MB_WIDTH(w));
+	HANTRO_PP_REG_WRITE(vpu, input_height, MB_HEIGHT(h));
+	HANTRO_PP_REG_WRITE(vpu, input_width_ext, MB_WIDTH(w) >> 9);
+	HANTRO_PP_REG_WRITE(vpu, input_height_ext, MB_HEIGHT(h) >> 8);
+	HANTRO_PP_REG_WRITE(vpu, crop_startx, 0);
+	HANTRO_PP_REG_WRITE(vpu, crop_starty, 0);
+	HANTRO_PP_REG_WRITE(vpu, crop_startx_ext, 0);
+	HANTRO_PP_REG_WRITE(vpu, crop_starty_ext, 0);
+	HANTRO_PP_REG_WRITE(vpu, crop8_r_e, crop && (w & 15));
+	HANTRO_PP_REG_WRITE(vpu, crop8_d_e, crop && (h & 15));
+}
+
 static int hantro_postproc_g1_enum_framesizes(struct hantro_ctx *ctx,
 					      struct v4l2_frmsizeenum *fsize)
 {
@@ -153,8 +209,8 @@ static int hantro_postproc_g1_enum_framesizes(struct hantro_ctx *ctx,
 	fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
 	fsize->stepwise.min_width = 16;
 	fsize->stepwise.min_height = 16;
-	fsize->stepwise.max_width = min(4096U, 3 * ctx->src_fmt.width);
-	fsize->stepwise.max_height = min(4096U, 3 * ctx->src_fmt.height - 2);
+	fsize->stepwise.max_width = min(4096U, 3 * (ctx->crop_w ?: ctx->src_fmt.width));
+	fsize->stepwise.max_height = min(4096U, 3 * (ctx->crop_h ?: ctx->src_fmt.height) - 2);
 	fsize->stepwise.step_width = 8;
 	fsize->stepwise.step_height = 2;
 
@@ -212,8 +268,6 @@ static void hantro_postproc_g1_enable(struct hantro_ctx *ctx)
 				    dst_dma + ctx->dst_fmt.plane_fmt[0].bytesperline *
 				    ctx->dst_fmt.height);
 	/* The PP input is the decoded (reference) picture, not the output. */
-	HANTRO_PP_REG_WRITE(vpu, input_width, MB_WIDTH(ctx->ref_fmt.width));
-	HANTRO_PP_REG_WRITE(vpu, input_height, MB_HEIGHT(ctx->ref_fmt.height));
 	HANTRO_PP_REG_WRITE(vpu, input_fmt, src_pp_fmt);
 	HANTRO_PP_REG_WRITE(vpu, output_fmt, dst_pp_fmt);
 	HANTRO_PP_REG_WRITE(vpu, output_width, ctx->dst_fmt.width);
@@ -221,14 +275,14 @@ static void hantro_postproc_g1_enable(struct hantro_ctx *ctx)
 	HANTRO_PP_REG_WRITE(vpu, output_width_ext, ctx->dst_fmt.width >> 11);
 	HANTRO_PP_REG_WRITE(vpu, output_height_ext, ctx->dst_fmt.height >> 11);
 	hantro_postproc_g1_scale(ctx);
+	hantro_postproc_g1_crop(ctx);
 	HANTRO_PP_REG_WRITE(vpu, orig_width, MB_WIDTH(ctx->ref_fmt.width));
 	HANTRO_PP_REG_WRITE(vpu, display_width, ctx->dst_fmt.width);
-	HANTRO_PP_REG_WRITE(vpu, input_width_ext, MB_WIDTH(ctx->ref_fmt.width) >> 9);
 	/*
 	 * Height extension is MBs >> 8 (8-bit field in swreg72). The 6.18
 	 * code has MB_HEIGHT(h >> 8), which yields 1 for any normal height.
+	 * Input size and crop are written by hantro_postproc_g1_crop().
 	 */
-	HANTRO_PP_REG_WRITE(vpu, input_height_ext, MB_HEIGHT(ctx->ref_fmt.height) >> 8);
 }
 
 static int down_scale_factor(struct hantro_ctx *ctx)

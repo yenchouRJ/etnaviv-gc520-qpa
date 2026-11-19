@@ -716,6 +716,58 @@ static int vidioc_g_selection(struct file *file, void *priv,
 {
 	struct hantro_ctx *ctx = fh_to_ctx(priv);
 
+	/*
+	 * Decoder with a PP scaler: the valid picture area of the CAPTURE buffer.  It is the
+	 * whole buffer when the PP scaled, else the SPS visible size (e.g. 1920x1080 in a
+	 * 1920x1088 buffer).
+	 */
+	if (!ctx->is_encoder && ctx->dev->variant->pp_scaler &&
+	    sel->type == V4L2_BUF_TYPE_VIDEO_CAPTURE) {
+		u32 w = ctx->dst_fmt.width, h = ctx->dst_fmt.height;
+
+		switch (sel->target) {
+		case V4L2_SEL_TGT_COMPOSE:
+		case V4L2_SEL_TGT_COMPOSE_DEFAULT:
+		case V4L2_SEL_TGT_COMPOSE_BOUNDS:
+			if (ctx->crop_w && ctx->crop_h &&
+			    ALIGN(ctx->crop_w, MB_DIM) == w && ALIGN(ctx->crop_h, MB_DIM) == h) {
+				w = ctx->crop_w;
+				h = ctx->crop_h;
+			}
+			sel->r.top = 0;
+			sel->r.left = 0;
+			sel->r.width = w;
+			sel->r.height = h;
+			return 0;
+		default:
+			return -EINVAL;
+		}
+	}
+
+	/* Decoder source crop: the visible part of the coded picture (see s_selection) */
+	if (!ctx->is_encoder && ctx->dev->variant->pp_scaler &&
+	    sel->type == V4L2_BUF_TYPE_VIDEO_OUTPUT) {
+		sel->r.top = 0;
+		sel->r.left = 0;
+		sel->r.width = ctx->src_fmt.width;
+		sel->r.height = ctx->src_fmt.height;
+		switch (sel->target) {
+		case V4L2_SEL_TGT_CROP_DEFAULT:
+		case V4L2_SEL_TGT_CROP_BOUNDS:
+			return 0;
+		case V4L2_SEL_TGT_CROP:
+			if (ctx->crop_w && ctx->crop_h &&
+			    ALIGN(ctx->crop_w, MB_DIM) == ctx->src_fmt.width &&
+			    ALIGN(ctx->crop_h, MB_DIM) == ctx->src_fmt.height) {
+				sel->r.width = ctx->crop_w;
+				sel->r.height = ctx->crop_h;
+			}
+			return 0;
+		default:
+			return -EINVAL;
+		}
+	}
+
 	/* Crop only supported on source. */
 	if (!ctx->is_encoder ||
 	    sel->type != V4L2_BUF_TYPE_VIDEO_OUTPUT)
@@ -748,6 +800,31 @@ static int vidioc_s_selection(struct file *file, void *priv,
 	struct hantro_ctx *ctx = fh_to_ctx(priv);
 	struct v4l2_rect *rect = &sel->r;
 	struct vb2_queue *vq;
+
+	/*
+	 * Decoder with a PP scaler: the stateless H.264 SPS control has no frame crop, so the
+	 * application passes the visible size here (OUTPUT CROP, origin 0, right/bottom crop
+	 * inside the last macroblocks, sizes multiple of 8).  The PP scaler then reads only
+	 * that part.  Anything else resets to the full coded picture.
+	 */
+	if (!ctx->is_encoder && ctx->dev->variant->pp_scaler &&
+	    sel->type == V4L2_BUF_TYPE_VIDEO_OUTPUT) {
+		if (sel->target != V4L2_SEL_TGT_CROP)
+			return -EINVAL;
+		if (vb2_is_streaming(v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx)))
+			return -EBUSY;
+		if (rect->left || rect->top || ((rect->width | rect->height) & 7) ||
+		    round_up(rect->width, MB_DIM) != ctx->src_fmt.width ||
+		    round_up(rect->height, MB_DIM) != ctx->src_fmt.height) {
+			rect->left = 0;
+			rect->top = 0;
+			rect->width = ctx->src_fmt.width;
+			rect->height = ctx->src_fmt.height;
+		}
+		ctx->crop_w = rect->width;
+		ctx->crop_h = rect->height;
+		return 0;
+	}
 
 	/* Crop only supported on source. */
 	if (!ctx->is_encoder ||

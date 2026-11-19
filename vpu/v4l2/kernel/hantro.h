@@ -271,6 +271,8 @@ struct hantro_ctx {
 	const struct hantro_codec_ops *codec_ops;
 	struct hantro_postproc_ctx postproc;
 	bool need_postproc;
+	/* Visible size set by the application (OUTPUT S_SELECTION CROP), 0 = none; PP input crop */
+	u32 crop_w, crop_h;
 
 	/* Specific for particular codec modes. */
 	union {
@@ -331,6 +333,8 @@ struct hantro_postproc_regs {
 	struct hantro_reg orig_width;
 	struct hantro_reg display_width;
 	struct hantro_reg input_width_ext;
+	struct hantro_reg crop_startx, crop_starty, crop_startx_ext, crop_starty_ext;
+	struct hantro_reg crop8_r_e, crop8_d_e;
 	struct hantro_reg input_height_ext;
 	struct hantro_reg output_width_ext;
 	struct hantro_reg output_height_ext;
@@ -509,6 +513,7 @@ void hantro_postproc_enable(struct hantro_ctx *ctx);
 int hantro_postproc_init(struct hantro_ctx *ctx);
 void hantro_postproc_free(struct hantro_ctx *ctx);
 bool hantro_postproc_forced(const struct hantro_ctx *ctx);
+bool hantro_postproc_crop(const struct hantro_ctx *ctx, u32 *w, u32 *h);
 bool hantro_postproc_try_size(const struct hantro_ctx *ctx, u32 *width, u32 *height);
 int hanto_postproc_enum_framesizes(struct hantro_ctx *ctx,
 				   struct v4l2_frmsizeenum *fsize);

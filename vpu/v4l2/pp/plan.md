@@ -161,7 +161,7 @@ roughly 245k MB/s. Measure on the board; unclocked 1080p decode is about 28 fps 
 - Scaled pixels: S1/S3/S4/S5 scaled to 9 sizes (down both axes, width only, height only, up,
   1280x720 to 1024x600): all PASS vs ffmpeg bicubic reference. The vendor ratio formulas are
   right; the `cHworkaroundFlag` workaround was not needed. S1-S6 unscaled still PASS with the
-  patched gst. Not covered: 1080p source (visible-size limit below), mixed up/down (clamped).
+  patched gst. Not covered: mixed up/down (clamped).
 - Stock gst 1.22.9
   `v4l2codecs` cannot drive it (only DISCRETE sizes are enumerated, `select_src_format` never
   sets the CAPTURE size, output caps use the SPS display size), so the T3 pixel test uses an
@@ -172,9 +172,12 @@ roughly 245k MB/s. Measure on the board; unclocked 1080p decode is about 28 fps 
   SIGSEGV), so the test needs `patches/gst1-plugins-bad/0005` (display size = scaled CAPTURE
   size); it is applied in the Buildroot gst tree and deployed. The real S_FMT-from-caps part
   stays in T4.
-- Known limits: the kernel does not know the visible (cropped) size (the SPS control has no
-  crop), so the scaler input is the MB-aligned picture (1920x1088): about 0.7 % vertical
-  squeeze and 8 junk lines at the bottom for 1080p until a crop selection is added (T4).
+- 1080p crop: the stateless SPS control has no frame crop, so the application passes the
+  visible size with `S_SELECTION(OUTPUT, CROP)` (origin 0, sizes multiple of 8) before the
+  CAPTURE `S_FMT`; the PP then reads only 1920x1080 (crop8_d_e). CAPTURE `G_SELECTION`
+  COMPOSE* reports the valid area. Verified: S6 to 1024x600 and 640x360, 120/120 frames,
+  PSNR-Y 51.5/51.0 dB, SSIM 0.998; negative control without the crop: 29.9 dB, SSIM 0.82.
+  T4 gst patch must call S_SELECTION with the SPS crop.
   The vendor `cHworkaroundFlag` (only for ASIC id 0x6731114x) is not implemented.
 - Program scale mode, ratios, inverse ratios, sizes; `enum_framesizes` (stepwise); `try_fmt` rules.
 - Pass: P12 layer 2 for 1080p to 1024x600, 720p to 1024x600, 640x480 to 1024x600 (up),
