@@ -1,7 +1,7 @@
-# VC8000NanoD post-processor (PP) on mainline Hantro: combined-mode scaling, then JPEG
+# VC8000NanoD post-processor (PP) on mainline Hantro: combined-mode scaling, then letterbox, RGB and JPEG
 
 Goal: the hardware decodes **and** scales every supported video/camera stream to the size the
-display needs, in NV12, with **no CPU fallback**. Built on the stateless mainline Hantro driver
+display needs, in NV12 (RGB as an option), with **no CPU fallback**. Built on the stateless mainline Hantro driver
 (`../kernel/`, our MA35D1 variant) with our own patches. The vendor-based work (`vpu/vc8k`, the
 6.18 BSP `drivers/media/platform/nuvoton/ma35d1/`) is reference only.
 
@@ -11,18 +11,21 @@ Status: T1 (PP refactor backport) and T2 (PP forced on at 1:1) are done and veri
 
 | # | Decision |
 |---|---|
-| P1 Scope | PP in **combined (pipeline) mode** with the decoder; output **NV12 only** (memory). No RGB, rotation, alpha blend, deinterlace |
+| P1 Scope | PP in **combined (pipeline) mode** with the decoder; output **NV12 by default** (memory), **RGB as an opt-in CAPTURE format** (P13). No rotation, alpha blend, deinterlace |
 | P2 Purpose | Display fit (any source to the panel/window size). Memory saving is a later phase (P2b) |
 | P3 Phasing | (a) mainline structure: one full-size decoder buffer per CAPTURE buffer, PP writes the scaled frame into the CAPTURE buffer; (b) later, measured: decouple the full-size pool from the CAPTURE count (DPB + 1) |
 | P4 gst buffers | Keep the `v4l2codecs` default (12 at 1080p). `experimental-0004` (cap to 8) stays archived |
 | P5 Memory budget | Boards have 256 or 512 MB (test board 256 MB, 1024x600 panel). Enlarge CMA as needed |
 | P6 Base | Kernel 6.6.93. Backport the 6.18 PP refactor first (`ref_fmt`, lazy `hantro_postproc_get_dec_buf_addr()`, G1 extended width/height bits, `max_num_buffers`), then add the G1 scaler |
 | P7 Size contract | Kernel reports the real hardware range: `ENUM_FRAMESIZES` = `STEPWISE` (see §3), `S_FMT` on CAPTURE accepts any size in range, aspect ratio may change. Patch gst `v4l2codecs` to accept stepwise sizes and aspect changes; the size comes from downstream caps (`... ! video/x-raw,width=1024,height=600 ! sink`) |
-| P8 Letterbox | (Not in scope) A no-distortion option: CAPTURE buffer = panel size, `S_SELECTION(COMPOSE)` places the scaled picture inside it using the PP picture-in-picture offset; borders cleared once at allocation |
-| P9 JPEG | Hardware JPEG decode inside our Hantro variant, phase J after the H.264 PP: whole-frame API (JPEG in on OUTPUT, NV12 out on CAPTURE, like `coda`/`mxc-jpeg`), header parsing with the existing `v4l2_jpeg_parse_header()`, PP always on (any JPEG sampling to NV12 + scaling), stock gst `v4l2jpegdec` |
+| P8 Letterbox | **In scope (T8).** No-distortion option: CAPTURE buffer = panel size, `S_SELECTION(COMPOSE)` places the scaled picture inside it using the PP picture-in-picture offset; borders cleared once at allocation. Reason: measured on the 1080p panel, bars as a separate Weston surface cost a third layer; the display controller has only primary + overlay (+ cursor), so video + bars + Qt UI does not fit. Bars inside the video buffer keep video on one plane |
+| P9 JPEG | Hardware JPEG decode inside our Hantro variant (T9-T10), after RGB and letterbox because it reuses them (PP is shared; combined mode needs **no** internal full-size buffer for JPEG): whole-frame API (JPEG in on OUTPUT, NV12 out on CAPTURE, like `coda`/`mxc-jpeg`), header parsing with the existing `v4l2_jpeg_parse_header()`, PP always on (any JPEG sampling to NV12 + scaling), stock gst `v4l2jpegdec` |
 | P10 Unsupported input | Rejected cleanly by the driver (`S_FMT` / header parse) with a clear error; no CPU fallback. Known unsupported: progressive and non-interleaved JPEG, interlaced H.264 when scaling (combined mode impossible), anything above the limits in §3 |
-| P11 Qt still images | `QImage` JPEG stays on the CPU (libjpeg-turbo through Qt's `qjpeg` plugin); enable `BR2_PACKAGE_QT5BASE_JPEG` (currently off, so Qt cannot load JPEG at all). "No CPU fallback" applies to video/camera streams (GStreamer/V4L2) |
+| P11 Qt still images | **Out of scope:** `QImage` JPEG stays on the CPU (libjpeg-turbo through Qt's `qjpeg` plugin); enable `BR2_PACKAGE_QT5BASE_JPEG` (currently off, so Qt cannot load JPEG at all). "No CPU fallback" applies to video/camera streams (GStreamer/V4L2). A later `QImageIOHandler` using T9/T10 is possible without driver changes |
 | P12 Pass criterion | Two layers: (1) PP on at 1:1 (NV12 to NV12, same size) gives md5 identical to the existing S1-S6 references; (2) scaled output vs ffmpeg scaled reference of the same frames: PSNR-Y >= 30 dB and SSIM >= 0.95 on every frame, no missing frames, plus a visual check on the panel. A vendor-stack golden md5 is a one-off cross-check only if numbers look wrong |
+
+| P13 RGB output | PP RGB output as a second CAPTURE format next to NV12: **XRGB8888 (`V4L2_PIX_FMT_XRGB32`) and RGB565 (`V4L2_PIX_FMT_RGB565`)** first; ARGB4444/alpha only if needed. NV12 stays the default and wins in memory (3.1 MB vs 8.3 MB at 1080p) and bandwidth, so RGB exists for JPEG and display cases that need it. Verified through H.264 because the PP is shared. YCbCr to RGB matrix and range follow the CAPTURE `colorspace`/`ycbcr_enc`/`quantization` (H.264: from VUI, default BT.601/limited; JPEG: BT.601/full) |
+| P14 Rotation | Not in scope: unavailable in combined mode for JPEG, and not needed |
 
 ## 2. Why the memory goes up in phase (a)
 
@@ -84,13 +87,13 @@ Sources (VeriSilicon confidential, local only, not copied here):
 - Input in combined mode: whatever the decoder produces (H.264 4:2:0; JPEG 4:0:0, 4:2:0, 4:2:2,
   4:4:0, 4:1:1, 4:4:4).
 - Output: NV12 (4:2:0 semi-planar), YUYV-family 4:2:2 (raster or 4x4 tiled), configurable ARGB.
-  **We use NV12 only.**
+  **NV12 by default; XRGB8888 and RGB565 added in T7.**
 - Colour conversion, contrast/brightness/saturation, dithering, alpha blending (not with NV12
   output), masking: not used.
 
 ### 3.5 Picture in picture
 - The PP can write its output at an offset inside a larger frame (up to 4096x4096 display),
-  given the frame's line length. This is what P8 (letterbox) would use.
+  given the frame's line length. This is what P8 (letterbox, T8) uses.
 
 ### 3.6 Decoder limits relevant to "reject cleanly"
 - H.264: Baseline/Main/High up to level 5.1 in hardware; our board caps at 1920x1088.
@@ -113,7 +116,7 @@ roughly 245k MB/s. Measure on the board; unclocked 1080p decode is about 28 fps 
 
 ## 4. Kernel–userspace contract
 
-- CAPTURE formats: NV12 only. When the PP is needed (`S_FMT` CAPTURE size != coded size),
+- CAPTURE formats: NV12 (default); with T7 also XRGB32 and RGB565 (PP always on for these). When the PP is needed (`S_FMT` CAPTURE size != coded size),
   `ctx->need_postproc = true`; the decoder writes `ref_fmt` (coded size) into `dec_q[]` and the
   PP writes `dst_fmt` into the CAPTURE buffer.
 - `VIDIOC_ENUM_FRAMESIZES` on CAPTURE (NV12): one `V4L2_FRMSIZE_TYPE_STEPWISE` entry,
@@ -122,6 +125,9 @@ roughly 245k MB/s. Measure on the board; unclocked 1080p decode is about 28 fps 
 - 1:1 size: PP off by default (native path, as today); a module parameter forces PP on at 1:1
   for the P12 layer-1 test.
 - Interlaced H.264 with a scaled CAPTURE size: fail the job/format with an error.
+- Letterbox (T8): `S_SELECTION(CAPTURE, COMPOSE)` sets the rectangle inside the CAPTURE size that
+  receives the scaled picture (even left/top, size rules of T3 apply to the rectangle);
+  `S_FMT` CAPTURE gives the full buffer (panel) size. Default COMPOSE = whole buffer (today).
 
 ## 5. Phases
 
@@ -217,17 +223,77 @@ roughly 245k MB/s. Measure on the board; unclocked 1080p decode is about 28 fps 
   1080p decoders (dashboard demo, not measured) or a smaller CMA (saves ~40 MB per decoder).
 - Only after T5; pool of DPB + 1 full-size buffers; same pass criteria as T2/T3.
 
-### J — JPEG decode — moved to its own plan (T0-T5 of this plan are done)
-- Variant gets `V4L2_PIX_FMT_JPEG` on OUTPUT; header parse with `v4l2_jpeg_parse_header()`;
-  reject progressive/non-interleaved; program the G1 JPEG decoder; PP always on to NV12.
-- Source-change event sequence so stock `v4l2jpegdec` works; check it unpatched first.
-- Pass: md5 is not possible after PP; use P12 layer 2 against ffmpeg/libjpeg decode + scale;
-  MJPEG camera (USB UVC) preview at 30 fps on the panel with `v4l2src ! v4l2jpegdec ! waylandsink`.
+### T7 — RGB output in the PP, verified on H.264 (P13)
+Order: before JPEG, because JPEG needs RGB and this is testable with the existing H.264 path.
+- Driver: PP output format registers (RGB mode, 32/16 bit, channel masks, endian/swap),
+  YCbCr to RGB matrix and range registers (vendor `PPSetRgbBitmask`, `PPSetRgbTransformCoeffs`);
+  CAPTURE ENUM_FMT lists NV12, XRGB32, RGB565; sizeimage = bytesperline x height; RGB forces PP on;
+  `colorspace`/`ycbcr_enc`/`quantization` reported and honoured (H.264 limited range BT.601 by default).
+- gst: `v4l2codecs` already negotiates the CAPTURE format from downstream caps; check that
+  `video/x-raw,format=BGRx` and `RGB16` work with the capsfilter and `waylandsink`.
+- Pass: `run_scale.sh`-style cases (1:1 and scaled, 1080p to 1024x600 and 720p to 1024x600 up)
+  with XRGB32 and RGB565; host compare against ffmpeg `scale` + `format=bgr0`/`rgb565le` with the
+  same matrix/range: PSNR >= 35 dB (HW vs software rounding, to be confirmed), exact frame
+  count, correct channel order (red/blue not swapped: test with a colour bar stream).
+  S1-S6 and the NV12 scaled cases still pass; panel plane check (`XR24`/`RG16` scan out on the overlay).
+- Not goals: speed or memory win (NV12 is better everywhere); alpha formats.
+
+### T8 — Letterbox via PiP and `COMPOSE` (P8)
+- Driver: `S_SELECTION(CAPTURE, COMPOSE)` accepts a rectangle inside the CAPTURE size; PP output
+  base = buffer base + offset, line stride = full buffer width (`display_width`); scaler sizes and
+  step rules apply to the COMPOSE rectangle; borders cleared once when buffers are allocated
+  (NV12: Y=16, UV=128; RGB: black); chroma offset even. Check the PiP size limit (guide: 1920x1088,
+  features: 4096) and the offset alignment on the board. Works for NV12 and RGB (T7).
+- gst (`v4l2codecs` h264dec): new property `add-borders` (name as in `videoscale`): when true, fit the
+  source display aspect into the downstream size, set COMPOSE, and keep the caps at the downstream
+  (panel) size. Default false keeps today's stretch.
+- Tests: pixel compare against ffmpeg `scale` + `pad` (black bars exact); 1024x600 clip on 1920x1080
+  (bars 40 px left/right) and 1920x1080 clip on 1024x600 (bars top/bottom); `try_fmt` rejects
+  COMPOSE outside the buffer or violating the rules.
+- Panel pass: cockpit demo with the letterboxed video. Plane state must show NV12 panel-sized on
+  plane-0 (fb changing) and the Qt UI on plane-1, i.e. the layout that failed with plain
+  `waylandsink` + capsfilter (video had no plane once the UI started).
+
+### T9 — JPEG decode in the Hantro variant (kernel) (P9)
+- T9a facts: JPEG bit in swreg50 (set on this board), PP JPEG input formats on this synth config;
+  decoder register list for JPEG mode (swreg 3, 5, 7: `JPEG_MODE`, `JPEG_QTABLES`, restart, stream
+  length, sampling), table upload (quantization, Huffman) from the vendor `jpegdec*` sources.
+- T9b header: `v4l2_jpeg_parse_header()`; accept baseline interleaved SOF0 with sampling 4:0:0,
+  4:2:0, 4:2:2, 4:4:0, 4:1:1, 4:4:4; reject progressive (SOF2), non-interleaved (scans with a
+  subset of components), arithmetic coding, 12-bit, CMYK, size outside 48..16368, with a clear error
+  (no hang). Restart intervals supported.
+- T9c decode job: stream base/length, tables, PP combined mode with the input format set from the
+  sampling, output NV12 or RGB (T7) with scaling/crop/COMPOSE (T3, T8). **No internal full-size
+  buffer** (guide 4.7.6: frame buffer not required in pipelined mode; check that the decoder still
+  needs a dummy output address). Rotation is not available.
+- T9d V4L2 contract: OUTPUT `V4L2_PIX_FMT_JPEG` (one image per buffer), CAPTURE NV12/XRGB32/RGB565,
+  size from the first OUTPUT header; `V4L2_EVENT_SOURCE_CHANGE` sequence like `mxc-jpeg`, so the
+  stock stateful `v4l2jpegdec` can drive it (R4). JFIF colour space reported (BT.601, full range).
+- Tests (host: `cjpeg`/ffmpeg to produce baseline JPEGs, a set per sampling, with restart markers,
+  non-multiple-of-16 sizes such as 1023x575, large image around 12 MP): HW decode vs
+  libjpeg-turbo (`djpeg`) / ffmpeg converted to NV12, PSNR-Y >= 40 dB expected unscaled (IDCT
+  differences only), scaled cases per P12 layer 2; negative cases (progressive, non-interleaved,
+  truncated, corrupt) fail cleanly; H.264 playback running at the same time still works (one
+  core shared at job level).
+
+### T10 — JPEG userspace and camera
+- Check the stock gst `v4l2jpegdec` unpatched first; patch only what fails (same approach as T4).
+- `filesrc ! jpegparse ! v4l2jpegdec ! video/x-raw,width=W,height=H ! waylandsink` for stills; MJPEG
+  camera (USB UVC) `v4l2src ! v4l2jpegdec ! waylandsink` at 30 fps on the panel (if a camera is available).
+- Pass: scaled/letterboxed JPEG on the panel; a still next to the Qt UI keeps two planes.
+
+### T11 — Measurements and wrap-up
+- JPEG throughput (spec: 250 Mpixel/s at 200 MHz, about 225 at 180 MHz) and its effect on a
+  running H.264 playback (frame delay of a 12 MP decode); CMA for JPEG, RGB 1080p and letterbox
+  buffers (extend `tests/mon_cma_scaled.sh`).
+- Record results here; generate the gst patch into `patches/gst1-plugins-bad/` from the gst tree
+  commits (`git format-patch` from `00b38c5`), update `docs/model.md`.
 
 ## 6. Not in scope (now)
-- P8 letterbox via `S_SELECTION(COMPOSE)` (no geometric distortion).
-- RGB output, rotation, deinterlacing, standalone PP (memory-to-memory scaler node).
-- Hardware decode for Qt still images.
+- Hardware decode for Qt still images (`QImage` / `QImageIOHandler`); stays on libjpeg-turbo (P11).
+- Rotation (not available in JPEG combined mode), deinterlacing, alpha blending, standalone PP
+  (memory-to-memory scaler node).
+- RGB with alpha channel and RGB as a performance path (NV12 wins in memory and bandwidth).
 - Upstream submission (keep patches upstream-shaped anyway).
 
 ## 7. Risks
@@ -236,5 +302,9 @@ roughly 245k MB/s. Measure on the board; unclocked 1080p decode is about 28 fps 
 | R1 | PP scaling not synthesised (swreg100 scale level 0) | T0 first; if 0, the plan stops at T2 |
 | R2 | Combined-mode scaling slower than 1080p30 | Measure in T3; fast downscale mode; lower panel targets |
 | R3 | 6.18 backport touches shared code (`ref_fmt` in G2/VP9/HEVC) | Only G1 H.264 is built; S1-S6 regression after T1 |
-| R4 | `v4l2jpegdec` expects stateful behaviour the Hantro m2m core lacks | Prototype the event sequence early in J |
+| R4 | `v4l2jpegdec` expects stateful behaviour the Hantro m2m core lacks | Prototype the event sequence early in T9d; model on `mxc-jpeg` |
+| R6 | PiP limit: guide says 1920x1088 displays, features table 4096 | Test on the board in T8; 1080p panels need only 1920x1080 |
+| R7 | YCbCr to RGB matrix/range wrong or rounding differs from ffmpeg | Test with colour bars first (T7); compare PSNR, not md5 |
+| R8 | JPEG register programming (tables, restart, odd sizes) is the largest single task | T9a facts first; vendor `jpegdec*` as reference; small stream set |
+| R9 | A large JPEG delays H.264 frames (one core) | Measure in T11; job granularity is one image |
 | R5 | CMA pressure in (a) at 1080p (about 61 MB with bitstream) | Enlarge CMA (P5); T6 |
