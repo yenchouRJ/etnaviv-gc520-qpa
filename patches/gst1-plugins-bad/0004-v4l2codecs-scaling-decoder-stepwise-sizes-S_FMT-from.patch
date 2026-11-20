@@ -1,0 +1,254 @@
+From 7b986182c28438156c50bffb28a7d6e958ea9759 Mon Sep 17 00:00:00 2001
+From: Joey Lu <yclu4@nuvoton.com>
+Date: Thu, 19 Nov 2026 14:44:46 +0800
+Subject: [PATCH] v4l2codecs: scaling decoder: stepwise sizes, S_FMT from
+ downstream caps size, S_SELECTION crop, h264 getcaps
+
+Let the stateless V4L2 decoders use a driver that scales in hardware.
+
+The Nuvoton MA35D1 VC8000 decoder has a post-processor that can scale the
+decoded picture, so CAPTURE accepts any size inside a range (stepwise or
+continuous VIDIOC_ENUM_FRAMESIZES) instead of only the coded size.
+gst-plugins-bad assumed a fixed size and always negotiated the coded
+resolution. This patch makes the negotiated size follow downstream:
+
+- gstv4l2decoder.c: accept stepwise/continuous frame sizes when probing the
+  CAPTURE caps and expose them as an int range.
+- gst_v4l2_decoder_select_src_format(): take the width/height fixed by
+  downstream caps (for example a capsfilter or the display size) and pass
+  them to VIDIOC_S_FMT, so the driver scales to that size. Without a fixed
+  size the behaviour is unchanged.
+- gst_v4l2_decoder_set_src_crop(): new helper that sets
+  VIDIOC_S_SELECTION(OUTPUT, CROP) with the visible size. The stateless
+  H.264 SPS control carries no frame crop, so the 1920x1088 coded picture
+  would otherwise be scaled with its padding rows.
+- h264dec: read the SPS crop, call set_src_crop() before S_FMT, and report
+  the scaled CAPTURE size as the display size.
+- h264dec getcaps: answer with the pad template. The default implementation
+  copied the scaled size from downstream onto the h264 sink caps, which made
+  negotiation fail with not-negotiated.
+
+Upstream-Status: Inappropriate [MA35D1 PP scaler specific: Nuvoton driver exposes stepwise CAPTURE sizes]
+Signed-off-by: Joey Lu <yclu4@nuvoton.com>
+---
+ sys/v4l2codecs/gstv4l2codech264dec.c | 47 +++++++++++++++++++-
+ sys/v4l2codecs/gstv4l2decoder.c      | 66 ++++++++++++++++++++++++++++
+ sys/v4l2codecs/gstv4l2decoder.h      |  3 ++
+ 3 files changed, 114 insertions(+), 2 deletions(-)
+
+diff --git a/sys/v4l2codecs/gstv4l2codech264dec.c b/sys/v4l2codecs/gstv4l2codech264dec.c
+index 5cbac66..6c2ca5c 100644
+--- a/sys/v4l2codecs/gstv4l2codech264dec.c
++++ b/sys/v4l2codecs/gstv4l2codech264dec.c
+@@ -63,6 +63,9 @@ struct _GstV4l2CodecH264Dec
+   GstVideoInfo vinfo;
+   gint display_width;
+   gint display_height;
++  /* Visible size from the SPS, before any driver scaling */
++  gint crop_width;
++  gint crop_height;
+   gint coded_width;
+   gint coded_height;
+   guint bitdepth;
+@@ -357,6 +360,10 @@ gst_v4l2_codec_h264_dec_negotiate (GstVideoDecoder * decoder)
+   gst_caps_unref (filter);
+   GST_DEBUG_OBJECT (self, "Peer supported formats: %" GST_PTR_FORMAT, caps);
+ 
++  /* Tell a scaling driver which part of the coded picture is visible */
++  gst_v4l2_decoder_set_src_crop (self->decoder, self->crop_width,
++      self->crop_height);
++
+   if (!gst_v4l2_decoder_select_src_format (self->decoder, caps, &self->vinfo)) {
+     GST_ELEMENT_ERROR (self, CORE, NEGOTIATION,
+         ("Unsupported bitdepth/chroma format"),
+@@ -367,6 +374,20 @@ gst_v4l2_codec_h264_dec_negotiate (GstVideoDecoder * decoder)
+   }
+   gst_caps_unref (caps);
+ 
++  /* Not scaled: the display size is the SPS crop.  Scaled by the driver: the
++   * CAPTURE size is the display size, nothing is left to crop or copy. */
++  if ((guint) self->vinfo.width != (guint) self->coded_width ||
++      (guint) self->vinfo.height != (guint) self->coded_height) {
++    GST_INFO_OBJECT (self, "Scaled by the driver: %ix%i -> %ix%i",
++        self->crop_width, self->crop_height, self->vinfo.width,
++        self->vinfo.height);
++    self->display_width = self->vinfo.width;
++    self->display_height = self->vinfo.height;
++  } else {
++    self->display_width = self->crop_width;
++    self->display_height = self->crop_height;
++  }
++
+   if (self->output_state)
+     gst_video_codec_state_unref (self->output_state);
+ 
+@@ -407,6 +428,25 @@ done:
+   return FALSE;
+ }
+ 
++/* The default getcaps copies the downstream width/height onto the h264 sink caps.
++ * With a scaling driver downstream asks for the scaled size, which is not the size
++ * of the bitstream, so only answer with the template. */
++static GstCaps *
++gst_v4l2_codec_h264_dec_getcaps (GstVideoDecoder * decoder, GstCaps * filter)
++{
++  GstCaps *caps =
++      gst_pad_get_pad_template_caps (GST_VIDEO_DECODER_SINK_PAD (decoder));
++
++  if (filter) {
++    GstCaps *tmp = gst_caps_intersect_full (filter, caps,
++        GST_CAPS_INTERSECT_FIRST);
++    gst_caps_unref (caps);
++    caps = tmp;
++  }
++
++  return caps;
++}
++
+ static gboolean
+ gst_v4l2_codec_h264_dec_decide_allocation (GstVideoDecoder * decoder,
+     GstQuery * query)
+@@ -868,15 +908,17 @@ gst_v4l2_codec_h264_dec_new_sequence (GstH264Decoder * decoder,
+   }
+ 
+   /* TODO Check if current buffers are large enough, and reuse them */
+-  if (self->display_width != crop_width || self->display_height != crop_height
++  if (self->crop_width != crop_width || self->crop_height != crop_height
+       || self->coded_width != sps->width || self->coded_height != sps->height) {
++    self->crop_width = crop_width;
++    self->crop_height = crop_height;
+     self->display_width = crop_width;
+     self->display_height = crop_height;
+     self->coded_width = sps->width;
+     self->coded_height = sps->height;
+     negotiation_needed = TRUE;
+     GST_INFO_OBJECT (self, "Resolution changed to %dx%d (%ix%i)",
+-        self->display_width, self->display_height,
++        self->crop_width, self->crop_height,
+         self->coded_width, self->coded_height);
+   }
+ 
+@@ -1527,6 +1569,7 @@ gst_v4l2_codec_h264_dec_subclass_init (GstV4l2CodecH264DecClass * klass,
+   decoder_class->stop = GST_DEBUG_FUNCPTR (gst_v4l2_codec_h264_dec_stop);
+   decoder_class->negotiate =
+       GST_DEBUG_FUNCPTR (gst_v4l2_codec_h264_dec_negotiate);
++  decoder_class->getcaps = GST_DEBUG_FUNCPTR (gst_v4l2_codec_h264_dec_getcaps);
+   decoder_class->decide_allocation =
+       GST_DEBUG_FUNCPTR (gst_v4l2_codec_h264_dec_decide_allocation);
+   decoder_class->flush = GST_DEBUG_FUNCPTR (gst_v4l2_codec_h264_dec_flush);
+diff --git a/sys/v4l2codecs/gstv4l2decoder.c b/sys/v4l2codecs/gstv4l2decoder.c
+index d0bc2e8..434281c 100644
+--- a/sys/v4l2codecs/gstv4l2decoder.c
++++ b/sys/v4l2codecs/gstv4l2decoder.c
+@@ -377,6 +377,39 @@ gst_v4l2_decoder_enum_size_for_format (GstV4l2Decoder * self,
+   if (ret < 0)
+     return NULL;
+ 
++  if (size.type == V4L2_FRMSIZE_TYPE_STEPWISE ||
++      size.type == V4L2_FRMSIZE_TYPE_CONTINUOUS) {
++    /* A scaling post-processor: any size in the range, the application picks it
++     * with downstream caps (see gst_v4l2_decoder_select_src_format()). */
++    GValue w = G_VALUE_INIT, h = G_VALUE_INIT;
++    guint sw = size.type == V4L2_FRMSIZE_TYPE_STEPWISE ? size.stepwise.step_width : 1;
++    guint sh = size.type == V4L2_FRMSIZE_TYPE_STEPWISE ? size.stepwise.step_height : 1;
++    GstCaps *c;
++
++    if (!gst_v4l2_format_to_video_format (pixelformat, &format))
++      return NULL;
++
++    g_value_init (&w, GST_TYPE_INT_RANGE);
++    g_value_init (&h, GST_TYPE_INT_RANGE);
++    gst_value_set_int_range_step (&w, size.stepwise.min_width,
++        size.stepwise.max_width, MAX (sw, 1));
++    gst_value_set_int_range_step (&h, size.stepwise.min_height,
++        size.stepwise.max_height, MAX (sh, 1));
++
++    c = gst_caps_new_simple ("video/x-raw", "format", G_TYPE_STRING,
++        gst_video_format_to_string (format), NULL);
++    gst_caps_set_value (c, "width", &w);
++    gst_caps_set_value (c, "height", &h);
++    g_value_unset (&w);
++    g_value_unset (&h);
++
++    GST_DEBUG_OBJECT (self, "scaling range %ux%u..%ux%u for %" GST_FOURCC_FORMAT,
++        size.stepwise.min_width, size.stepwise.min_height,
++        size.stepwise.max_width, size.stepwise.max_height,
++        GST_FOURCC_ARGS (pixelformat));
++    return c;
++  }
++
+   if (size.type != V4L2_FRMSIZE_TYPE_DISCRETE) {
+     GST_WARNING_OBJECT (self, "V4L2_FRMSIZE type not supported");
+     return NULL;
+@@ -473,6 +506,22 @@ gst_v4l2_decoder_enum_src_formats (GstV4l2Decoder * self)
+   return caps;
+ }
+ 
++/* The visible size of the coded picture; the driver scaler reads only that part.
++ * Optional: failure just means the driver has no scaler / ignores the crop. */
++void
++gst_v4l2_decoder_set_src_crop (GstV4l2Decoder * self, gint width, gint height)
++{
++  struct v4l2_selection sel = {
++    .type = self->sink_buf_type,
++    .target = V4L2_SEL_TGT_CROP,
++    .r = {.width = width,.height = height},
++  };
++
++  if (ioctl (self->video_fd, VIDIOC_S_SELECTION, &sel) < 0)
++    GST_DEBUG_OBJECT (self, "VIDIOC_S_SELECTION (crop) not supported: %s",
++        g_strerror (errno));
++}
++
+ gboolean
+ gst_v4l2_decoder_select_src_format (GstV4l2Decoder * self, GstCaps * caps,
+     GstVideoInfo * info)
+@@ -485,6 +534,8 @@ gst_v4l2_decoder_select_src_format (GstV4l2Decoder * self, GstCaps * caps,
+   const gchar *format_str;
+   GstVideoFormat format;
+   guint32 pix_fmt;
++  gint width, height;
++  gboolean need_s_fmt = FALSE;
+ 
+   if (gst_caps_is_empty (caps))
+     return FALSE;
+@@ -506,7 +557,22 @@ gst_v4l2_decoder_select_src_format (GstV4l2Decoder * self, GstCaps * caps,
+       pix_fmt != fmt.fmt.pix_mp.pixelformat) {
+     GST_DEBUG_OBJECT (self, "Trying to use peer format: %s ", format_str);
+     fmt.fmt.pix_mp.pixelformat = pix_fmt;
++    need_s_fmt = TRUE;
++  }
++
++  /* Downstream fixed a size different from the decoded one (e.g. a capsfilter
++   * width=1024,height=600): ask the driver to scale to it. */
++  if (gst_structure_get_int (str, "width", &width) &&
++      gst_structure_get_int (str, "height", &height) &&
++      ((guint) width != fmt.fmt.pix_mp.width ||
++          (guint) height != fmt.fmt.pix_mp.height)) {
++    GST_DEBUG_OBJECT (self, "Trying to scale to %ix%i", width, height);
++    fmt.fmt.pix_mp.width = width;
++    fmt.fmt.pix_mp.height = height;
++    need_s_fmt = TRUE;
++  }
+ 
++  if (need_s_fmt) {
+     ret = ioctl (self->video_fd, VIDIOC_S_FMT, &fmt);
+     if (ret < 0) {
+       GST_ERROR_OBJECT (self, "VIDIOC_S_FMT failed: %s", g_strerror (errno));
+diff --git a/sys/v4l2codecs/gstv4l2decoder.h b/sys/v4l2codecs/gstv4l2decoder.h
+index 320ea44..4361ee7 100644
+--- a/sys/v4l2codecs/gstv4l2decoder.h
++++ b/sys/v4l2codecs/gstv4l2decoder.h
+@@ -58,6 +58,9 @@ gboolean          gst_v4l2_decoder_set_sink_fmt (GstV4l2Decoder * self, guint32
+ 
+ GstCaps *         gst_v4l2_decoder_enum_src_formats (GstV4l2Decoder * self);
+ 
++void              gst_v4l2_decoder_set_src_crop (GstV4l2Decoder * self,
++                                                 gint width, gint height);
++
+ gboolean          gst_v4l2_decoder_select_src_format (GstV4l2Decoder * self,
+                                                       GstCaps * caps,
+                                                       GstVideoInfo * info);
+-- 
+2.43.0
+
