@@ -223,7 +223,7 @@ roughly 245k MB/s. Measure on the board; unclocked 1080p decode is about 28 fps 
   1080p decoders (dashboard demo, not measured) or a smaller CMA (saves ~40 MB per decoder).
 - Only after T5; pool of DPB + 1 full-size buffers; same pass criteria as T2/T3.
 
-### T7 — RGB output in the PP, verified on H.264 (P13)
+### T7 — RGB output in the PP, verified on H.264 (P13) — DONE
 Order: before JPEG, because JPEG needs RGB and this is testable with the existing H.264 path.
 - Driver: PP output format registers (RGB mode, 32/16 bit, channel masks, endian/swap),
   YCbCr to RGB matrix and range registers (vendor `PPSetRgbBitmask`, `PPSetRgbTransformCoeffs`);
@@ -237,6 +237,18 @@ Order: before JPEG, because JPEG needs RGB and this is testable with the existin
   count, correct channel order (red/blue not swapped: test with a colour bar stream).
   S1-S6 and the NV12 scaled cases still pass; panel plane check (`XR24`/`RG16` scan out on the overlay).
 - Not goals: speed or memory win (NV12 is better everywhere); alpha formats.
+- Result (1024x600 panel image, CMA 120 MB, `tests/run_rgb.sh` + `cmp_rgb.sh`): all PASS.
+  Unscaled 320x240: BGRx 53.0 dB, RGB565 44.4 dB (matrix and byte order exact). Scaled to 1024x600:
+  1080p 45.2 dB, 720p/480p about 30 dB. The 30 dB cases are not a matrix error: luma rms 1.15, chroma
+  error unbiased at colour edges (HW chroma scaling differs from ffmpeg bicubic), so the scaled limit
+  is 29 dB, unscaled 40 dB. 1080p to 1920x1080 RGB565 1:1 (crop of coded 1088) 120/120 frames.
+  NV12 scaled `run_scale.sh` 11 cases still PASS. Panel: BGRx on the overlay, XR24 1024x600 with a
+  changing fb (zero-copy), user confirmed colours and smoothness.
+- Bug found: the CAPTURE reset colorspace is JPEG, which selected full range for H.264. Full range
+  now only for a JPEG stream or explicit `quantization=FULL`; BT.709 only if `ycbcr_enc`/colorspace
+  say so. gst does not pass colorimetry yet (always BT.601 limited).
+- CMA: 1080p to 1920x1080 XRGB32 needs about 137 MB (11 x 8.3 + 40 + 6) and fails with ENOMEM at
+  120 MB (expected, P13 cost; RGB565 1080p fits). Use NV12 at 1080p; T6 would cut about 40 MB.
 
 ### T8 — Letterbox via PiP and `COMPOSE` (P8)
 - Driver: `S_SELECTION(CAPTURE, COMPOSE)` accepts a rectangle inside the CAPTURE size; PP output

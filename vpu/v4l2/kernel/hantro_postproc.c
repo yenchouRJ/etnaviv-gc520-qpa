@@ -73,6 +73,26 @@ static const struct hantro_postproc_regs hantro_g1_postproc_regs = {
 	.scale_hratio = {G1_REG_PP_SCALING1, 0, 0x3ffff},
 	.wscale_invra = {G1_REG_PP_SCALING2, 16, 0xffff},
 	.hscale_invra = {G1_REG_PP_SCALING2, 0, 0xffff},
+	.out_swap16 = {G1_REG_PP_CONTROL, 2, 0x1},
+	.rgb_pix_in32 = {G1_REG_PP_SCALING0, 28, 0x1},
+	.ycbcr_range = {G1_REG_PP_SCALING0, 29, 0x1},
+	.rgb_r_padd = {G1_REG_PP_SCALING0, 23, 0x1f},
+	.rgb_g_padd = {G1_REG_PP_SCALING0, 18, 0x1f},
+	.rgb_b_padd = {G1_REG_PP_SCALING1, 18, 0x1f},
+	.r_mask = {G1_REG_PP_MASK_R, 0, 0xffffffff},
+	.g_mask = {G1_REG_PP_MASK_G, 0, 0xffffffff},
+	.b_mask = {G1_REG_PP_MASK_B, 0, 0xffffffff},
+	.contrast_thr1 = {G1_REG_PP_CONTRAST_ADJUST, 24, 0xff},
+	.contrast_off2 = {G1_REG_PP_CONTRAST_ADJUST, 10, 0x3ff},
+	.contrast_off1 = {G1_REG_PP_CONTRAST_ADJUST, 0, 0x3ff},
+	.coeff_a2 = {G1_REG_PP_COLOR_CONVERSION, 18, 0x3ff},
+	.coeff_a1 = {G1_REG_PP_COLOR_CONVERSION, 8, 0x3ff},
+	.contrast_thr2 = {G1_REG_PP_COLOR_CONVERSION, 0, 0xff},
+	.coeff_d = {G1_REG_PP_COLOR_CONVERSION0, 20, 0x3ff},
+	.coeff_c = {G1_REG_PP_COLOR_CONVERSION0, 10, 0x3ff},
+	.coeff_b = {G1_REG_PP_COLOR_CONVERSION0, 0, 0x3ff},
+	.coeff_f = {G1_REG_PP_COLOR_CONVERSION1, 10, 0xff},
+	.coeff_e = {G1_REG_PP_COLOR_CONVERSION1, 0, 0x3ff},
 };
 
 #define PP_SCALE_OFF	0
@@ -91,9 +111,12 @@ bool hantro_postproc_forced(const struct hantro_ctx *ctx)
  * 2.3 / vendor ppinternal.c): width step 8, height step 2, 16..4096, up-scale at most 3x
  * (3x - 2 for the height), no up-scale on one axis together with a down-scale on the
  * other.  Returns true when the PP has to scale; false (size reset to the coded size) when
- * the request equals the coded size, e.g. the visible 1080 of a coded 1088.
+ * the request equals the coded size, e.g. the visible 1080 of a coded 1088.  pp_only (the
+ * CAPTURE format exists only through the PP, e.g. RGB) keeps such a request and always
+ * reports true.
  */
-bool hantro_postproc_try_size(const struct hantro_ctx *ctx, u32 *width, u32 *height)
+bool hantro_postproc_try_size(const struct hantro_ctx *ctx, u32 *width, u32 *height,
+			      bool pp_only)
 {
 	u32 sw = ctx->src_fmt.width, sh = ctx->src_fmt.height;
 	u32 vw = sw, vh = sh;
@@ -106,7 +129,7 @@ bool hantro_postproc_try_size(const struct hantro_ctx *ctx, u32 *width, u32 *hei
 		vh = ctx->crop_h;
 	}
 
-	if (!w || !h || (ALIGN(w, MB_DIM) == sw && ALIGN(h, MB_DIM) == sh)) {
+	if (!w || !h || (!pp_only && ALIGN(w, MB_DIM) == sw && ALIGN(h, MB_DIM) == sh)) {
 		*width = sw;
 		*height = sh;
 		return false;
@@ -125,7 +148,7 @@ bool hantro_postproc_try_size(const struct hantro_ctx *ctx, u32 *width, u32 *hei
 
 	*width = w;
 	*height = h;
-	return w != sw || h != sh;
+	return pp_only || w != sw || h != sh;
 }
 
 /*
@@ -229,6 +252,77 @@ bool hantro_needs_postproc(const struct hantro_ctx *ctx,
 	return fmt->postprocessed;
 }
 
+bool hantro_postproc_is_rgb(u32 fourcc)
+{
+	return fourcc == V4L2_PIX_FMT_XRGB32 || fourcc == V4L2_PIX_FMT_RGB565;
+}
+
+/*
+ * RGB output: channel masks/pad positions (vendor PPSetRgbBitmask) and the YCbCr to RGB
+ * matrix (vendor PPSetRgbTransformCoeffs, ppapi.c tables). Matrix and range follow the
+ * CAPTURE colorimetry: BT.709 only when ycbcr_enc/colorspace say so, full range only when
+ * quantization/colorspace say so (default: BT.601, limited).
+ */
+static void hantro_postproc_g1_rgb(struct hantro_ctx *ctx, bool rgb16)
+{
+	struct hantro_dev *vpu = ctx->dev;
+	const struct v4l2_pix_format_mplane *f = &ctx->dst_fmt;
+	u32 enc = f->ycbcr_enc, quant = f->quantization;
+	bool bt709, full;
+	u32 a, b, c, d, e;
+
+	if (enc == V4L2_YCBCR_ENC_DEFAULT)
+		bt709 = f->colorspace == V4L2_COLORSPACE_REC709;
+	else
+		bt709 = enc == V4L2_YCBCR_ENC_709;
+	if (quant == V4L2_QUANTIZATION_DEFAULT)
+		/* the reset default colorspace is JPEG, so only a JPEG stream means full range */
+		full = ctx->vpu_src_fmt->fourcc == V4L2_PIX_FMT_JPEG;
+	else
+		full = quant == V4L2_QUANTIZATION_FULL_RANGE;
+
+	if (!bt709 && !full) {
+		a = 298; b = 409; c = 208; d = 100; e = 516;
+	} else if (!bt709) {
+		a = 256; b = 350; c = 179; d = 86; e = 443;
+	} else if (!full) {
+		a = 298; b = 459; c = 137; d = 55; e = 544;
+	} else {
+		a = 256; b = 403; c = 120; d = 48; e = 475;
+	}
+
+	HANTRO_PP_REG_WRITE(vpu, ycbcr_range, full);
+	HANTRO_PP_REG_WRITE(vpu, rgb_pix_in32, rgb16);
+	/* No contrast, brightness or saturation adjustment (saturation 64 = x1) */
+	HANTRO_PP_REG_WRITE(vpu, contrast_thr1, 55);
+	HANTRO_PP_REG_WRITE(vpu, contrast_thr2, 165);
+	HANTRO_PP_REG_WRITE(vpu, contrast_off1, 0);
+	HANTRO_PP_REG_WRITE(vpu, contrast_off2, 0);
+	HANTRO_PP_REG_WRITE(vpu, coeff_a1, a);
+	HANTRO_PP_REG_WRITE(vpu, coeff_a2, a);
+	HANTRO_PP_REG_WRITE(vpu, coeff_b, b);
+	HANTRO_PP_REG_WRITE(vpu, coeff_c, c);
+	HANTRO_PP_REG_WRITE(vpu, coeff_d, d);
+	HANTRO_PP_REG_WRITE(vpu, coeff_e, e);
+	HANTRO_PP_REG_WRITE(vpu, coeff_f, 0);
+
+	if (rgb16) {		/* RGB565: V4L2 R in the top 5 bits of the 16-bit word */
+		HANTRO_PP_REG_WRITE(vpu, r_mask, 0xf800f800);
+		HANTRO_PP_REG_WRITE(vpu, g_mask, 0x07e007e0);
+		HANTRO_PP_REG_WRITE(vpu, b_mask, 0x001f001f);
+		HANTRO_PP_REG_WRITE(vpu, rgb_r_padd, 0);
+		HANTRO_PP_REG_WRITE(vpu, rgb_g_padd, 5);
+		HANTRO_PP_REG_WRITE(vpu, rgb_b_padd, 11);
+	} else {		/* XRGB32: word 0xffRRGGBB */
+		HANTRO_PP_REG_WRITE(vpu, r_mask, 0xff000000 | 0x00ff0000);
+		HANTRO_PP_REG_WRITE(vpu, g_mask, 0xff000000 | 0x0000ff00);
+		HANTRO_PP_REG_WRITE(vpu, b_mask, 0xff000000 | 0x000000ff);
+		HANTRO_PP_REG_WRITE(vpu, rgb_r_padd, 8);
+		HANTRO_PP_REG_WRITE(vpu, rgb_g_padd, 16);
+		HANTRO_PP_REG_WRITE(vpu, rgb_b_padd, 24);
+	}
+}
+
 static void hantro_postproc_g1_enable(struct hantro_ctx *ctx)
 {
 	struct hantro_dev *vpu = ctx->dev;
@@ -248,6 +342,10 @@ static void hantro_postproc_g1_enable(struct hantro_ctx *ctx)
 	case V4L2_PIX_FMT_YUYV:
 		dst_pp_fmt = VPU_PP_OUT_YUYV;
 		break;
+	case V4L2_PIX_FMT_XRGB32:
+	case V4L2_PIX_FMT_RGB565:
+		dst_pp_fmt = VPU_PP_OUT_RGB;
+		break;
 	default:
 		WARN(1, "output format %d not supported by the post-processor, this wasn't expected.",
 		     ctx->vpu_dst_fmt->fourcc);
@@ -259,8 +357,19 @@ static void hantro_postproc_g1_enable(struct hantro_ctx *ctx)
 	dst_dma = vb2_dma_contig_plane_dma_addr(&dst_buf->vb2_buf, 0);
 
 	HANTRO_PP_REG_WRITE(vpu, clk_gate, 0x1);
-	HANTRO_PP_REG_WRITE(vpu, out_endian, 0x1);
-	HANTRO_PP_REG_WRITE(vpu, out_swap32, 0x1);
+	if (hantro_postproc_is_rgb(ctx->vpu_dst_fmt->fourcc)) {
+		/* Vendor ppcfg.h: RGB32/RGB16 outputs are big endian with 32-bit word swap */
+		bool rgb16 = ctx->vpu_dst_fmt->fourcc == V4L2_PIX_FMT_RGB565;
+
+		HANTRO_PP_REG_WRITE(vpu, out_endian, 0x0);
+		HANTRO_PP_REG_WRITE(vpu, out_swap32, 0x1);
+		HANTRO_PP_REG_WRITE(vpu, out_swap16, rgb16);
+		hantro_postproc_g1_rgb(ctx, rgb16);
+	} else {
+		HANTRO_PP_REG_WRITE(vpu, out_endian, 0x1);
+		HANTRO_PP_REG_WRITE(vpu, out_swap32, 0x1);
+		HANTRO_PP_REG_WRITE(vpu, out_swap16, 0x0);
+	}
 	HANTRO_PP_REG_WRITE(vpu, max_burst, 16);
 	HANTRO_PP_REG_WRITE(vpu, out_luma_base, dst_dma);
 	if (ctx->vpu_dst_fmt->fourcc == V4L2_PIX_FMT_NV12)

@@ -30,6 +30,11 @@ static bool ma35d1_force_pp;
 module_param_named(ma35d1_force_pp, ma35d1_force_pp, bool, 0644);
 MODULE_PARM_DESC(ma35d1_force_pp, "Run the decoder through the post-processor (default 0)");
 
+#define MA35D1_PP_FRMSIZE { \
+	.min_width = FMT_MIN_WIDTH, .max_width = FMT_FHD_WIDTH, .step_width = MB_DIM, \
+	.min_height = FMT_MIN_HEIGHT, .max_height = FMT_FHD_HEIGHT, .step_height = MB_DIM, \
+}
+
 static const struct hantro_fmt ma35d1_vpu_postproc_fmts[] = {
 	{
 		.fourcc = V4L2_PIX_FMT_NV12,
@@ -43,6 +48,18 @@ static const struct hantro_fmt ma35d1_vpu_postproc_fmts[] = {
 			.max_height = FMT_FHD_HEIGHT,
 			.step_height = MB_DIM,
 		},
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_XRGB32,
+		.codec_mode = HANTRO_MODE_NONE,
+		.postprocessed = true,
+		.frmsize = MA35D1_PP_FRMSIZE,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_RGB565,
+		.codec_mode = HANTRO_MODE_NONE,
+		.postprocessed = true,
+		.frmsize = MA35D1_PP_FRMSIZE,
 	},
 };
 

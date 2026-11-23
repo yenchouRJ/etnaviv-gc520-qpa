@@ -367,12 +367,20 @@ static int hantro_try_fmt(const struct hantro_ctx *ctx,
 		 */
 		if (ctx->dev->variant->pp_scaler)
 			scaled = hantro_postproc_try_size(ctx, &pix_mp->width,
-							  &pix_mp->height);
+							  &pix_mp->height,
+							  hantro_postproc_is_rgb(fmt->fourcc));
 		else {
 			pix_mp->width = ctx->src_fmt.width;
 			pix_mp->height = ctx->src_fmt.height;
 		}
 		vpu_fmt = fmt;
+		/* The RGB conversion follows the colorimetry of the stream (set on OUTPUT) */
+		if (hantro_postproc_is_rgb(fmt->fourcc) && !pix_mp->colorspace) {
+			pix_mp->colorspace = ctx->src_fmt.colorspace;
+			pix_mp->ycbcr_enc = ctx->src_fmt.ycbcr_enc;
+			pix_mp->quantization = ctx->src_fmt.quantization;
+			pix_mp->xfer_func = ctx->src_fmt.xfer_func;
+		}
 	}
 
 	pix_mp->field = V4L2_FIELD_NONE;
@@ -383,7 +391,8 @@ static int hantro_try_fmt(const struct hantro_ctx *ctx,
 
 	/* With a scaler the PP state follows the requested size, not stale ctx state */
 	pp = (!coded && !ctx->is_encoder && ctx->dev->variant->pp_scaler) ?
-	     (scaled || hantro_postproc_forced(ctx)) : hantro_needs_postproc(ctx, fmt);
+	     (scaled || hantro_postproc_forced(ctx) || fmt->postprocessed) :
+	     hantro_needs_postproc(ctx, fmt);
 
 	if (!coded) {
 		/* Fill remaining fields */

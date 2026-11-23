@@ -344,6 +344,13 @@ struct hantro_postproc_regs {
 	struct hantro_reg scale_hratio;
 	struct hantro_reg wscale_invra;
 	struct hantro_reg hscale_invra;
+	/* RGB output: pixel size, pad positions, channel masks, YCbCr range and matrix */
+	struct hantro_reg out_swap16;
+	struct hantro_reg rgb_pix_in32, ycbcr_range;
+	struct hantro_reg rgb_r_padd, rgb_g_padd, rgb_b_padd;
+	struct hantro_reg r_mask, g_mask, b_mask;
+	struct hantro_reg contrast_thr1, contrast_thr2, contrast_off1, contrast_off2;
+	struct hantro_reg coeff_a1, coeff_a2, coeff_b, coeff_c, coeff_d, coeff_e, coeff_f;
 };
 
 struct hantro_vp9_decoded_buffer_info {
@@ -514,7 +521,9 @@ int hantro_postproc_init(struct hantro_ctx *ctx);
 void hantro_postproc_free(struct hantro_ctx *ctx);
 bool hantro_postproc_forced(const struct hantro_ctx *ctx);
 bool hantro_postproc_crop(const struct hantro_ctx *ctx, u32 *w, u32 *h);
-bool hantro_postproc_try_size(const struct hantro_ctx *ctx, u32 *width, u32 *height);
+bool hantro_postproc_try_size(const struct hantro_ctx *ctx, u32 *width, u32 *height,
+			      bool pp_only);
+bool hantro_postproc_is_rgb(u32 fourcc);
 int hanto_postproc_enum_framesizes(struct hantro_ctx *ctx,
 				   struct v4l2_frmsizeenum *fsize);
 
