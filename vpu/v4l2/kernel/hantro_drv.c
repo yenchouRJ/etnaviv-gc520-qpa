@@ -216,8 +216,10 @@ queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue *dst_vq)
 	 * for faster allocation. Also, no CPU access on the source queue,
 	 * so no kernel mapping needed.
 	 */
-	src_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES |
-			    DMA_ATTR_NO_KERNEL_MAPPING;
+	src_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES;
+	/* The JPEG decoder parses the headers on the CPU (hantro_g1_jpeg_dec.c) */
+	if (ctx->is_encoder || !(ctx->dev->variant->codec & HANTRO_JPEG_DECODER))
+		src_vq->dma_attrs |= DMA_ATTR_NO_KERNEL_MAPPING;
 	src_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
 	src_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	src_vq->lock = &ctx->dev->vpu_mutex;

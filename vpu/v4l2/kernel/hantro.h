@@ -39,6 +39,7 @@ struct hantro_postproc_ops;
 #define HANTRO_HEVC_DECODER	BIT(19)
 #define HANTRO_VP9_DECODER	BIT(20)
 #define HANTRO_AV1_DECODER	BIT(21)
+#define HANTRO_JPEG_DECODER	BIT(22)
 #define HANTRO_DECODERS		0xffff0000
 
 /**
@@ -118,6 +119,7 @@ struct hantro_variant {
  * @HANTRO_MODE_HEVC_DEC: HEVC decoder.
  * @HANTRO_MODE_VP9_DEC: VP9 decoder.
  * @HANTRO_MODE_AV1_DEC: AV1 decoder
+ * @HANTRO_MODE_JPEG_DEC: JPEG decoder (baseline, G1 family)
  */
 enum hantro_codec_mode {
 	HANTRO_MODE_NONE = -1,
@@ -128,6 +130,7 @@ enum hantro_codec_mode {
 	HANTRO_MODE_HEVC_DEC,
 	HANTRO_MODE_VP9_DEC,
 	HANTRO_MODE_AV1_DEC,
+	HANTRO_MODE_JPEG_DEC,
 };
 
 /*
@@ -284,6 +287,7 @@ struct hantro_ctx {
 		struct hantro_hevc_dec_hw_ctx hevc_dec;
 		struct hantro_vp9_dec_hw_ctx vp9_dec;
 		struct hantro_av1_dec_hw_ctx av1_dec;
+		struct hantro_jpeg_dec_hw_ctx jpeg_dec;
 	};
 };
 
@@ -331,6 +335,7 @@ struct hantro_postproc_regs {
 	struct hantro_reg output_width;
 	struct hantro_reg output_height;
 	struct hantro_reg input_fmt;
+	struct hantro_reg input_fmt_es;
 	struct hantro_reg output_fmt;
 	struct hantro_reg orig_width;
 	struct hantro_reg display_width;
@@ -499,6 +504,13 @@ hantro_get_dst_buf(struct hantro_ctx *ctx)
 
 bool hantro_needs_postproc(const struct hantro_ctx *ctx,
 			   const struct hantro_fmt *fmt);
+
+/* JPEG decoding always goes through the post-processor (combined mode, no decoder output) */
+static inline bool hantro_is_jpeg_dec(const struct hantro_ctx *ctx)
+{
+	return !ctx->is_encoder && ctx->vpu_src_fmt &&
+	       ctx->vpu_src_fmt->codec_mode == HANTRO_MODE_JPEG_DEC;
+}
 
 dma_addr_t
 hantro_postproc_get_dec_buf_addr(struct hantro_ctx *ctx, int index);

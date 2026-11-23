@@ -139,7 +139,11 @@ hantro_set_reference_frames_format(struct hantro_ctx *ctx)
 	ctx->ref_fmt.width = ctx->src_fmt.width;
 	ctx->ref_fmt.height = ctx->src_fmt.height;
 
-	v4l2_apply_frmsize_constraints(&ctx->ref_fmt.width, &ctx->ref_fmt.height, &fmt->frmsize);
+	/* JPEG: the PP input is the MB-aligned picture, larger than the H.264 limit of the native format */
+	if (hantro_is_jpeg_dec(ctx))
+		ctx->ref_fmt.width = ALIGN(ctx->ref_fmt.width, MB_DIM), ctx->ref_fmt.height = ALIGN(ctx->ref_fmt.height, MB_DIM);
+	else
+		v4l2_apply_frmsize_constraints(&ctx->ref_fmt.width, &ctx->ref_fmt.height, &fmt->frmsize);
 	return v4l2_fill_pixfmt_mp(&ctx->ref_fmt, fmt->fourcc,
 				   ctx->ref_fmt.width, ctx->ref_fmt.height);
 }
@@ -568,6 +572,7 @@ static int hantro_set_fmt_out(struct hantro_ctx *ctx,
 			      bool need_postproc)
 {
 	struct vb2_queue *vq;
+	u32 req_w = pix_mp->width, req_h = pix_mp->height;
 	int ret;
 
 	vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx,
@@ -607,6 +612,15 @@ static int hantro_set_fmt_out(struct hantro_ctx *ctx,
 
 	ctx->vpu_src_fmt = hantro_find_format(ctx, pix_mp->pixelformat);
 	ctx->src_fmt = *pix_mp;
+	/* JPEG decoder: the visible size is what the application asked for (PP crop granularity 8) */
+	if (hantro_is_jpeg_dec(ctx) && req_w && req_h && ALIGN(req_w, MB_DIM) == pix_mp->width &&
+	    ALIGN(req_h, MB_DIM) == pix_mp->height) {
+		ctx->crop_w = ALIGN(req_w, 8);
+		ctx->crop_h = ALIGN(req_h, 8);
+	} else if (hantro_is_jpeg_dec(ctx)) {
+		ctx->crop_w = 0;
+		ctx->crop_h = 0;
+	}
 
 	/*
 	 * Current raw format might have become invalid with newly
@@ -620,7 +634,7 @@ static int hantro_set_fmt_out(struct hantro_ctx *ctx,
 	if (!ctx->is_encoder)
 		hantro_reset_raw_fmt(ctx,
 				     hantro_get_format_depth(pix_mp->pixelformat),
-				     need_postproc);
+				     need_postproc || hantro_is_jpeg_dec(ctx));
 
 	/* Colorimetry information are always propagated. */
 	ctx->dst_fmt.colorspace = pix_mp->colorspace;
@@ -679,7 +693,7 @@ static int hantro_set_fmt_cap(struct hantro_ctx *ctx,
 		return ret;
 	/* PP scaling needed when the CAPTURE size differs from the decoded one */
 	if (!ctx->is_encoder && ctx->dev->variant->pp_scaler)
-		ctx->need_postproc = hantro_postproc_forced(ctx) ||
+		ctx->need_postproc = hantro_postproc_forced(ctx) || hantro_is_jpeg_dec(ctx) ||
 				     pix_mp->width != ctx->ref_fmt.width ||
 				     pix_mp->height != ctx->ref_fmt.height;
 

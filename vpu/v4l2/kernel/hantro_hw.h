@@ -113,6 +113,17 @@ struct hantro_h264_dec_hw_ctx {
 };
 
 /**
+ * struct hantro_jpeg_dec_hw_ctx
+ * @tables:	Quantisation and Huffman value tables read by the HW
+ * @pp_in:	Post-processor input format for the sampling of the current image
+ * @pp_in_es:	Extension of @pp_in (4:4:4 / 4:1:1)
+ */
+struct hantro_jpeg_dec_hw_ctx {
+	struct hantro_aux_buf tables;
+	u8 pp_in, pp_in_es;
+};
+
+/**
  * struct hantro_hevc_dec_ctrls
  * @decode_params: Decode params
  * @scaling:	Scaling matrix
@@ -436,6 +447,9 @@ u16 hantro_h264_get_ref_nbr(struct hantro_ctx *ctx,
 int hantro_h264_dec_prepare_run(struct hantro_ctx *ctx);
 int rockchip_vpu2_h264_dec_run(struct hantro_ctx *ctx);
 int hantro_g1_h264_dec_run(struct hantro_ctx *ctx);
+int hantro_g1_jpeg_dec_run(struct hantro_ctx *ctx);
+int hantro_jpeg_dec_init(struct hantro_ctx *ctx);
+void hantro_jpeg_dec_exit(struct hantro_ctx *ctx);
 int hantro_h264_dec_init(struct hantro_ctx *ctx);
 void hantro_h264_dec_exit(struct hantro_ctx *ctx);
 

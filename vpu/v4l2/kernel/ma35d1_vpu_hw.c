@@ -30,9 +30,10 @@ static bool ma35d1_force_pp;
 module_param_named(ma35d1_force_pp, ma35d1_force_pp, bool, 0644);
 MODULE_PARM_DESC(ma35d1_force_pp, "Run the decoder through the post-processor (default 0)");
 
+/* PP output limit (swreg100 max width 4096); H.264 input is capped at 1080p by its OUTPUT format */
 #define MA35D1_PP_FRMSIZE { \
-	.min_width = FMT_MIN_WIDTH, .max_width = FMT_FHD_WIDTH, .step_width = MB_DIM, \
-	.min_height = FMT_MIN_HEIGHT, .max_height = FMT_FHD_HEIGHT, .step_height = MB_DIM, \
+	.min_width = FMT_MIN_WIDTH, .max_width = 4096, .step_width = MB_DIM, \
+	.min_height = FMT_MIN_HEIGHT, .max_height = 4096, .step_height = MB_DIM, \
 }
 
 static const struct hantro_fmt ma35d1_vpu_postproc_fmts[] = {
@@ -40,14 +41,7 @@ static const struct hantro_fmt ma35d1_vpu_postproc_fmts[] = {
 		.fourcc = V4L2_PIX_FMT_NV12,
 		.codec_mode = HANTRO_MODE_NONE,
 		.postprocessed = true,
-		.frmsize = {
-			.min_width = FMT_MIN_WIDTH,
-			.max_width = FMT_FHD_WIDTH,
-			.step_width = MB_DIM,
-			.min_height = FMT_MIN_HEIGHT,
-			.max_height = FMT_FHD_HEIGHT,
-			.step_height = MB_DIM,
-		},
+		.frmsize = MA35D1_PP_FRMSIZE,
 	},
 	{
 		.fourcc = V4L2_PIX_FMT_XRGB32,
@@ -88,6 +82,13 @@ static const struct hantro_fmt ma35d1_vpu_fmts[] = {
 			.max_height = FMT_FHD_HEIGHT,
 			.step_height = MB_DIM,
 		},
+	},
+	{
+		/* Baseline JPEG, one image per buffer; the PP limits the output to 4096 */
+		.fourcc = V4L2_PIX_FMT_JPEG,
+		.codec_mode = HANTRO_MODE_JPEG_DEC,
+		.max_depth = 2,
+		.frmsize = MA35D1_PP_FRMSIZE,
 	},
 };
 
@@ -144,6 +145,12 @@ static const struct hantro_codec_ops ma35d1_vpu_codec_ops[] = {
 		.init = hantro_h264_dec_init,
 		.exit = hantro_h264_dec_exit,
 	},
+	[HANTRO_MODE_JPEG_DEC] = {
+		.run = hantro_g1_jpeg_dec_run,
+		.reset = ma35d1_vpu_reset,
+		.init = hantro_jpeg_dec_init,
+		.exit = hantro_jpeg_dec_exit,
+	},
 };
 
 static const struct hantro_irq ma35d1_vpu_irqs[] = {
@@ -160,7 +167,7 @@ const struct hantro_variant ma35d1_vpu_variant = {
 	.postproc_ops = &hantro_g1_postproc_ops,
 	.force_postproc = &ma35d1_force_pp,
 	.pp_scaler = 1,
-	.codec = HANTRO_H264_DECODER,
+	.codec = HANTRO_H264_DECODER | HANTRO_JPEG_DECODER,
 	.codec_ops = ma35d1_vpu_codec_ops,
 	.irqs = ma35d1_vpu_irqs,
 	.num_irqs = ARRAY_SIZE(ma35d1_vpu_irqs),

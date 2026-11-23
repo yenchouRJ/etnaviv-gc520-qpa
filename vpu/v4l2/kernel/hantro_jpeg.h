@@ -13,3 +13,4 @@ struct hantro_jpeg_ctx {
 };
 
 void hantro_jpeg_header_assemble(struct hantro_jpeg_ctx *ctx);
+const unsigned char *hantro_jpeg_std_huffman(bool ac, bool chroma, size_t *len);

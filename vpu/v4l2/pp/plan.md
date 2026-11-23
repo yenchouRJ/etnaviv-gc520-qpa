@@ -301,6 +301,29 @@ Order: before JPEG, because JPEG needs RGB and this is testable with the existin
   truncated, corrupt) fail cleanly; H.264 playback running at the same time still works (one
   core shared at job level).
 
+#### T9 progress (work in `vpu/v4l2/jpeg/`)
+- **T9a facts (board, swreg read while a decode runs):** swreg0 `0x6E645000` (ID family != 8170, so the
+  vendor limits are the 8190 ones: up to 16384 wide, 268 Mpixel), swreg50 `0x1335A780`: JPEG supported
+  (bit 28), progressive **not** supported (bit 22 = 0), H.264 high, bus 64 bit, max configured width 1920
+  (video; the JPEG limits above are what the vendor `JpegDecInit` uses). swreg54 `0xC0040C00`, swreg99
+  `0xFFFFFFFF`, swreg100 `0xFFC74780` (PP, as in T0). PP JPEG input formats (vendor `ppapi.c`):
+  4:2:0 -> 1, 4:2:2 -> 4 (semi-planar), 4:0:0 -> 3, 4:4:0 -> 6, 4:4:4 -> 7 + ES 0, 4:1:1 -> 7 + ES 1
+  (`swreg85[31:29]`, `swreg86[31:29]`). Registers: swreg3-8, 12-27, 40 (vendor `JpegDecInitHW`,
+  `jpegdecinternal.c`); `jpeg_mode` 0/2/3/4/5/6 = 4:0:0/4:2:0/4:2:2/4:4:4/4:4:0/4:1:1; code counts in
+  swreg16-26 (variable field widths); quantisation (raster order) + AC/DC values in a DMA table (swreg40,
+  big-endian words, same endian/swap setup as H.264). Luma always uses HW table 1; chroma selectors
+  say whether Cb/Cr use the luma table or the other one.
+- **T9 design (first milestone):** own header parser (`v4l2_jpeg_parse_header` has no 4:4:0 and is a
+  Kconfig dependency); OUTPUT `V4L2_PIX_FMT_JPEG` (step 16, 33..4096), visible size = size asked in
+  `S_FMT` (crop, 8-pixel PP granularity) like the stateless H.264 path, header checked against the
+  OUTPUT format at job time (mismatch/unsupported -> buffer error, no HW access, no hang);
+  CAPTURE NV12/XRGB32/RGB565 via the PP always (combined mode, decoder output disabled, no internal
+  pictures); OUTPUT queue gets a kernel mapping when the variant has the JPEG decoder; PP output limit
+  4096 (>4096 JPEGs and `SOURCE_CHANGE` for stateful users come with T10). 4:1:1 only when the width
+  rounds to a multiple of 32; missing DHT -> standard tables.
+- Tests: `jpeg/gen_jpeg.sh` (31 images + references), `jpeg/t_jpeg_dec.c` (V4L2 tool),
+  `jpeg/run_jpeg.sh` (board, `/mnt/vc8k/jpeg`), `jpeg/cmp_jpeg.sh` (host PSNR).
+
 ### T10 — JPEG userspace and camera
 - Check the stock gst `v4l2jpegdec` unpatched first; patch only what fails (same approach as T4).
 - `filesrc ! jpegparse ! v4l2jpegdec ! video/x-raw,width=W,height=H ! waylandsink` for stills; MJPEG

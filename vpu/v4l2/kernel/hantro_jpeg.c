@@ -346,3 +346,18 @@ void hantro_jpeg_header_assemble(struct hantro_jpeg_ctx *ctx)
 
 	jpeg_set_quality(ctx);
 }
+
+/*
+ * Standard (T.81 Annex K) Huffman table as BITS[16] followed by HUFFVAL, for decoding
+ * streams without DHT (e.g. motion JPEG from UVC cameras).  @ac: AC (else DC),
+ * @chroma: table id 1 (else 0).
+ */
+const unsigned char *hantro_jpeg_std_huffman(bool ac, bool chroma, size_t *len)
+{
+	const unsigned char *t = ac ? (chroma ? chroma_ac_table : luma_ac_table) :
+				      (chroma ? chroma_dc_table : luma_dc_table);
+
+	*len = ac ? (chroma ? sizeof(chroma_ac_table) : sizeof(luma_ac_table)) :
+		    (chroma ? sizeof(chroma_dc_table) : sizeof(luma_dc_table));
+	return t;
+}

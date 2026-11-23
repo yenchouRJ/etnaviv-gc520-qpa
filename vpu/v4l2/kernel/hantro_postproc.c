@@ -50,6 +50,8 @@ static const struct hantro_postproc_regs hantro_g1_postproc_regs = {
 	.output_width = {G1_REG_PP_CONTROL, 4, 0x7ff},
 	.output_height = {G1_REG_PP_CONTROL, 15, 0x7ff},
 	.input_fmt = {G1_REG_PP_CONTROL, 29, 0x7},
+	/* swreg86 bits 31:29: input format extension (4:4:4 = 0, 4:1:1 = 1 with input_fmt 7) */
+	.input_fmt_es = {G1_SWREG(86), 29, 0x7},
 	.output_fmt = {G1_REG_PP_CONTROL, 26, 0x7},
 	.orig_width = {G1_REG_PP_MASK1_ORIG_WIDTH, 23, 0x1ff},
 	/* swreg92 bits 12:0: 13 bits so a 4096 wide output fits (mainline: 0xfff) */
@@ -278,7 +280,7 @@ bool hantro_needs_postproc(const struct hantro_ctx *ctx,
 	if (ctx->is_encoder)
 		return false;
 
-	if (ctx->need_postproc)
+	if (hantro_is_jpeg_dec(ctx) || ctx->need_postproc)
 		return true;
 
 	return fmt->postprocessed;
@@ -368,6 +370,8 @@ static void hantro_postproc_g1_enable(struct hantro_ctx *ctx)
 	HANTRO_PP_REG_WRITE(vpu, pipeline_en, 0x1);
 
 	src_pp_fmt = VPU_PP_IN_NV12;
+	if (hantro_is_jpeg_dec(ctx))
+		src_pp_fmt = ctx->jpeg_dec.pp_in;
 
 	switch (ctx->vpu_dst_fmt->fourcc) {
 	case V4L2_PIX_FMT_NV12:
@@ -428,6 +432,7 @@ static void hantro_postproc_g1_enable(struct hantro_ctx *ctx)
 	HANTRO_PP_REG_WRITE(vpu, out_luma_base, dst_dma);
 	/* The PP input is the decoded (reference) picture, not the output. */
 	HANTRO_PP_REG_WRITE(vpu, input_fmt, src_pp_fmt);
+	HANTRO_PP_REG_WRITE(vpu, input_fmt_es, hantro_is_jpeg_dec(ctx) ? ctx->jpeg_dec.pp_in_es : 0);
 	HANTRO_PP_REG_WRITE(vpu, output_fmt, dst_pp_fmt);
 	HANTRO_PP_REG_WRITE(vpu, output_width, cr.width);
 	HANTRO_PP_REG_WRITE(vpu, output_height, cr.height);
@@ -580,6 +585,10 @@ int hantro_postproc_init(struct hantro_ctx *ctx)
 	unsigned int num_buffers = cap_queue->num_buffers;
 	unsigned int i;
 	int ret;
+
+	/* JPEG is intra only and the decoder writes nothing: no internal pictures */
+	if (hantro_is_jpeg_dec(ctx))
+		return 0;
 
 	for (i = 0; i < num_buffers; i++) {
 		ret = hantro_postproc_alloc(ctx, i);
