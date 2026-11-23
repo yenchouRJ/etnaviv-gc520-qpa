@@ -250,7 +250,7 @@ Order: before JPEG, because JPEG needs RGB and this is testable with the existin
 - CMA: 1080p to 1920x1080 XRGB32 needs about 137 MB (11 x 8.3 + 40 + 6) and fails with ENOMEM at
   120 MB (expected, P13 cost; RGB565 1080p fits). Use NV12 at 1080p; T6 would cut about 40 MB.
 
-### T8 — Letterbox via PiP and `COMPOSE` (P8)
+### T8 — Letterbox via PiP and `COMPOSE` (P8) — DONE
 - Driver: `S_SELECTION(CAPTURE, COMPOSE)` accepts a rectangle inside the CAPTURE size; PP output
   base = buffer base + offset, line stride = full buffer width (`display_width`); scaler sizes and
   step rules apply to the COMPOSE rectangle; borders cleared once when buffers are allocated
@@ -265,6 +265,19 @@ Order: before JPEG, because JPEG needs RGB and this is testable with the existin
 - Panel pass: cockpit demo with the letterboxed video. Plane state must show NV12 panel-sized on
   plane-0 (fb changing) and the Qt UI on plane-1, i.e. the layout that failed with plain
   `waylandsink` + capsfilter (video had no plane once the UI started).
+
+- Result (1024x600 image): all 5 cases PASS (`tests/run_letterbox.sh` + `cmp_letterbox.sh`): 640x480 to
+  1024x600 (800x600@112,0), 720p to 1024x768 (1024x576@0,96), 1080p to 1024x600 (1024x576@0,12), 320x240 to
+  640x360, 1024x600 to 1920x1080 (1840x1080@40,0, 584/584 frames); bars exactly Y=16/UV=128, PSNR-Y 43-52 dB.
+  NV12 scale (11) and RGB (6) regressions pass. Panel: cockpit UI plus letterboxed 1080p: NV12 panel-sized
+  on plane-0 (fb changing), Qt AR24 on plane-1; user confirmed the picture.
+- Implementation notes: `ctx->compose` (width 0 = whole buffer, reset by `S_FMT` CAPTURE); `S_SELECTION`
+  COMPOSE is `EBUSY` once buffers exist, `ERANGE` outside the buffer. PP base = buffer + top*stride +
+  left*bpp (chroma: (top/2)*stride + left), stride = buffer width. Borders painted in `buf_init`
+  (needs a kernel mapping, so the scaler decoder's CAPTURE queue no longer uses NO_KERNEL_MAPPING).
+  The mixed up/down scaling rule moved from `S_FMT` (a letterbox buffer may be e.g. 1024x768 for 720p)
+  to the COMPOSE rectangle and to STREAMON (`EINVAL`, verified with 640x480 to 1024x300).
+- gst: property `add-borders` (id 16: the base decoder installs ids 1.. ignoring the offset).
 
 ### T9 — JPEG decode in the Hantro variant (kernel) (P9)
 - T9a facts: JPEG bit in swreg50 (set on this board), PP JPEG input formats on this synth config;
@@ -307,6 +320,12 @@ Order: before JPEG, because JPEG needs RGB and this is testable with the existin
   (memory-to-memory scaler node).
 - RGB with alpha channel and RGB as a performance path (NV12 wins in memory and bandwidth).
 - Upstream submission (keep patches upstream-shaped anyway).
+- gst `v4l2convert` (and any standalone raw-to-raw PP node): does not fit. `v4l2convert` needs a V4L2
+  mem2mem device with raw frames on both queues; our node is a stateless decoder (coded slices on OUTPUT)
+  and the PP only runs in pipeline mode behind it, so the element finds nothing to use. A standalone PP
+  node would be a second m2m device with its own queues and job scheduling (about T9 size) and would only
+  add scaling of non-decoder sources (camera, software decode), which the GC520 2D engine (`etna2d`)
+  already covers zero-copy. Revisit only if such a source needs the VPU scaler.
 
 ## 7. Risks
 | # | Risk | Mitigation |

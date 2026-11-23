@@ -116,7 +116,7 @@ bool hantro_postproc_forced(const struct hantro_ctx *ctx)
  * reports true.
  */
 bool hantro_postproc_try_size(const struct hantro_ctx *ctx, u32 *width, u32 *height,
-			      bool pp_only)
+			      bool pp_only, bool mix_rule)
 {
 	u32 sw = ctx->src_fmt.width, sh = ctx->src_fmt.height;
 	u32 vw = sw, vh = sh;
@@ -141,14 +141,42 @@ bool hantro_postproc_try_size(const struct hantro_ctx *ctx, u32 *width, u32 *hei
 	h = min(h, min(4096U, 3 * vh - 2) & ~1U);
 
 	/* Mixed up/down scaling is not possible: the up-scaled axis stays at the source size */
-	if (w > vw && h < vh)
+	if (mix_rule && w > vw && h < vh)
 		w = vw;
-	else if (h > vh && w < vw)
+	else if (mix_rule && h > vh && w < vw)
 		h = vh;
 
 	*width = w;
 	*height = h;
 	return pp_only || w != sw || h != sh;
+}
+
+/*
+ * The scaled rectangle (COMPOSE, default the whole buffer) must scale both axes the same way.
+ * S_FMT does not enforce it (a letterbox buffer is bigger than its picture); STREAMON does.
+ */
+bool hantro_postproc_scale_ok(const struct hantro_ctx *ctx)
+{
+	struct v4l2_rect r;
+	u32 vw = ctx->crop_w ?: ctx->src_fmt.width, vh = ctx->crop_h ?: ctx->src_fmt.height;
+
+	if (!ctx->need_postproc)
+		return true;
+	hantro_postproc_compose(ctx, &r);
+	return !((r.width > vw && r.height < vh) || (r.height > vh && r.width < vw));
+}
+
+/* Rectangle of the CAPTURE buffer that receives the scaled picture (default: all of it) */
+void hantro_postproc_compose(const struct hantro_ctx *ctx, struct v4l2_rect *r)
+{
+	if (ctx->compose.width && ctx->compose.height) {
+		*r = ctx->compose;
+		return;
+	}
+	r->left = 0;
+	r->top = 0;
+	r->width = ctx->dst_fmt.width;
+	r->height = ctx->dst_fmt.height;
 }
 
 /*
@@ -162,7 +190,7 @@ bool hantro_postproc_crop(const struct hantro_ctx *ctx, u32 *w, u32 *h)
 
 	if (!ctx->crop_w || !ctx->crop_h ||
 	    ALIGN(ctx->crop_w, MB_DIM) != *w || ALIGN(ctx->crop_h, MB_DIM) != *h ||
-	    (ctx->dst_fmt.width == *w && ctx->dst_fmt.height == *h))
+	    (ctx->dst_fmt.width == *w && ctx->dst_fmt.height == *h && !ctx->compose.width))
 		return false;
 
 	*w = ctx->crop_w;
@@ -174,8 +202,12 @@ static void hantro_postproc_g1_scale(struct hantro_ctx *ctx)
 {
 	struct hantro_dev *vpu = ctx->dev;
 	u32 iw, ih;
-	u32 ow = ctx->dst_fmt.width, oh = ctx->dst_fmt.height;
+	struct v4l2_rect c;
+	u32 ow, oh;
 
+	hantro_postproc_compose(ctx, &c);
+	ow = c.width;
+	oh = c.height;
 	hantro_postproc_crop(ctx, &iw, &ih);
 
 	/* Ratios as in the vendor PP driver (ppinternal.c), 16-bit fixed point */
@@ -329,6 +361,8 @@ static void hantro_postproc_g1_enable(struct hantro_ctx *ctx)
 	struct vb2_v4l2_buffer *dst_buf;
 	u32 src_pp_fmt, dst_pp_fmt;
 	dma_addr_t dst_dma;
+	struct v4l2_rect cr;
+	u32 bpl = ctx->dst_fmt.plane_fmt[0].bytesperline, bpp;
 
 	/* Turn on pipeline mode. Must be done first. */
 	HANTRO_PP_REG_WRITE(vpu, pipeline_en, 0x1);
@@ -355,6 +389,26 @@ static void hantro_postproc_g1_enable(struct hantro_ctx *ctx)
 
 	dst_buf = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
 	dst_dma = vb2_dma_contig_plane_dma_addr(&dst_buf->vb2_buf, 0);
+	hantro_postproc_compose(ctx, &cr);
+	/* Picture in picture: the output base moves to the COMPOSE origin, the line stride stays */
+	switch (ctx->vpu_dst_fmt->fourcc) {
+	case V4L2_PIX_FMT_XRGB32:
+		bpp = 4;
+		break;
+	case V4L2_PIX_FMT_RGB565:
+	case V4L2_PIX_FMT_YUYV:
+		bpp = 2;
+		break;
+	default:
+		bpp = 1;
+		break;
+	}
+	{
+		dma_addr_t chroma = dst_dma + bpl * ctx->dst_fmt.height + (cr.top / 2) * bpl + cr.left;
+
+		dst_dma += cr.top * bpl + cr.left * bpp;
+		HANTRO_PP_REG_WRITE(vpu, out_chroma_base, chroma);
+	}
 
 	HANTRO_PP_REG_WRITE(vpu, clk_gate, 0x1);
 	if (hantro_postproc_is_rgb(ctx->vpu_dst_fmt->fourcc)) {
@@ -372,17 +426,13 @@ static void hantro_postproc_g1_enable(struct hantro_ctx *ctx)
 	}
 	HANTRO_PP_REG_WRITE(vpu, max_burst, 16);
 	HANTRO_PP_REG_WRITE(vpu, out_luma_base, dst_dma);
-	if (ctx->vpu_dst_fmt->fourcc == V4L2_PIX_FMT_NV12)
-		HANTRO_PP_REG_WRITE(vpu, out_chroma_base,
-				    dst_dma + ctx->dst_fmt.plane_fmt[0].bytesperline *
-				    ctx->dst_fmt.height);
 	/* The PP input is the decoded (reference) picture, not the output. */
 	HANTRO_PP_REG_WRITE(vpu, input_fmt, src_pp_fmt);
 	HANTRO_PP_REG_WRITE(vpu, output_fmt, dst_pp_fmt);
-	HANTRO_PP_REG_WRITE(vpu, output_width, ctx->dst_fmt.width);
-	HANTRO_PP_REG_WRITE(vpu, output_height, ctx->dst_fmt.height);
-	HANTRO_PP_REG_WRITE(vpu, output_width_ext, ctx->dst_fmt.width >> 11);
-	HANTRO_PP_REG_WRITE(vpu, output_height_ext, ctx->dst_fmt.height >> 11);
+	HANTRO_PP_REG_WRITE(vpu, output_width, cr.width);
+	HANTRO_PP_REG_WRITE(vpu, output_height, cr.height);
+	HANTRO_PP_REG_WRITE(vpu, output_width_ext, cr.width >> 11);
+	HANTRO_PP_REG_WRITE(vpu, output_height_ext, cr.height >> 11);
 	hantro_postproc_g1_scale(ctx);
 	hantro_postproc_g1_crop(ctx);
 	HANTRO_PP_REG_WRITE(vpu, orig_width, MB_WIDTH(ctx->ref_fmt.width));

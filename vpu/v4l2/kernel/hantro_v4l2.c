@@ -368,7 +368,7 @@ static int hantro_try_fmt(const struct hantro_ctx *ctx,
 		if (ctx->dev->variant->pp_scaler)
 			scaled = hantro_postproc_try_size(ctx, &pix_mp->width,
 							  &pix_mp->height,
-							  hantro_postproc_is_rgb(fmt->fourcc));
+							  hantro_postproc_is_rgb(fmt->fourcc), false);
 		else {
 			pix_mp->width = ctx->src_fmt.width;
 			pix_mp->height = ctx->src_fmt.height;
@@ -672,6 +672,8 @@ static int hantro_set_fmt_cap(struct hantro_ctx *ctx,
 
 	ctx->vpu_dst_fmt = hantro_find_format(ctx, pix_mp->pixelformat);
 	ctx->dst_fmt = *pix_mp;
+	ctx->compose.width = 0;
+	ctx->compose.height = 0;
 	ret = hantro_set_reference_frames_format(ctx);
 	if (ret)
 		return ret;
@@ -747,6 +749,8 @@ static int vidioc_g_selection(struct file *file, void *priv,
 			sel->r.left = 0;
 			sel->r.width = w;
 			sel->r.height = h;
+			if (sel->target == V4L2_SEL_TGT_COMPOSE)
+				hantro_postproc_compose(ctx, &sel->r);
 			return 0;
 		default:
 			return -EINVAL;
@@ -809,6 +813,41 @@ static int vidioc_s_selection(struct file *file, void *priv,
 	struct hantro_ctx *ctx = fh_to_ctx(priv);
 	struct v4l2_rect *rect = &sel->r;
 	struct vb2_queue *vq;
+
+	/*
+	 * Letterbox: the rectangle of the CAPTURE buffer that gets the scaled picture.  The
+	 * buffer (S_FMT size) is cleared at allocation, so this must precede REQBUFS.
+	 */
+	if (!ctx->is_encoder && ctx->dev->variant->pp_scaler &&
+	    sel->type == V4L2_BUF_TYPE_VIDEO_CAPTURE) {
+		u32 w, h;
+
+		if (sel->target != V4L2_SEL_TGT_COMPOSE)
+			return -EINVAL;
+		if (vb2_is_busy(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
+			return -EBUSY;
+		if (rect->left < 0 || rect->top < 0 ||
+		    rect->left + rect->width > ctx->dst_fmt.width ||
+		    rect->top + rect->height > ctx->dst_fmt.height)
+			return -ERANGE;
+		w = rect->width;
+		h = rect->height;
+		hantro_postproc_try_size(ctx, &w, &h, true, true);
+		rect->left &= ~1;
+		rect->top &= ~1;
+		if (rect->left + w > ctx->dst_fmt.width || rect->top + h > ctx->dst_fmt.height)
+			return -ERANGE;
+		rect->width = w;
+		rect->height = h;
+		if (!rect->left && !rect->top && w == ctx->dst_fmt.width && h == ctx->dst_fmt.height) {
+			ctx->compose.width = 0;
+			ctx->compose.height = 0;
+		} else {
+			ctx->compose = *rect;
+			ctx->need_postproc = true;
+		}
+		return 0;
+	}
 
 	/*
 	 * Decoder with a PP scaler: the stateless H.264 SPS control has no frame crop, so the
@@ -995,6 +1034,32 @@ hantro_buf_plane_check(struct vb2_buffer *vb,
 	return 0;
 }
 
+/* Letterbox: paint the whole buffer black once, the PP only writes inside COMPOSE */
+static int hantro_buf_init(struct vb2_buffer *vb)
+{
+	struct hantro_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+	const struct v4l2_pix_format_mplane *f = &ctx->dst_fmt;
+	size_t size, luma;
+	u8 *p;
+
+	if (ctx->is_encoder || vb->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE ||
+	    !ctx->compose.width)
+		return 0;
+
+	p = vb2_plane_vaddr(vb, 0);
+	if (!p)
+		return -ENOMEM;
+	size = vb2_plane_size(vb, 0);
+	if (ctx->vpu_dst_fmt->fourcc == V4L2_PIX_FMT_NV12) {
+		luma = min_t(size_t, size, f->plane_fmt[0].bytesperline * f->height);
+		memset(p, 16, luma);
+		memset(p + luma, 128, size - luma);
+	} else {
+		memset(p, 0, size);
+	}
+	return 0;
+}
+
 static int hantro_buf_prepare(struct vb2_buffer *vb)
 {
 	struct vb2_queue *vq = vb->vb2_queue;
@@ -1083,6 +1148,11 @@ static int hantro_start_streaming(struct vb2_queue *q, unsigned int count)
 				return ret;
 		}
 
+		if (!hantro_postproc_scale_ok(ctx)) {
+			vpu_err("mixed up/down scaling is not supported\n");
+			ret = -EINVAL;
+			goto err_codec_exit;
+		}
 		if (hantro_needs_postproc(ctx, ctx->vpu_dst_fmt)) {
 			ret = hantro_postproc_init(ctx);
 			if (ret)
@@ -1159,6 +1229,7 @@ static int hantro_buf_out_validate(struct vb2_buffer *vb)
 
 const struct vb2_ops hantro_queue_ops = {
 	.queue_setup = hantro_queue_setup,
+	.buf_init = hantro_buf_init,
 	.buf_prepare = hantro_buf_prepare,
 	.buf_queue = hantro_buf_queue,
 	.buf_out_validate = hantro_buf_out_validate,

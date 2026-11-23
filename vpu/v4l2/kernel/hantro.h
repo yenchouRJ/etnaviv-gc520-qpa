@@ -273,6 +273,8 @@ struct hantro_ctx {
 	bool need_postproc;
 	/* Visible size set by the application (OUTPUT S_SELECTION CROP), 0 = none; PP input crop */
 	u32 crop_w, crop_h;
+	/* Letterbox (CAPTURE COMPOSE) inside the CAPTURE buffer; width 0 = whole buffer */
+	struct v4l2_rect compose;
 
 	/* Specific for particular codec modes. */
 	union {
@@ -520,9 +522,11 @@ void hantro_postproc_enable(struct hantro_ctx *ctx);
 int hantro_postproc_init(struct hantro_ctx *ctx);
 void hantro_postproc_free(struct hantro_ctx *ctx);
 bool hantro_postproc_forced(const struct hantro_ctx *ctx);
+void hantro_postproc_compose(const struct hantro_ctx *ctx, struct v4l2_rect *r);
 bool hantro_postproc_crop(const struct hantro_ctx *ctx, u32 *w, u32 *h);
+bool hantro_postproc_scale_ok(const struct hantro_ctx *ctx);
 bool hantro_postproc_try_size(const struct hantro_ctx *ctx, u32 *width, u32 *height,
-			      bool pp_only);
+			      bool pp_only, bool mix_rule);
 bool hantro_postproc_is_rgb(u32 fourcc);
 int hanto_postproc_enum_framesizes(struct hantro_ctx *ctx,
 				   struct v4l2_frmsizeenum *fsize);
