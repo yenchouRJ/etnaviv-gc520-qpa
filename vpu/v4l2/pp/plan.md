@@ -355,6 +355,22 @@ Order: before JPEG, because JPEG needs RGB and this is testable with the existin
   1280x720 input in `jpegparse` before any S_FMT. Still to do: patch `v4l2videodec` negotiation
   (downstream size/format -> CAPTURE S_FMT), JFIF colourspace on CAPTURE, MJPEG file (`avidemux`/`qtdemux`).
 
+#### T11a results: gst patches for the stock `v4l2jpegdec` (scaling, RGB)
+- Patch `patches/gst1-plugins-good/0001-v4l2videodec-...` (gst-plugins-good 1.22.9, `sys/v4l2/gstv4l2videodec.c`):
+  (1) `sink_getcaps` answers with the probed sink caps instead of proxying downstream, because downstream
+  width/height is the scaling request, not the bitstream size (the cause of `not-negotiated` in `jpegparse`);
+  (2) `negotiate`: do not fixate the downstream query to the native size, fixate the chosen caps towards
+  the native size, `S_FMT` the CAPTURE queue to them (the driver scales / converts in the PP) and re-acquire.
+  Same idea as the H.264 `v4l2codecs` patch. Install as `package/gstreamer1/gst1-plugins-good/0001-*.patch`.
+  Also in `patches/gst1-plugins-bad/`: `0005` (XRGB32->BGRx, RGB565->RGB16) and `0006` (h264dec
+  add-borders), generated from the gst tree; 0004-0006 apply in order on the Buildroot-patched baseline.
+- Board results, `run_gst.sh` (stock `filesrc ! jpegparse ! v4l2jpegdec ! video/x-raw,... ! filesink`):
+  scaled NV12 1024x600 PSNR-Y 43-51 dB on all 1280x720/1080p/4k/12MP images; XRGB 1024x600 42-44 dB (vs
+  ffmpeg bicubic), native XRGB 1080p 44.8 dB, RGB565 1080p 36 dB. 48x48 and 100x60 cannot be upscaled to
+  1024x600 (PP upscale limit 3x, pipeline fails to negotiate, expected). 1000x563 stays at the 8-line crop.
+- Panel (kiosk Weston, `jpeg/showj.sh`): `fdsrc ! jpegparse ! v4l2jpegdec ! video/x-raw,width=1024,height=600
+  ! waylandsink` of the 1080p drone JPEG: checked by the user, correct.
+
 ### T11 — Measurements and wrap-up
 - JPEG throughput (spec: 250 Mpixel/s at 200 MHz, about 225 at 180 MHz) and its effect on a
   running H.264 playback (frame delay of a 12 MP decode); CMA for JPEG, RGB 1080p and letterbox

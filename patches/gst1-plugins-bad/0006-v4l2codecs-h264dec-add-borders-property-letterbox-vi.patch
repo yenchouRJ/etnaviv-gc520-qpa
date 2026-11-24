@@ -1,0 +1,160 @@
+From 95891444eb8a897521a2fcd1c8ed42c42ad41b33 Mon Sep 17 00:00:00 2001
+From: yclu4 <yclu4@nuvoton.com>
+Date: Mon, 23 Nov 2026 14:49:43 +0800
+Subject: [PATCH 6/6] v4l2codecs: h264dec add-borders property (letterbox via
+ CAPTURE COMPOSE)
+
+---
+ sys/v4l2codecs/gstv4l2codech264dec.c | 35 +++++++++++++++++++++++++++-
+ sys/v4l2codecs/gstv4l2decoder.c      | 25 ++++++++++++++++++++
+ sys/v4l2codecs/gstv4l2decoder.h      |  3 +++
+ sys/v4l2codecs/gstv4l2format.h       |  2 +-
+ 4 files changed, 63 insertions(+), 2 deletions(-)
+
+diff --git a/sys/v4l2codecs/gstv4l2codech264dec.c b/sys/v4l2codecs/gstv4l2codech264dec.c
+index 6c2ca5c..d435d12 100644
+--- a/sys/v4l2codecs/gstv4l2codech264dec.c
++++ b/sys/v4l2codecs/gstv4l2codech264dec.c
+@@ -39,7 +39,9 @@ GST_DEBUG_CATEGORY_STATIC (v4l2_h264dec_debug);
+ enum
+ {
+   PROP_0,
+-  PROP_LAST = PROP_0
++  PROP_LAST = PROP_0,
++  /* the base decoder installs ids 1.. itself (offset is not applied), stay clear */
++  PROP_ADD_BORDERS = 16
+ };
+ 
+ static GstStaticPadTemplate sink_template =
+@@ -66,6 +68,7 @@ struct _GstV4l2CodecH264Dec
+   /* Visible size from the SPS, before any driver scaling */
+   gint crop_width;
+   gint crop_height;
++  gboolean add_borders;
+   gint coded_width;
+   gint coded_height;
+   guint bitdepth;
+@@ -383,6 +386,24 @@ gst_v4l2_codec_h264_dec_negotiate (GstVideoDecoder * decoder)
+         self->vinfo.height);
+     self->display_width = self->vinfo.width;
+     self->display_height = self->vinfo.height;
++
++    if (self->add_borders) {
++      /* Fit the picture into the CAPTURE size keeping its aspect; the driver
++       * paints the bars, so the video stays one buffer on one plane. */
++      GstVideoRectangle src = { 0, 0, self->crop_width, self->crop_height };
++      GstVideoRectangle dst = { 0, 0, self->vinfo.width, self->vinfo.height };
++      GstVideoRectangle r;
++
++      gst_video_center_rect (&src, &dst, &r, TRUE);
++      r.w &= ~7;
++      r.h &= ~1;
++      r.x = (self->vinfo.width - r.w) / 2 & ~1;
++      r.y = (self->vinfo.height - r.h) / 2 & ~1;
++      if (!gst_v4l2_decoder_set_src_compose (self->decoder, &r))
++        GST_WARNING_OBJECT (self, "Driver cannot letterbox, stretching");
++      else
++        GST_INFO_OBJECT (self, "Letterbox %ix%i at %i,%i", r.w, r.h, r.x, r.y);
++    }
+   } else {
+     self->display_width = self->crop_width;
+     self->display_height = self->crop_height;
+@@ -1488,6 +1509,9 @@ gst_v4l2_codec_h264_dec_set_property (GObject * object, guint prop_id,
+   GObject *dec = G_OBJECT (self->decoder);
+ 
+   switch (prop_id) {
++    case PROP_ADD_BORDERS:
++      self->add_borders = g_value_get_boolean (value);
++      break;
+     default:
+       gst_v4l2_decoder_set_property (dec, prop_id - PROP_LAST, value, pspec);
+       break;
+@@ -1502,6 +1526,9 @@ gst_v4l2_codec_h264_dec_get_property (GObject * object, guint prop_id,
+   GObject *dec = G_OBJECT (self->decoder);
+ 
+   switch (prop_id) {
++    case PROP_ADD_BORDERS:
++      g_value_set_boolean (value, self->add_borders);
++      break;
+     default:
+       gst_v4l2_decoder_get_property (dec, prop_id - PROP_LAST, value, pspec);
+       break;
+@@ -1591,6 +1618,12 @@ gst_v4l2_codec_h264_dec_subclass_init (GstV4l2CodecH264DecClass * klass,
+   h264decoder_class->get_preferred_output_delay =
+       GST_DEBUG_FUNCPTR (gst_v4l2_codec_h264_dec_get_preferred_output_delay);
+ 
++  g_object_class_install_property (gobject_class, PROP_ADD_BORDERS,
++      g_param_spec_boolean ("add-borders", "Add borders",
++          "Keep the aspect ratio when the driver scales to the downstream "
++          "size, filling the rest with black bars (needs driver COMPOSE support)",
++          FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
++
+   klass->device = device;
+   gst_v4l2_decoder_install_properties (gobject_class, PROP_LAST, device);
+ }
+diff --git a/sys/v4l2codecs/gstv4l2decoder.c b/sys/v4l2codecs/gstv4l2decoder.c
+index 434281c..879d598 100644
+--- a/sys/v4l2codecs/gstv4l2decoder.c
++++ b/sys/v4l2codecs/gstv4l2decoder.c
+@@ -522,6 +522,31 @@ gst_v4l2_decoder_set_src_crop (GstV4l2Decoder * self, gint width, gint height)
+         g_strerror (errno));
+ }
+ 
++/* Letterbox: the rectangle of the CAPTURE buffer (S_FMT size) that receives the scaled
++ * picture.  Must be set before the buffers are allocated.  Returns FALSE when the
++ * driver cannot do it; r is updated with what the driver accepted. */
++gboolean
++gst_v4l2_decoder_set_src_compose (GstV4l2Decoder * self, GstVideoRectangle * r)
++{
++  struct v4l2_selection sel = {
++    .type = self->src_buf_type,
++    .target = V4L2_SEL_TGT_COMPOSE,
++    .r = {.left = r->x,.top = r->y,.width = r->w,.height = r->h},
++  };
++
++  if (ioctl (self->video_fd, VIDIOC_S_SELECTION, &sel) < 0) {
++    GST_WARNING_OBJECT (self, "VIDIOC_S_SELECTION (compose) failed: %s",
++        g_strerror (errno));
++    return FALSE;
++  }
++
++  r->x = sel.r.left;
++  r->y = sel.r.top;
++  r->w = sel.r.width;
++  r->h = sel.r.height;
++  return TRUE;
++}
++
+ gboolean
+ gst_v4l2_decoder_select_src_format (GstV4l2Decoder * self, GstCaps * caps,
+     GstVideoInfo * info)
+diff --git a/sys/v4l2codecs/gstv4l2decoder.h b/sys/v4l2codecs/gstv4l2decoder.h
+index 4361ee7..1ade8f8 100644
+--- a/sys/v4l2codecs/gstv4l2decoder.h
++++ b/sys/v4l2codecs/gstv4l2decoder.h
+@@ -61,6 +61,9 @@ GstCaps *         gst_v4l2_decoder_enum_src_formats (GstV4l2Decoder * self);
+ void              gst_v4l2_decoder_set_src_crop (GstV4l2Decoder * self,
+                                                  gint width, gint height);
+ 
++gboolean          gst_v4l2_decoder_set_src_compose (GstV4l2Decoder * self,
++                                                    GstVideoRectangle * r);
++
+ gboolean          gst_v4l2_decoder_select_src_format (GstV4l2Decoder * self,
+                                                       GstCaps * caps,
+                                                       GstVideoInfo * info);
+diff --git a/sys/v4l2codecs/gstv4l2format.h b/sys/v4l2codecs/gstv4l2format.h
+index b579248..852fc09 100644
+--- a/sys/v4l2codecs/gstv4l2format.h
++++ b/sys/v4l2codecs/gstv4l2format.h
+@@ -24,7 +24,7 @@
+ #include <gst/video/video.h>
+ #include "linux/videodev2.h"
+ 
+-#define GST_V4L2_DEFAULT_VIDEO_FORMATS "{ NV12, YUY2, NV12_4L4, NV12_32L32, NV12_16L32S, I420, P010_10LE}"
++#define GST_V4L2_DEFAULT_VIDEO_FORMATS "{ NV12, YUY2, NV12_4L4, NV12_32L32, NV12_16L32S, I420, P010_10LE, BGRx, RGB16}"
+ 
+ gboolean   gst_v4l2_format_to_video_info (struct v4l2_format * fmt,
+                                           GstVideoInfo * out_info);
+-- 
+2.43.0
+

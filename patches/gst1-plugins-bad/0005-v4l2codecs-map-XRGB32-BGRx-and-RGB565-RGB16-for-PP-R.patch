@@ -1,0 +1,26 @@
+From c1565a103a94d4872ebed989020181113bf888a5 Mon Sep 17 00:00:00 2001
+From: yclu4 <yclu4@nuvoton.com>
+Date: Mon, 23 Nov 2026 11:22:26 +0800
+Subject: [PATCH 5/6] v4l2codecs: map XRGB32->BGRx and RGB565->RGB16 for PP RGB
+ output
+
+---
+ sys/v4l2codecs/gstv4l2format.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/sys/v4l2codecs/gstv4l2format.c b/sys/v4l2codecs/gstv4l2format.c
+index 1110742..9a0432e 100644
+--- a/sys/v4l2codecs/gstv4l2format.c
++++ b/sys/v4l2codecs/gstv4l2format.c
+@@ -39,6 +39,8 @@ static struct FormatEntry format_map[] = {
+   {V4L2_PIX_FMT_MM21, 2, GST_VIDEO_FORMAT_NV12_16L32S, 8, 420},
+   {V4L2_PIX_FMT_YUV420M, 3, GST_VIDEO_FORMAT_I420, 8, 420},
+   {V4L2_PIX_FMT_P010, 1, GST_VIDEO_FORMAT_P010_10LE, 16, 420},
++  {V4L2_PIX_FMT_XRGB32, 1, GST_VIDEO_FORMAT_BGRx, 8, 444},
++  {V4L2_PIX_FMT_RGB565, 1, GST_VIDEO_FORMAT_RGB16, 8, 444},
+   {0,}
+ };
+ 
+-- 
+2.43.0
+

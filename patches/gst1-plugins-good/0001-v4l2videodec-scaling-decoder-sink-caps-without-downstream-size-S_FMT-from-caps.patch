@@ -1,0 +1,86 @@
+From 67928ae250697385c697bcb80f8804bfb43c2dcc Mon Sep 17 00:00:00 2001
+From: joey <joey@example.com>
+Date: Tue, 24 Nov 2026 14:41:26 +0800
+Subject: [PATCH] v4l2videodec: scaling decoder: sink caps without downstream
+ size, CAPTURE S_FMT from downstream caps
+
+---
+ sys/v4l2/gstv4l2videodec.c | 42 ++++++++++++++++++++++++++++++--------
+ 1 file changed, 34 insertions(+), 8 deletions(-)
+
+diff --git a/sys/v4l2/gstv4l2videodec.c b/sys/v4l2/gstv4l2videodec.c
+index c7f39dd..740096c 100644
+--- a/sys/v4l2/gstv4l2videodec.c
++++ b/sys/v4l2/gstv4l2videodec.c
+@@ -437,8 +437,10 @@ gst_v4l2_video_dec_negotiate (GstVideoDecoder * decoder)
+   GST_DEBUG_OBJECT (self, "Acquired caps: %" GST_PTR_FORMAT, acquired_caps);
+   fixation_caps = gst_caps_copy (acquired_caps);
+   st = gst_caps_get_structure (fixation_caps, 0);
++  /* The size is not fixated here: a scaling CAPTURE queue (post-processor) lets
++   * downstream pick another size, see below. */
+   gst_structure_remove_fields (st, "format", "colorimetry", "chroma-site",
+-      NULL);
++      "width", "height", NULL);
+ 
+   /* Probe currently available pixel formats */
+   available_caps = gst_caps_copy (self->probed_srccaps);
+@@ -468,16 +470,27 @@ gst_v4l2_video_dec_negotiate (GstVideoDecoder * decoder)
+   if (gst_caps_is_subset (acquired_caps, caps))
+     goto use_acquired_caps;
+ 
+-  /* Fixate pixel format */
++  /* Fixate pixel format, and the size towards the one the driver acquired */
++  caps = gst_caps_truncate (caps);
++  st = gst_caps_get_structure (caps, 0);
++  gst_structure_fixate_field_nearest_int (st, "width", info.width);
++  gst_structure_fixate_field_nearest_int (st, "height", info.height);
+   caps = gst_caps_fixate (caps);
+ 
+   GST_DEBUG_OBJECT (self, "Chosen decoded caps: %" GST_PTR_FORMAT, caps);
+ 
+-  /* Try to set negotiated format, on success replace acquired format */
+-  if (gst_v4l2_object_set_format (self->v4l2capture, caps, &error))
+-    gst_video_info_from_caps (&info, caps);
+-  else
++  /* Try to set negotiated format (the driver may scale), on success replace
++   * acquired format */
++  if (gst_v4l2_object_set_format (self->v4l2capture, caps, &error)) {
++    if (gst_v4l2_object_acquire_format (self->v4l2capture, &info)) {
++      info.fps_n = self->v4l2output->info.fps_n;
++      info.fps_d = self->v4l2output->info.fps_d;
++    } else {
++      gst_video_info_from_caps (&info, caps);
++    }
++  } else {
+     gst_v4l2_clear_error (&error);
++  }
+ 
+ use_acquired_caps:
+   gst_caps_unref (acquired_caps);
+@@ -1150,8 +1163,21 @@ gst_v4l2_video_dec_sink_getcaps (GstVideoDecoder * decoder, GstCaps * filter)
+   GstV4l2VideoDec *self = GST_V4L2_VIDEO_DEC (decoder);
+   GstCaps *result;
+ 
+-  result = gst_video_decoder_proxy_getcaps (decoder, self->probed_sinkcaps,
+-      filter);
++  /* The default proxy copies downstream width/height onto the coded sink caps.
++   * A decoder whose CAPTURE queue can scale (post-processor) is asked for the
++   * scaled size downstream, which is not the size of the bitstream, so only
++   * answer with the probed sink caps. */
++  if (self->probed_sinkcaps)
++    result = gst_caps_ref (self->probed_sinkcaps);
++  else
++    result =
++        gst_pad_get_pad_template_caps (GST_VIDEO_DECODER_SINK_PAD (decoder));
++  if (filter) {
++    GstCaps *tmp = gst_caps_intersect_full (filter, result,
++        GST_CAPS_INTERSECT_FIRST);
++    gst_caps_unref (result);
++    result = tmp;
++  }
+ 
+   GST_DEBUG_OBJECT (self, "Returning sink caps %" GST_PTR_FORMAT, result);
+ 
+-- 
+2.43.0
+
