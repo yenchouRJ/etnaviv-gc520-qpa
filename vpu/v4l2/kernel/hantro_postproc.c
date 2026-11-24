@@ -295,7 +295,7 @@ bool hantro_postproc_is_rgb(u32 fourcc)
  * RGB output: channel masks/pad positions (vendor PPSetRgbBitmask) and the YCbCr to RGB
  * matrix (vendor PPSetRgbTransformCoeffs, ppapi.c tables). Matrix and range follow the
  * CAPTURE colorimetry: BT.709 only when ycbcr_enc/colorspace say so, full range only when
- * quantization/colorspace say so (default: BT.601, limited).
+ * quantization/colorspace say so (default: BT.601 limited, BT.709 for HD video).
  */
 static void hantro_postproc_g1_rgb(struct hantro_ctx *ctx, bool rgb16)
 {
@@ -306,7 +306,15 @@ static void hantro_postproc_g1_rgb(struct hantro_ctx *ctx, bool rgb16)
 	u32 a, b, c, d, e;
 
 	if (enc == V4L2_YCBCR_ENC_DEFAULT)
-		bt709 = f->colorspace == V4L2_COLORSPACE_REC709;
+		/*
+		 * Colorspace JPEG on a video stream is the reset default, i.e. userspace did
+		 * not describe the stream (stateless gst does not): use the usual heuristic,
+		 * HD (>= 720 lines) is BT.709, SD is BT.601.
+		 */
+		bt709 = f->colorspace == V4L2_COLORSPACE_REC709 ||
+			(f->colorspace == V4L2_COLORSPACE_JPEG &&
+			 ctx->vpu_src_fmt->fourcc != V4L2_PIX_FMT_JPEG &&
+			 ctx->src_fmt.height >= 720);
 	else
 		bt709 = enc == V4L2_YCBCR_ENC_709;
 	if (quant == V4L2_QUANTIZATION_DEFAULT)

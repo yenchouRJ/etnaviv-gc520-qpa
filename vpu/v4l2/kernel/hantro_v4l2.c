@@ -391,6 +391,14 @@ static int hantro_try_fmt(const struct hantro_ctx *ctx,
 		}
 	}
 
+	/* JPEG data is JFIF: BT.601 matrix, full range, sRGB transfer, whatever was requested */
+	if (hantro_is_jpeg_dec(ctx)) {
+		pix_mp->colorspace = V4L2_COLORSPACE_JPEG;
+		pix_mp->ycbcr_enc = V4L2_YCBCR_ENC_601;
+		pix_mp->quantization = V4L2_QUANTIZATION_FULL_RANGE;
+		pix_mp->xfer_func = V4L2_XFER_FUNC_SRGB;
+	}
+
 	pix_mp->field = V4L2_FIELD_NONE;
 
 	if (!scaled)

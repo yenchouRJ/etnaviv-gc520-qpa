@@ -93,4 +93,7 @@ frame drone-hd_1920_1080_30fps.mp4 5 16 16 $T/t16.ppm
 cjpeg -quality 85 -sample 2x2,1x1,1x1 -outfile neg_tiny_16x16.jpg $T/t16.ppm
 # extended sequential (SOF1, 16-bit quant tables): not supported by the HW
 cjpeg -quality 10 -sample 2x2,1x1,1x1 -outfile neg_sof1_16bitq.jpg $T/drone720.ppm
+# larger than the PP output limit (4096): must be rejected cleanly
+convert -size 4200x600 gradient:red-blue $T/over.ppm 2>/dev/null || ffmpeg -v error -y -f lavfi -i testsrc2=size=4200x600 -frames:v 1 $T/over.ppm
+cjpeg -quality 80 -sample 2x2,1x1,1x1 -outfile neg_oversize_4200x600.jpg $T/over.ppm
 ls "$O" | grep -c '\.jpg$' | xargs echo "images:"

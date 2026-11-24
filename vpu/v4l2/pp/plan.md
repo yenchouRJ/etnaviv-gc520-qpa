@@ -381,6 +381,14 @@ Order: before JPEG, because JPEG needs RGB and this is testable with the existin
 - Note: the boot-time Weston (full ini) holds the DRM master; `killall weston` before starting the kiosk one.
 - Decision: JPEGs above the PP input limit are to be documented as unsupported and rejected cleanly (kernel change pending).
 
+#### T11c: colorimetry and oversize JPEG (kernel, to be board-tested after rebuild)
+- JPEG decode: CAPTURE G/S/TRY_FMT always report JFIF (colorspace JPEG, BT.601, full range, sRGB); the PP matrix follows it.
+- Video (H.264) RGB output: stateless gst sets no colorimetry, so the reset default (colorspace JPEG on a non-JPEG stream)
+  means "unspecified": HD (>= 720 lines) now uses BT.709, SD BT.601; limited range. Explicit colorimetry from userspace still wins.
+  NV12 output has no conversion and is unaffected. Better long term: gst sets colorimetry from the SPS VUI.
+- JPEGs larger than 4096 in either direction are rejected at parse (buffer error, no hang); documented limit. Negative test
+  `neg_oversize_4200x600.jpg` added to `gen_jpeg.sh`.
+
 ### T11 — Measurements and wrap-up
 - JPEG throughput (spec: 250 Mpixel/s at 200 MHz, about 225 at 180 MHz) and its effect on a
   running H.264 playback (frame delay of a 12 MP decode); CMA for JPEG, RGB 1080p and letterbox
