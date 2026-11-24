@@ -371,6 +371,16 @@ Order: before JPEG, because JPEG needs RGB and this is testable with the existin
 - Panel (kiosk Weston, `jpeg/showj.sh`): `fdsrc ! jpegparse ! v4l2jpegdec ! video/x-raw,width=1024,height=600
   ! waylandsink` of the 1080p drone JPEG: checked by the user, correct.
 
+#### T11b results: MJPEG files through the stock pipeline
+- Files: ffmpeg testsrc2 30 fps, 4 s (120 frames), mjpeg yuvj420p, as .avi and .mp4 (1024x600 and 1920x1080).
+- `filesrc ! avidemux|qtdemux ! jpegparse ! v4l2jpegdec ! video/x-raw,format=BGRx,width=1024,height=600 ! fakesink sync=false`:
+  1024x600 avi 0.79 s (153 fps), 1080p avi 2.6 s (46 fps, with PP downscale), 1080p mp4 2.4 s. No errors, no dmesg output.
+- Real time on the panel (kiosk Weston, `waylandsink`, 1080p mp4 -> BGRx 1024x600): ends after 4.00 s, so 30 fps is kept;
+  `/sys/kernel/debug/dri/0/state` shows the video on plane-1 as an XR24 dmabuf fb (not composited). CmaFree returns to the
+  pre-run value after the run (no leak).
+- Note: the boot-time Weston (full ini) holds the DRM master; `killall weston` before starting the kiosk one.
+- Decision: JPEGs above the PP input limit are to be documented as unsupported and rejected cleanly (kernel change pending).
+
 ### T11 — Measurements and wrap-up
 - JPEG throughput (spec: 250 Mpixel/s at 200 MHz, about 225 at 180 MHz) and its effect on a
   running H.264 playback (frame delay of a 12 MP decode); CMA for JPEG, RGB 1080p and letterbox
