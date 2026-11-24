@@ -324,6 +324,15 @@ Order: before JPEG, because JPEG needs RGB and this is testable with the existin
 - Tests: `jpeg/gen_jpeg.sh` (31 images + references), `jpeg/t_jpeg_dec.c` (V4L2 tool),
   `jpeg/run_jpeg.sh` (board, `/mnt/vc8k/jpeg`), `jpeg/cmp_jpeg.sh` (host PSNR).
 
+- **T9 board results (kernel #99):** all 26 positives decode (4:2:0/4:2:2/4:4:0/4:4:4/4:1:1/gray,
+  restart markers, q10/q100, optimized Huffman, 48x48 .. 4000x3000): unscaled PSNR-Y 62-68 dB; scaled to
+  1024x600 NV12 43-51 dB; XRGB 1024x600 ~43 dB. 9 negatives (progressive, arithmetic, non-interleaved,
+  SOF1/16-bit DQT, truncated, corrupt, garbage, empty, 16x16) are rejected cleanly (buffer error, no hang,
+  no dmesg errors). Speed: 1280x720 6 ms, 1080p 13.5 ms, 3840x2160 -> 1080p 80 ms, 12 MP 113 ms.
+  Known limits: visible size has 8-pixel granularity (1000x563 is scaled from 1000x568); 4:0:0 chroma
+  is 128 (ffmpeg's gray->nv12 reference has 0, not a HW difference); PP upscale limit applies to tiny
+  images; SOF1 (extended sequential) unsupported, as in the vendor driver.
+
 ### T10 — JPEG userspace and camera
 - Check the stock gst `v4l2jpegdec` unpatched first; patch only what fails (same approach as T4).
 - `filesrc ! jpegparse ! v4l2jpegdec ! video/x-raw,width=W,height=H ! waylandsink` for stills; MJPEG

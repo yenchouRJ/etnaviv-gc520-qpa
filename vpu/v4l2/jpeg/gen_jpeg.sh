@@ -62,7 +62,7 @@ mk j17_100x60_420          $T/tiny100.ppm   -quality 85 -sample 2x2,1x1,1x1
 mk j18_3840x2160_420       $T/big4k.ppm     -quality 90 -sample 2x2,1x1,1x1
 mk j19_4000x3000_420       $T/big12mp.ppm   -quality 90 -sample 2x2,1x1,1x1
 # --- entropy coding / tables ---
-mk j20_1280x720_420_q10    $T/drone720.ppm  -quality 10  -sample 2x2,1x1,1x1
+mk j20_1280x720_420_q10    $T/drone720.ppm  -quality 10 -baseline -sample 2x2,1x1,1x1
 mk j21_1280x720_420_q100   $T/drone720.ppm  -quality 100 -sample 2x2,1x1,1x1
 mk j22_1280x720_420_opt    $T/drone720.ppm  -quality 85  -sample 2x2,1x1,1x1 -optimize
 mk j23_1280x720_420_rst1   $T/drone720.ppm  -quality 85  -sample 2x2,1x1,1x1 -restart 1B
@@ -91,4 +91,6 @@ head -c 4096 /dev/urandom > neg_garbage.jpg
 # too small (< 48 in both directions is allowed by the PP rules? 16x16 is below the HW minimum)
 frame drone-hd_1920_1080_30fps.mp4 5 16 16 $T/t16.ppm
 cjpeg -quality 85 -sample 2x2,1x1,1x1 -outfile neg_tiny_16x16.jpg $T/t16.ppm
+# extended sequential (SOF1, 16-bit quant tables): not supported by the HW
+cjpeg -quality 10 -sample 2x2,1x1,1x1 -outfile neg_sof1_16bitq.jpg $T/drone720.ppm
 ls "$O" | grep -c '\.jpg$' | xargs echo "images:"
