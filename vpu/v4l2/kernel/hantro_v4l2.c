@@ -213,6 +213,10 @@ static int vidioc_enum_framesizes(struct file *file, void *priv,
 
 	fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
 	fsize->stepwise = fmt->frmsize;
+	/* JPEG: any size is accepted on OUTPUT (the driver aligns and crops); step 16 would make
+	 * stock gst reject e.g. 1080 lines */
+	if (fmt->codec_mode == HANTRO_MODE_JPEG_DEC)
+		fsize->stepwise.step_width = fsize->stepwise.step_height = 1;
 
 	return 0;
 }
@@ -928,6 +932,46 @@ static const struct v4l2_event hantro_eos_event = {
 	.type = V4L2_EVENT_EOS
 };
 
+static int vidioc_try_decoder_cmd(struct file *file, void *priv,
+				  struct v4l2_decoder_cmd *dc)
+{
+	struct hantro_ctx *ctx = fh_to_ctx(priv);
+
+	/* stateful style (STOP/START with a LAST buffer) for JPEG, as stock gst expects */
+	if (hantro_is_jpeg_dec(ctx))
+		return v4l2_m2m_ioctl_try_decoder_cmd(file, priv, dc);
+	return v4l2_m2m_ioctl_stateless_try_decoder_cmd(file, priv, dc);
+}
+
+static int vidioc_decoder_cmd(struct file *file, void *priv,
+			      struct v4l2_decoder_cmd *dc)
+{
+	struct hantro_ctx *ctx = fh_to_ctx(priv);
+	int ret;
+
+	if (!hantro_is_jpeg_dec(ctx))
+		return v4l2_m2m_ioctl_stateless_decoder_cmd(file, priv, dc);
+
+	ret = v4l2_m2m_ioctl_try_decoder_cmd(file, priv, dc);
+	if (ret < 0)
+		return ret;
+
+	/* no streaming gate: gst sends STOP while CAPTURE is still being set up; the
+	 * m2m helper then marks the last queued OUTPUT buffer (or the next CAPTURE one) */
+	ret = v4l2_m2m_ioctl_decoder_cmd(file, priv, dc);
+	if (ret < 0)
+		return ret;
+
+	if (dc->cmd == V4L2_DEC_CMD_STOP &&
+	    v4l2_m2m_has_stopped(ctx->fh.m2m_ctx))
+		v4l2_event_queue_fh(&ctx->fh, &hantro_eos_event);
+
+	if (dc->cmd == V4L2_DEC_CMD_START)
+		vb2_clear_last_buffer_dequeued(&ctx->fh.m2m_ctx->cap_q_ctx.q);
+
+	return 0;
+}
+
 static int vidioc_encoder_cmd(struct file *file, void *priv,
 			      struct v4l2_encoder_cmd *ec)
 {
@@ -986,8 +1030,8 @@ const struct v4l2_ioctl_ops hantro_ioctl_ops = {
 	.vidioc_g_selection = vidioc_g_selection,
 	.vidioc_s_selection = vidioc_s_selection,
 
-	.vidioc_decoder_cmd = v4l2_m2m_ioctl_stateless_decoder_cmd,
-	.vidioc_try_decoder_cmd = v4l2_m2m_ioctl_stateless_try_decoder_cmd,
+	.vidioc_decoder_cmd = vidioc_decoder_cmd,
+	.vidioc_try_decoder_cmd = vidioc_try_decoder_cmd,
 
 	.vidioc_try_encoder_cmd = v4l2_m2m_ioctl_try_encoder_cmd,
 	.vidioc_encoder_cmd = vidioc_encoder_cmd,

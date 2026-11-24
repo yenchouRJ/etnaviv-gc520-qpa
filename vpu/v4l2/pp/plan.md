@@ -339,6 +339,22 @@ Order: before JPEG, because JPEG needs RGB and this is testable with the existin
   camera (USB UVC) `v4l2src ! v4l2jpegdec ! waylandsink` at 30 fps on the panel (if a camera is available).
 - Pass: scaled/letterboxed JPEG on the panel; a still next to the Qt UI keeps two planes.
 
+#### T10 results (kernel #103, unpatched stock gst 1.22.9 `v4l2jpegdec`, `jpeg/run_gst.sh`)
+- Needs Buildroot `GST1_PLUGINS_GOOD_PLUGIN_V4L2` + `_V4L2_PROBE` (the element is registered by probing
+  `/dev/video0`) and `GST1_PLUGINS_BAD_PLUGIN_JPEGFORMAT` (`jpegparse`).
+- Pipeline `filesrc ! jpegparse ! v4l2jpegdec ! video/x-raw,format=NV12 ! filesink`: all 23 positive
+  images decode and reach EOS by themselves, PSNR-Y 62-68 dB, identical to the plain V4L2 tool
+  (`cmp_jpeg.sh`); caps sizes 1920x1080, 1024x600, 1000x568 (563 rounded up to 8), 104x64; no dmesg errors.
+  4k / 12 MP come out at 1920x1088 (CAPTURE default, scaled by the PP).
+- Kernel fixes the stock element needed: (1) `DECODER_CMD` STOP/START with the stateful m2m helpers, no
+  streaming gate (gst sends STOP while CAPTURE is still being set up; without it gst loops on empty
+  buffers and never reaches EOS), LAST flag + EOS event; (2) OUTPUT `ENUM_FRAMESIZES` step 1 (with step 16
+  gst built EMPTY sink caps for heights such as 1080/563/600 -> `not-negotiated` in jpegparse).
+- Not working with the stock element (-> T11 gst patch): scaling or RGB via downstream caps. `v4l2videodec`
+  derives its sink caps from downstream, so `v4l2jpegdec ! video/x-raw,width=1024,height=600` rejects a
+  1280x720 input in `jpegparse` before any S_FMT. Still to do: patch `v4l2videodec` negotiation
+  (downstream size/format -> CAPTURE S_FMT), JFIF colourspace on CAPTURE, MJPEG file (`avidemux`/`qtdemux`).
+
 ### T11 — Measurements and wrap-up
 - JPEG throughput (spec: 250 Mpixel/s at 200 MHz, about 225 at 180 MHz) and its effect on a
   running H.264 playback (frame delay of a 12 MP decode); CMA for JPEG, RGB 1080p and letterbox

@@ -429,8 +429,8 @@ int hantro_g1_jpeg_dec_run(struct hantro_ctx *ctx)
 	if (!ret)
 		ret = hantro_jpeg_check(&hdr);
 	if (ret) {
-		vpu_err("JPEG: stream not supported (baseline interleaved 8 bit, 33..%u)\n",
-			JPG_MAX_DIM);
+		vpu_err("JPEG: stream not supported (baseline interleaved 8 bit, 33..%u): ret %d payload %zu head %*ph\n",
+			JPG_MAX_DIM, ret, payload, (int)min_t(size_t, payload, 8), vaddr);
 		return ret;
 	}
 	if (ALIGN(hdr.width, MB_DIM) != ctx->src_fmt.width ||
