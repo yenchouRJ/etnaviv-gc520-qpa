@@ -389,6 +389,13 @@ Order: before JPEG, because JPEG needs RGB and this is testable with the existin
 - JPEGs larger than 4096 in either direction are rejected at parse (buffer error, no hang); documented limit. Negative test
   `neg_oversize_4200x600.jpg` added to `gen_jpeg.sh`.
 
+#### T11c results (kernel #106)
+- `run_jpeg.sh all`: all positives decode, all 10 negatives (incl. `neg_oversize_4200x600`) rejected cleanly, no dmesg output.
+  RGB PSNR (j10, 1024x600) 42.72 dB, identical to before: JFIF colorimetry was already effectively used, now it is explicit.
+  cmp FAILs are the known harness cases (4k/12MP at the 1920x1088 default, 8-line crop of 1000x563, > 3x upscales, j11 buffer 1024x608).
+- H.264 1080p -> BGRx 1024x600 (BT.709 fallback): plane-1 XR24 dmabuf, panel colours judged correct by the user.
+- Board note: after a reflash `/run/user/0` does not exist; `mkdir -p /run/user/0; chmod 700` before starting Weston.
+
 ### T11 — Measurements and wrap-up
 - JPEG throughput (spec: 250 Mpixel/s at 200 MHz, about 225 at 180 MHz) and its effect on a
   running H.264 playback (frame delay of a 12 MP decode); CMA for JPEG, RGB 1080p and letterbox
