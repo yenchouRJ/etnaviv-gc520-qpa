@@ -355,6 +355,13 @@ Order: before JPEG, because JPEG needs RGB and this is testable with the existin
   1280x720 input in `jpegparse` before any S_FMT. Still to do: patch `v4l2videodec` negotiation
   (downstream size/format -> CAPTURE S_FMT), JFIF colourspace on CAPTURE, MJPEG file (`avidemux`/`qtdemux`).
 
+### T11 — Measurements and wrap-up
+- JPEG throughput (spec: 250 Mpixel/s at 200 MHz, about 225 at 180 MHz) and its effect on a
+  running H.264 playback (frame delay of a 12 MP decode); CMA for JPEG, RGB 1080p and letterbox
+  buffers (extend `tests/mon_cma_scaled.sh`).
+- Record results here; generate the gst patch into `patches/gst1-plugins-bad/` from the gst tree
+  commits (`git format-patch` from `00b38c5`), update `docs/model.md`.
+
 #### T11a results: gst patches for the stock `v4l2jpegdec` (scaling, RGB)
 - Patch `patches/gst1-plugins-good/0001-v4l2videodec-...` (gst-plugins-good 1.22.9, `sys/v4l2/gstv4l2videodec.c`):
   (1) `sink_getcaps` answers with the probed sink caps instead of proxying downstream, because downstream
@@ -394,14 +401,37 @@ Order: before JPEG, because JPEG needs RGB and this is testable with the existin
   RGB PSNR (j10, 1024x600) 42.72 dB, identical to before: JFIF colorimetry was already effectively used, now it is explicit.
   cmp FAILs are the known harness cases (4k/12MP at the 1920x1088 default, 8-line crop of 1000x563, > 3x upscales, j11 buffer 1024x608).
 - H.264 1080p -> BGRx 1024x600 (BT.709 fallback): plane-1 XR24 dmabuf, panel colours judged correct by the user.
-- Board note: after a reflash `/run/user/0` does not exist; `mkdir -p /run/user/0; chmod 700` before starting Weston.
+- Board note: the image's `/etc/profile.d/weston.sh` uses `XDG_RUNTIME_DIR=/tmp/xdg`, `WAYLAND_DISPLAY=wayland-1` (Weston 10) and starts the desktop-ini Weston at login; use that one (an earlier note and `showj.sh` wrongly used `/run/user/0`).
 
-### T11 — Measurements and wrap-up
-- JPEG throughput (spec: 250 Mpixel/s at 200 MHz, about 225 at 180 MHz) and its effect on a
-  running H.264 playback (frame delay of a 12 MP decode); CMA for JPEG, RGB 1080p and letterbox
-  buffers (extend `tests/mon_cma_scaled.sh`).
-- Record results here; generate the gst patch into `patches/gst1-plugins-bad/` from the gst tree
-  commits (`git format-patch` from `00b38c5`), update `docs/model.md`.
+#### T11d results: throughput and interleaving (kernel #106, `t_jpeg_dec -n 30`, per-frame VPU time, no display)
+| image | native NV12 | -> 1024x600 NV12 | -> 1024x600 XRGB |
+|---|---|---|---|
+| 48x48 / 100x60 | 0.2 ms | 0.3 / 0.5 ms | 0.3 / 0.5 ms |
+| 1024x600 | 4.6 ms (217 fps) | 4.6 | 4.7 |
+| 1280x720 | 6.0 ms (167 fps) | 9.2 | 9.2 |
+| 1920x1080 | 13.4 ms (75 fps) | 20.0 (50 fps) | 20.0 |
+| 3840x2160 | 80 ms | 76.6 | 76.6 |
+| 4000x3000 (12 MP) | 113 ms | 110 | 110 |
+- Output format (NV12 vs XRGB) costs nothing. PP downscale adds ~50% at 720p/1080p (PP is the slower stage there); for 4k/12MP the
+  decode dominates (~9 ns/pixel... i.e. ~110 MP/s) and the downscaled output is slightly faster (smaller write).
+- Interleaving: H.264 1080p (s10, 750 frames, fakesink sync=false) alone 25-26 s; with a concurrent 12 MP JPEG loop (300 frames)
+  52 s, i.e. ~2.1x slower while overlapped (H.264 gets ~48% of the VPU), JPEG 113 -> 132 ms avg. Both progress (m2m job round-robin,
+  no starvation, no errors, no dmesg warnings); CmaFree unchanged (66.9 MB). A 12 MP decode blocks H.264 for ~113 ms per image
+  (3-4 dropped frames at 30 fps), so on a live H.264 stream large JPEGs should be avoided or rate limited.
+
+#### T11e results: 1920x1080 panel (kernel #107, boot Weston with `weston.ini`, `/tmp/xdg`)
+- MJPEG Jelly (1080p) -> `v4l2jpegdec ! video/x-raw,format=BGRx,width=1920,height=1080 ! waylandsink` (no scaling): plane XR24
+  dmabuf, correct colours and smooth per the user; the display shows underflow at 1080p XRGB (expected, display bandwidth;
+  not a decoder issue). CmaFree dropped from 72 MB to 18 MB while playing (JPEG CAPTURE pool of 8.3 MB buffers + Weston).
+- H.264 1080p -> BGRx 1920x1080 fails: `v4l2slh264dec` needs 12 CAPTURE buffers x 8.3 MB = ~100 MB, the allocator gets 11
+  (`cma_alloc ... 2025 pages`), gst reports "Not enough memory to allocate source buffers". CMA is 120 MB total, so it is a
+  capacity limit. Same stream as NV12 (3.1 MB/buffer) or scaled to 1024x600 works. Options: cap the CAPTURE pool
+  (`patches/gst1-plugins-bad/experimental-0004`, not part of the series), larger CMA, or RGB16 (4.1 MB/buffer).
+- Workaround: H.264 1080p -> `video/x-raw,format=RGB16,width=1920,height=1080 ! waylandsink` (VPU converts to RGB565, no
+  scaling needed) works on the 1080p panel: plane RG16 dmabuf, looped ~2 min, user: correct, no display underflow (RGB565 halves
+  the scan-out bandwidth vs XRGB). `fakesink` runs of RGB16 1080p, RGB16 720p and BGRx 720p also pass; only BGRx 1080p fails.
+  CmaFree during playback is ~0 (24-136 kB, no `cma_alloc` failures in dmesg): it fits but with no headroom, so no second
+  1080p client at the same time.
 
 ## 6. Not in scope (now)
 - Hardware decode for Qt still images (`QImage` / `QImageIOHandler`); stays on libjpeg-turbo (P11).

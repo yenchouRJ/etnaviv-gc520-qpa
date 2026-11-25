@@ -1,8 +1,10 @@
 #!/bin/sh
 # usage: [HOLD=s] showj.sh image.jpg [caps]   stock pipeline on the panel via kiosk Weston; fdsrc keeps the last frame up
-export XDG_RUNTIME_DIR=/run/user/0 WAYLAND_DISPLAY=wayland-1; mkdir -p $XDG_RUNTIME_DIR
+# Board convention (/etc/profile.d/weston.sh): XDG_RUNTIME_DIR=/tmp/xdg, Weston 10 socket wayland-1.
+# Use the running Weston (boot one, desktop ini); only start a kiosk one if none is running.
+export XDG_RUNTIME_DIR=/tmp/xdg WAYLAND_DISPLAY=wayland-1
+mkdir -p $XDG_RUNTIME_DIR; chmod 0700 $XDG_RUNTIME_DIR
 if [ ! -S $XDG_RUNTIME_DIR/wayland-1 ]; then
-  killall weston 2>/dev/null; sleep 1; rm -f $XDG_RUNTIME_DIR/wayland-1*
   weston --tty=1 --backend=drm-backend.so --config=/etc/xdg/weston/weston-kiosk.ini --shell=kiosk-shell.so --use-pixman >/tmp/weston.log 2>&1 &
   n=0; while [ ! -S $XDG_RUNTIME_DIR/wayland-1 ] && [ $n -lt 20 ]; do sleep 1; n=$((n+1)); done; sleep 2
 fi
